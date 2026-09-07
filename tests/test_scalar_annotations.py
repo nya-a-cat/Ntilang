@@ -58,7 +58,7 @@ def test_annotation_does_not_initialize_a_value():
     def bad(B: T.Tensor((32,), "int32")):
         with T.Kernel(1, threads=32) as _bx:
             for i in T.Parallel(32):
-                value: T.int32
+                _value: T.int32
                 B[i] = i
 
     with pytest.raises(ntilang.CompileError, match="does not initialize"):
