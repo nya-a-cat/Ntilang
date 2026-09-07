@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ntilang"
+version = "0.1.0"
+description = "A TileLang-style language that compiles directly to pure CuTe DSL."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Ntilang contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+cuda = ["nvidia-cutlass-dsl==4.7.1; sys_platform == 'linux'", "apache-tvm-ffi==0.1.4; sys_platform == 'linux'"]
+
+[dependency-groups]
+dev = ["pytest>=8.3,<10", "numpy>=2.0,<3", "ruff>=0.12,<1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["python/ntilang"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-m 'not gpu'"
+markers = ["cuda: requires the CuTe DSL compiler", "gpu: requires an NVIDIA GPU"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
