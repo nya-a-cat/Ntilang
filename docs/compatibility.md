@@ -14,6 +14,16 @@ does not establish compatibility.
 The upstream TIR parser is provided by the pinned `TileLang/tvm` submodule at
 `907a88c8791ccf33b9874821bc875e7abf624367`; its exports are included in this scope.
 
+The [export inventory](tilelang-api.json) records 706 distinct names from that
+default CUDA facade, including dtype variants, parser constructors, common tile
+operations, and CUDA-specific APIs. It follows the source `__all__` unions,
+removes backend-only parser exports from the common layer, and adds the CUDA
+layer. The inventory includes source hashes and overlapping export groups.
+This is a name inventory; implementation status requires separate signature,
+behavior, interaction, and hardware checks. Ntilang currently implements only
+parts of this surface. Its `maximum` and `minimum` spellings are extensions;
+the upstream facade exports `max` and `min`.
+
 ## Current work
 
 The compiler currently handles static tensor kernels, linear register fragments,
