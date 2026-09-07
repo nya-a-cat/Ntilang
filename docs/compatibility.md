@@ -90,7 +90,12 @@ and remaining scalar signatures still need implementation.
 
 Local scalar annotations preserve the expression dtype according to the default
 eager frontend, including branch joins and captured specialization dtype names.
-Legacy TIR annotation semantics, mutable scalar storage, and buffer annotations
+Legacy TIR annotation semantics and buffer annotations remain open.
+
+`alloc_var` supports basic scalar dtypes in the local.var scope, initialization,
+assignment, augmented assignment, serial/unrolled loop-carried values, and
+conditional updates. Cross-parallel persistent scalar state, mutable index
+range analysis, alternative allocation scopes, and buffer-style scalar access
 remain open.
 
 Floor and truncating integer division/remainder support signed and unsigned

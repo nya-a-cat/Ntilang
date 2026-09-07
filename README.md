@@ -119,6 +119,7 @@ the same argument contract.
 - Floor/truncating integer division and remainder, expression `T.ceildiv` / `T.cdiv`, and `T.align_up`.
 - Static shapes; Boolean, signed/unsigned 8/16/32/64-bit integers, FP16, BF16, FP32, and FP64.
 - Conditional statements, branch-defined scalar values, and branch-aware fragment initialization.
+- Mutable `T.alloc_var` scalars with typed initialization, loop accumulation, and conditional updates.
 - `T.Select` and lazy `T.if_then_else`, including guarded division and bounded conditional indices.
 
 Fragments support element assignment and augmented assignment inside a

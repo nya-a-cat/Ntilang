@@ -112,6 +112,7 @@ for _name in (
     "Unroll",
     "alloc_shared",
     "alloc_fragment",
+    "alloc_var",
     "copy",
     "clear",
     "fill",

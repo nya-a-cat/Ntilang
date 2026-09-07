@@ -629,6 +629,13 @@ class Emitter:
                 )
                 self.scalar_types[args[0]] = dtype
                 self.emit(f"{self.var(args[0])} = cutlass.{CUTLASS_TYPES[dtype]}({value})")
+            elif op == "declare":
+                name, dtype, initializer = args
+                value = self.expression(initializer)
+                self.scalar_types[name] = dtype
+                self.emit(f"{self.var(name)} = {value}")
+            elif op == "assign":
+                self.emit(f"{self.var(args[0])} = {self.expression(args[1])}")
             elif op == "store":
                 name, indices, value = args
                 coords = [self.expression(x) for x in indices]

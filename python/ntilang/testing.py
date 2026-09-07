@@ -138,6 +138,13 @@ def reference(kernel: CompiledKernel, *arrays):
                 dtype = variable_types.get(args[0]) or expression_dtype(args[1], buffer_types, variable_types)
                 variables[args[0]] = cast(expr(args[1]), dtype)
                 variable_types[args[0]] = dtype
+            elif op == "declare":
+                if args[1] == "bfloat16":
+                    raise TypeError("The NumPy evaluator does not support bfloat16")
+                variables[args[0]] = expr(args[2])
+                variable_types[args[0]] = args[1]
+            elif op == "assign":
+                variables[args[0]] = expr(args[1])
             elif op == "store":
                 write(args[0], tuple(expr(x) for x in args[1]), expr(args[2]))
             elif op == "copy":

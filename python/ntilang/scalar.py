@@ -63,7 +63,7 @@ def expression_dtype(expr, buffers, variables):
         return variables[expr.value]
     if expr.op == "load":
         return buffers[expr.value].type.dtype
-    if expr.op == "cast":
+    if expr.op in ("cast", "mutable"):
         return expr.value
     if expr.op in CHOICE_OPS:
         condition, true_value, false_value = expr.args
@@ -102,7 +102,9 @@ def expression_dtype(expr, buffers, variables):
 def body_types(body, types, buffers):
     types = types.copy()
     for stmt in body:
-        if stmt.op == "let":
+        if stmt.op == "declare":
+            types[stmt.args[0]] = stmt.args[1]
+        elif stmt.op == "let":
             types[stmt.args[0]] = expression_dtype(stmt.args[1], buffers, types)
         elif stmt.op == "if":
             then_types = body_types(stmt.args[1], types, buffers)

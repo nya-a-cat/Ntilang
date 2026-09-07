@@ -120,6 +120,8 @@ def interval(expr, bounds, definitions):
         if expr.value not in bounds:
             raise CompileError("Indices must use integer block/loop variables and static constants")
         result = bounds[expr.value]
+    elif expr.op == "mutable":
+        raise CompileError("Mutable scalar indices require additional loop-state range analysis")
     elif expr.op == "cast" and (expr.value.startswith(("int", "uint")) or expr.value == "bool"):
         result = interval(expr.args[0], bounds, definitions)
         low, high = integer_limits(expr.value)
@@ -401,6 +403,11 @@ def validate(kernel: Kernel):
                     expression(args[1], bounds, definitions)
                     # Assignments use fresh names in the frontend, avoiding cycles.
                     definitions[args[0]] = args[1]
+                elif op == "declare":
+                    expression(args[2], bounds, definitions)
+                    definitions[args[0]] = Expr("mutable", value=args[1])
+                elif op == "assign":
+                    expression(args[1], bounds, definitions)
                 elif op == "store":
                     name, indices, value = args
                     expression(value, bounds, definitions)

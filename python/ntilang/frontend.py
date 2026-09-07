@@ -86,6 +86,7 @@ class Parser:
         self.allocated: list[Buffer] = []
         self.threads = 0
         self.parallel_context = None
+        self.mutable = {}
 
     def location(self, node):
         return SourceLocation(self.filename, self.first_line + node.lineno - 1, node.col_offset)
@@ -224,6 +225,57 @@ class Parser:
             if factor is not None:
                 annotations["pragma_unroll_factor"] = factor
         return (start, stop, step), tuple(sorted(annotations.items()))
+
+    def scalar_allocation(self, call, target):
+        keywords = {}
+        for keyword in call.keywords:
+            if keyword.arg not in ("dtype", "scope", "init") or keyword.arg in keywords:
+                self.fail(call, f"Unsupported or duplicate alloc_var argument {keyword.arg!r}")
+            keywords[keyword.arg] = keyword.value
+        arguments = list(call.args)
+        if arguments:
+            if "dtype" in keywords:
+                self.fail(call, "Duplicate alloc_var dtype")
+            dtype_node = arguments.pop(0)
+        elif "dtype" in keywords:
+            dtype_node = keywords.pop("dtype")
+        else:
+            self.fail(call, "alloc_var requires dtype")
+        dtype = self.static(dtype_node)
+        if not isinstance(dtype, str) or dtype not in DTYPES:
+            self.fail(call, "alloc_var requires a supported scalar dtype")
+        scope = self.static(keywords.get("scope", ast.Constant(value="local.var")))
+        initializer = keywords.get("init", ast.Constant(value=None))
+
+        def optional_static(value):
+            try:
+                return self.static(value)
+            except CompileError:
+                return object()
+
+        if len(arguments) == 1:
+            argument = optional_static(arguments[0])
+            if isinstance(argument, str) and optional_static(initializer) is None and scope == "local.var":
+                scope = argument
+            else:
+                if optional_static(initializer) is not None:
+                    self.fail(call, "Initializer specified multiple times in alloc_var")
+                initializer = arguments[0]
+        elif len(arguments) == 2:
+            if optional_static(initializer) is not None:
+                self.fail(call, "Initializer specified multiple times in alloc_var")
+            initializer, scope_node = arguments
+            scope = self.static(scope_node)
+        elif len(arguments) > 2:
+            self.fail(call, "alloc_var accepts at most three positional arguments")
+        if scope != "local.var":
+            self.fail(call, "alloc_var currently supports the local.var scope")
+        if target.id in self.variables or target.id in self.buffers or target.id.startswith("_nt_"):
+            self.fail(target, f"Duplicate or reserved name {target.id}")
+        value = Expr("const", value=0) if optional_static(initializer) is None else self.expr(initializer)
+        self.variables.add(target.id)
+        self.mutable[target.id] = (dtype, self.parallel_context)
+        return Statement("declare", (target.id, dtype, Expr("cast", (value,), dtype)), self.location(call))
 
     def reduction(self, call, name, loc):
         kinds = {"sum", "abssum", "max", "absmax", "min", "bitand", "bitor", "bitxor"}
@@ -516,19 +568,27 @@ class Parser:
             condition = self.expr(node.test)
             before_vars = self.variables.copy()
             before_initialized = self.initialized.copy()
+            before_mutable = self.mutable.copy()
             then_body = tuple(self.statement(n, parallel=parallel, nested=True) for n in node.body)
             then_vars, then_initialized = self.variables.copy(), self.initialized.copy()
+            then_mutable = self.mutable.copy()
             self.variables = before_vars
             self.initialized = before_initialized
+            self.mutable = before_mutable
             else_body = tuple(self.statement(n, parallel=parallel, nested=True) for n in node.orelse)
             self.variables.intersection_update(then_vars)
             self.initialized.intersection_update(then_initialized)
+            for name in self.variables:
+                if self.mutable.get(name) != then_mutable.get(name):
+                    self.fail(node, "Conditional scalar declarations must agree in kind, dtype, and scope")
+            self.mutable = {name: info for name, info in self.mutable.items() if name in self.variables}
             return Statement("if", (condition, then_body, else_body), loc)
         if isinstance(node, ast.Pass):
             return Statement("pass", (), loc)
         if isinstance(node, ast.AugAssign):
-            if not isinstance(node.target, ast.Subscript) or type(node.op) not in BINOPS:
-                self.fail(node, "Augmented assignment currently requires a tensor element")
+            mutable_target = isinstance(node.target, ast.Name) and node.target.id in self.mutable
+            if not (isinstance(node.target, ast.Subscript) or mutable_target) or type(node.op) not in BINOPS:
+                self.fail(node, "Augmented assignment requires a tensor element or T.alloc_var scalar")
             assignment = ast.Assign(
                 targets=[node.target], value=ast.BinOp(left=node.target, op=node.op, right=node.value)
             )
@@ -539,6 +599,8 @@ class Parser:
             target = node.targets[0]
             if isinstance(target, ast.Name) and isinstance(node.value, ast.Call):
                 name = self.call_name(node.value)
+                if name == "alloc_var":
+                    return self.scalar_allocation(node.value, target)
                 if name in ("alloc_shared", "alloc_fragment"):
                     if nested:
                         self.fail(node, "Allocate buffers directly inside T.Kernel, before loops")
@@ -557,6 +619,11 @@ class Parser:
                     return Statement("alloc", (buf.name,), loc)
             value = self.expr(node.value)
             if isinstance(target, ast.Name):
+                if target.id in self.mutable:
+                    dtype, owner = self.mutable[target.id]
+                    if owner != self.parallel_context:
+                        self.fail(node, "Declare mutable scalars inside the parallel loop that updates them")
+                    return Statement("assign", (target.id, Expr("cast", (value,), dtype)), loc)
                 if target.id in self.variables or target.id in self.buffers or target.id.startswith("_nt_"):
                     self.fail(node, f"Cannot assign to {target.id}")
                 self.variables.add(target.id)
@@ -628,6 +695,7 @@ class Parser:
             old_vars = self.variables.copy()
             old_initialized = self.initialized.copy()
             old_parallel = self.parallel_context
+            old_mutable = self.mutable.copy()
             self.variables.update(names)
             if name == "Parallel":
                 self.parallel_context = (extents, names)
@@ -636,6 +704,7 @@ class Parser:
             )
             self.variables = old_vars
             self.parallel_context = old_parallel
+            self.mutable = old_mutable
             if name != "Parallel" and not range(*extents):
                 self.initialized = old_initialized
             kind = (

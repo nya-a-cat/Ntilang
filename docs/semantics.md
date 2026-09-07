@@ -136,6 +136,21 @@ constructor or `T.cast` for conversion. An annotation without a value can refer
 to an existing scalar; it does not initialize a new variable. Legacy TIR parser
 annotation behavior and non-scalar type annotations require separate support.
 
+`T.alloc_var(dtype, ..., scope="local.var", init=None)` creates a mutable scalar.
+Its default value is zero, following the pinned CUDA allocation lowering.
+The supported positional initializer/scope forms and keyword initializer cast
+to the declared dtype. Assignments and augmented assignments preserve that
+dtype, including narrowing after each loop update. An ordinary scalar binding
+such as `saved = accumulator` captures its value at that point.
+
+Mutable values can carry state through serial/unrolled loops and conditional
+updates. Scalars declared inside a parallel loop are initialized separately for
+each logical element. Scalars declared outside parallel loops can be updated
+by uniform statements and read inside parallel loops. Updating them inside a
+parallel loop requires additional per-thread state mapping and is currently
+diagnosed. Mutable index expressions also require further loop-state range
+analysis; their initializer is never substituted as a bound for later reads.
+
 For lazy branches, the index checker refines single-variable affine integer
 comparisons, their negation, true conjunctions, and false disjunctions. This
 allows guards such as `i != 0` to establish a nonzero divisor when zero is an
