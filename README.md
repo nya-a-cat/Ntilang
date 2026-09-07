@@ -159,6 +159,7 @@ See [the language semantics](docs/semantics.md) for the precise restrictions and
 [the compiler architecture](docs/architecture.md) for the implementation.
 The [TileLang compatibility work](docs/compatibility.md) tracks the full language
 objective and the remaining implementation and validation requirements.
+The [roadmap](ROADMAP.md) records the verified baseline, remaining stages, and current pause status.
 
 ## Testing
 
