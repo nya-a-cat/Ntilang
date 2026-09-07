@@ -113,6 +113,30 @@ The current backend uses the SM80 warp MMA instruction family. Its shared copies
 and register operand loads are synchronous. GPU numerical tests use tolerances
 because Tensor Core accumulation order differs from the serial reference.
 
+## Reductions
+
+`T.reduce(buffer, out, reduce_type, dim, clear)` supports `sum`, `abssum`,
+`max`, `absmax`, `min`, `bitand`, `bitor`, and `bitxor`. The corresponding
+`T.reduce_*` wrappers preserve their upstream defaults and argument names.
+Source and destination may be shared or fragment buffers. The selected axis
+is static; the output removes that axis or keeps it with extent one. A rank-one
+input can use a `(1,)` output. Inputs are converted to the output dtype before
+combining. Bitwise reductions require an integer output.
+
+With `clear=True`, the output starts from the operation's identity. With
+`clear=False`, its initialized value is combined once with the reduction result.
+`nan_propagate=True` affects FP16/BF16 max/min/absmax, following the upstream
+signature. Other floating max/min reductions prefer non-NaN operands; an
+all-NaN maximum with clearing returns negative infinity. Sum propagates NaNs.
+
+The backend materializes a typed shared workspace, then combines disjoint pairs
+in tree levels with uniform barriers between levels. The input buffer is
+preserved. MMA input fragments retain their coordinate mapping when entering
+the workspace. Tree order can change floating-point rounding relative to other
+implementations. `batch=1` and empty lowering annotations are supported; batched
+AllReduce scheduling, packed arithmetic controls, and reducer epochs remain open.
+Reduction workspace counts toward the shared-memory limit.
+
 ## Scope of verification
 
 The compiler checks a restricted source contract, then delegates instruction

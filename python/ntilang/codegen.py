@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
-from math import prod
+from math import isfinite, isnan, prod
 
 from .ir import DTYPES, CompileError, Expr, Kernel, Partition
 
@@ -91,15 +91,24 @@ class Emitter:
                 self.mmas[c] = plan
         self.fragment_layouts = self.infer_fragment_layouts()
         self.snapshots = set()
+        self.reduction_workspaces = {}
         for stmt in walk(kernel.body):
             if stmt.op == "parallel":
                 _, snapshots = self.parallel_accesses(stmt)
                 self.snapshots.update(snapshots)
+            elif stmt.op == "reduce":
+                src, dst = stmt.args[:2]
+                key = (src, self.buffers[dst].type.dtype)
+                if key not in self.reduction_workspaces:
+                    self.reduction_workspaces[key] = f"_nt_reduce_workspace_{len(self.reduction_workspaces)}"
         shared_bytes = 0
         for buffer in kernel.buffers:
             if buffer.space == "shared" or buffer.name in self.snapshots:
                 shared_bytes = (shared_bytes + 15) // 16 * 16
                 shared_bytes += prod(buffer.type.shape) * DTYPES[buffer.type.dtype]
+        for src, dtype in self.reduction_workspaces:
+            shared_bytes = (shared_bytes + 15) // 16 * 16
+            shared_bytes += prod(self.buffers[src].type.shape) * DTYPES[dtype]
         if shared_bytes > 48 * 1024:
             raise CompileError("Shared buffers and fragment communication exceed 48 KiB per block")
 
@@ -269,6 +278,9 @@ class Emitter:
         if op == "const":
             if type(expr.value) not in (int, float, bool):
                 raise CompileError("Only numeric and boolean values can appear in scalar expressions")
+            if type(expr.value) is float and not isfinite(expr.value):
+                value = "nan" if isnan(expr.value) else "inf" if expr.value > 0 else "-inf"
+                return f"float('{value}')"
             return repr(expr.value)
         if op == "var":
             return self.var(expr.value)
@@ -389,6 +401,82 @@ class Emitter:
         self.depth -= 1
         self.emit("cute.arch.sync_threads()")
 
+    def reduction(self, src, dst, kind, dim, clear, nan_propagate):
+        shape = self.buffers[src].type.shape
+        out_shape = self.buffers[dst].type.shape
+        dtype = self.buffers[dst].type.dtype
+        workspace = self.reduction_workspaces[src, dtype]
+        propagate = nan_propagate and dtype in ("float16", "bfloat16")
+
+        def access(coords):
+            return f"{workspace}[{', '.join(coords)}]"
+
+        def combine(left, right):
+            if kind in ("sum", "abssum"):
+                return f"({left} + {right})"
+            if kind in ("max", "absmax", "min"):
+                operation = "min" if kind == "min" else "max"
+                return f"cute.math.{operation}({left}, {right}, propagate_nan={propagate})"
+            return f"({left} { {'bitand': '&', 'bitor': '|', 'bitxor': '^'}[kind] } {right})"
+
+        self.emit("cute.arch.sync_threads()")
+        if self.buffers[src].space == "fragment":
+            slot, coords, depth = self.loop_fragment(src)
+            value = f"{self.buf(src)}[{slot}]"
+        else:
+            _, coords = self.loop_tile(shape)
+            depth = 2
+            value = self.access(src, coords)
+        value_name = self.unique("reduce_value")
+        self.emit(f"{value_name} = {self.dtype(dst)}({value})")
+        if kind in ("abssum", "absmax"):
+            value_name = f"cute.math.max({value_name}, -{value_name}, propagate_nan=False)"
+        self.emit(f"{access(coords)} = {self.dtype(dst)}({value_name})")
+        self.depth -= depth
+        self.emit("cute.arch.sync_threads()")
+        # Disjoint pairs in each tree level: right operands are never written
+        # at that level, and the block reconverges before the following level.
+        stride = 1
+        while stride < shape[dim]:
+            _, coords = self.loop_tile(shape)
+            self.emit(
+                f"if ({coords[dim]} % {2 * stride} == 0) and ({coords[dim]} + {stride} < {shape[dim]}):"
+            )
+            self.depth += 1
+            partner = coords.copy()
+            partner[dim] = f"({coords[dim]} + {stride})"
+            result = combine(access(coords), access(partner))
+            self.emit(f"{access(coords)} = {self.dtype(dst)}({result})")
+            self.depth -= 3
+            self.emit("cute.arch.sync_threads()")
+            stride *= 2
+        if self.buffers[dst].space == "fragment":
+            slot, coords, depth = self.loop_fragment(dst)
+            destination = f"{self.buf(dst)}[{slot}]"
+        else:
+            _, coords = self.loop_tile(out_shape)
+            depth = 2
+            destination = self.access(dst, coords)
+        source_coords = coords.copy()
+        if len(out_shape) == len(shape):
+            source_coords[dim] = "0"
+        else:
+            source_coords.insert(dim, "0")
+        if clear:
+            identity = "0"
+            if kind == "max":
+                identity = str(-(2**31)) if dtype == "int32" else "float('-inf')"
+            elif kind == "min":
+                identity = str(2**31 - 1) if dtype == "int32" else "float('inf')"
+            elif kind == "bitand":
+                identity = "-1"
+            initial = f"{self.dtype(dst)}({identity})"
+        else:
+            initial = destination
+        self.emit(f"{destination} = {self.dtype(dst)}({combine(initial, access(source_coords))})")
+        self.depth -= depth
+        self.emit("cute.arch.sync_threads()")
+
     def statements(self, body):
         for stmt in body:
             op, args = stmt.op, stmt.args
@@ -430,6 +518,8 @@ class Emitter:
                 self.copy(*args)
             elif op == "gemm":
                 self.gemm(*args)
+            elif op == "reduce":
+                self.reduction(*args)
             elif op == "let":
                 value = self.expression(args[1])
                 dtype = self.scalar_types.get(args[0]) or self.expression_type(args[1], self.scalar_types)
@@ -507,7 +597,11 @@ class Emitter:
         self.emit("_nt_tid, _, _ = cute.arch.thread_idx()")
         block = [self.var(v) for v in self.kernel.block_vars] + ["_"] * (3 - len(self.kernel.block_vars))
         self.emit(f"{', '.join(block)} = cute.arch.block_idx()")
-        if self.snapshots or any(b.space == "shared" for b in self.kernel.buffers):
+        if (
+            self.snapshots
+            or self.reduction_workspaces
+            or any(b.space == "shared" for b in self.kernel.buffers)
+        ):
             self.emit("_nt_smem = utils.SmemAllocator()")
         for name, (m, n, _, wm, wn, dtype) in self.mmas.items():
             self.emit(
@@ -541,6 +635,12 @@ class Emitter:
                 self.emit(
                     f"{self.buf(b.name)} = cute.make_rmem_tensor(({Partition(b.type.shape, self.kernel.threads).slots},), {self.dtype(b.name)})"
                 )
+        for (src, dtype), workspace in self.reduction_workspaces.items():
+            shape = self.buffers[src].type.shape
+            strides = tuple(prod(shape[i + 1 :]) for i in range(len(shape)))
+            self.emit(
+                f"{workspace} = _nt_smem.allocate_tensor(cutlass.{CUTLASS_TYPES[dtype]}, cute.make_layout({shape}, stride={strides}), byte_alignment=16)"
+            )
         self.statements(self.kernel.body)
         self.depth = 0
         self.emit()

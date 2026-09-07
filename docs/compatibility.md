@@ -36,6 +36,13 @@ The additional storage participates in the block's shared-memory limit. Direct
 shuffle-based communication and in-place cross-element transformations need
 further lowering and dependency analysis.
 
+All eight basic reduction kinds lower through synchronized shared-memory trees.
+Shared/fragment scope combinations, static axes, kept dimensions, output dtype
+conversion, accumulation, and FP16/BF16 NaN controls have source and compiler
+coverage. Stable Softmax exercises reductions with broadcast communication.
+Batch scheduling, packed reduction annotations, local scopes, regions, and
+reducer epoch APIs remain open compatibility work.
+
 Loop steps and empty iteration domains are preserved. The supported `unroll`
 form emits CuTe compile-time iteration. Loop annotations, partial unroll factors,
 dynamic bounds, and vectorized loop lowering require further implementation.

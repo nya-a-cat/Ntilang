@@ -6,6 +6,7 @@ from examples.fragment_affine import fragment_affine
 from examples.matmul import matmul
 from examples.matmul_relu import matmul_relu
 from examples.piecewise import piecewise
+from examples.softmax import softmax
 from examples.vector_add import vector_add
 
 pytestmark = pytest.mark.gpu
@@ -67,6 +68,14 @@ def test_piecewise_on_gpu(torch_cuda):
     piecewise(target=target_for(torch))(a, b)
     expected = torch.where(a < 0, -a, torch.where(a < 1, a * a, a + 2))
     torch.testing.assert_close(b, expected, rtol=0, atol=0)
+
+
+def test_softmax_on_gpu(torch_cuda):
+    torch = torch_cuda
+    a = torch.randn(9, 113, device="cuda", dtype=torch.float32) * 30
+    b = torch.empty_like(a)
+    softmax(target=target_for(torch))(a, b)
+    torch.testing.assert_close(b, torch.softmax(a, dim=1), rtol=2e-5, atol=2e-6)
 
 
 def test_nondefault_stream_on_gpu(torch_cuda):

@@ -119,6 +119,77 @@ class Parser:
             result[kw.arg] = self.static(kw.value)
         return result
 
+    def bind_call(self, node, parameters, defaults):
+        if len(node.args) > len(parameters):
+            self.fail(node, "Too many positional arguments")
+        arguments = dict(zip(parameters, node.args))
+        for keyword in node.keywords:
+            if keyword.arg not in parameters or keyword.arg in arguments:
+                self.fail(node, f"Unsupported or duplicate argument {keyword.arg!r}")
+            arguments[keyword.arg] = keyword.value
+        for name in parameters:
+            if name not in arguments:
+                if name not in defaults:
+                    self.fail(node, f"Missing required argument {name!r}")
+                arguments[name] = ast.Constant(value=defaults[name])
+        return arguments
+
+    def reduction(self, call, name, loc):
+        kinds = {"sum", "abssum", "max", "absmax", "min", "bitand", "bitor", "bitxor"}
+        parameters = ["buffer", "out"]
+        defaults = {"dim": -1, "clear": True, "batch": 1, "nan_propagate": False, "annotations": None}
+        if name == "reduce":
+            parameters += ["reduce_type", "dim", "clear", "batch", "nan_propagate", "annotations"]
+            del defaults["dim"], defaults["clear"]
+        else:
+            parameters += ["dim"]
+            if name != "reduce_abssum":
+                parameters.append("clear")
+            parameters.append("batch")
+            if name in ("reduce_max", "reduce_min", "reduce_absmax"):
+                parameters.append("nan_propagate")
+            parameters.append("annotations")
+        args = self.bind_call(call, parameters, defaults)
+        src, dst = (self.buffer_name(args[key]) for key in ("buffer", "out"))
+        source, destination = self.buffers[src], self.buffers[dst]
+        kind = self.static(args["reduce_type"]) if name == "reduce" else name.removeprefix("reduce_")
+        if kind not in kinds:
+            self.fail(call, f"Unsupported reduction kind {kind!r}")
+        dim = self.static(args["dim"])
+        if type(dim) is not int or not -len(source.type.shape) <= dim < len(source.type.shape):
+            self.fail(call, "Reduction dimension is outside the source rank")
+        dim %= len(source.type.shape)
+        clear = self.static(args["clear"]) if "clear" in args else True
+        nan_propagate = self.static(args["nan_propagate"]) if "nan_propagate" in args else False
+        if type(clear) is not bool or type(nan_propagate) is not bool:
+            self.fail(call, "Reduction clear and nan_propagate must be bool")
+        batch = self.static(args["batch"])
+        if type(batch) is not int or batch < 1:
+            self.fail(call, "Reduction batch must be a positive integer")
+        if batch != 1:
+            self.fail(call, "Batched AllReduce scheduling is not implemented; reduction batch must be 1")
+        annotations = args["annotations"]
+        if not (
+            isinstance(annotations, ast.Constant)
+            and annotations.value is None
+            or isinstance(annotations, ast.Dict)
+            and not annotations.keys
+        ):
+            self.fail(call, "Reduction lowering annotations are not implemented")
+        if source.space not in ("shared", "fragment") or destination.space not in ("shared", "fragment"):
+            self.fail(call, "Reductions require shared or fragment buffers")
+        shape = source.type.shape
+        removed = shape[:dim] + shape[dim + 1 :]
+        kept = shape[:dim] + (1,) + shape[dim + 1 :]
+        if destination.type.shape not in (removed, kept):
+            self.fail(call, f"Reduction output shape must be {removed} or {kept}")
+        if kind.startswith("bit") and destination.type.dtype != "int32":
+            self.fail(call, "Bitwise reductions require an integer output dtype")
+        if src not in self.initialized or not clear and dst not in self.initialized:
+            self.fail(call, "Reduction reads a buffer before initialization")
+        self.initialized.add(dst)
+        return Statement("reduce", (src, dst, kind, dim, clear, nan_propagate), loc)
+
     def indices(self, node):
         parts = node.elts if isinstance(node, ast.Tuple) else [node]
         if any(isinstance(p, ast.Slice) for p in parts):
@@ -325,6 +396,8 @@ class Parser:
             name = self.call_name(call)
             if parallel:
                 self.fail(node, "Collective tile operations cannot appear inside T.Parallel")
+            if name == "reduce" or name.startswith("reduce_"):
+                return self.reduction(call, name, loc)
             if name in ("clear", "fill"):
                 if len(call.args) != (1 if name == "clear" else 2) or call.keywords:
                     self.fail(node, "T.clear(buffer) or T.fill(buffer, value) expected")

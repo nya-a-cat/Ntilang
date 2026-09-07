@@ -106,6 +106,38 @@ def reference(kernel: CompiledKernel, *arrays):
                 av, bv = buffers[a], buffers[b]
                 av, bv = av.T if ta else av, bv.T if tb else bv
                 buffers[c] += av.astype(np.float32) @ bv.astype(np.float32)
+            elif op == "reduce":
+                src, dst, kind, dim, clear, nan_propagate = args
+                output = buffers[dst]
+                values = buffers[src].astype(output.dtype)
+                if kind in ("abssum", "absmax"):
+                    values = np.fmax(values, -values)
+                propagate = nan_propagate and output.dtype == np.dtype("float16")
+                combine = {
+                    "sum": np.add,
+                    "abssum": np.add,
+                    "max": np.maximum if propagate else np.fmax,
+                    "absmax": np.maximum if propagate else np.fmax,
+                    "min": np.minimum if propagate else np.fmin,
+                    "bitand": np.bitwise_and,
+                    "bitor": np.bitwise_or,
+                    "bitxor": np.bitwise_xor,
+                }[kind]
+                identity = 0
+                if kind == "max":
+                    identity = np.iinfo(output.dtype).min if output.dtype.kind == "i" else -np.inf
+                elif kind == "min":
+                    identity = np.iinfo(output.dtype).max if output.dtype.kind == "i" else np.inf
+                elif kind == "bitand":
+                    identity = -1
+                reduced = combine.reduce(
+                    values,
+                    axis=dim,
+                    dtype=output.dtype,
+                    initial=identity,
+                    keepdims=output.ndim == values.ndim,
+                )
+                output[...] = reduced if clear else combine(output, reduced)
             elif op == "parallel":
                 names, shape, inner = args
                 for coord in np.ndindex(shape):

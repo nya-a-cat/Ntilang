@@ -83,6 +83,7 @@ Choose a target matching the GPU that will execute the kernel. The default
 - [Tiled matrix multiplication](examples/matmul.py): shared tiles, FP16 inputs, FP32 accumulation, and CuTe's `MmaF16BF16Op`.
 - [Matrix multiplication with ReLU](examples/matmul_relu.py): scale, tensor bias, and activation in the accumulator's register layout.
 - [Piecewise transform](examples/piecewise.py): data-dependent `if`/`elif`/`else` with guarded output writes.
+- [Softmax](examples/softmax.py): stable row normalization with maximum/sum reductions, fragment broadcasts, and tail masking.
 
 Example factories accept `target=`. A shape-specialized factory can also be
 decorated with `@ntilang.jit(target="sm_80")` and return a `@T.prim_func`.
@@ -111,6 +112,7 @@ the same argument contract.
 - `T.Tensor`, `T.Kernel`, `T.Parallel`, `T.serial`/`T.Serial`, `T.unroll`/`T.Unroll`, and `T.ceildiv`.
 - `T.alloc_shared`, `T.alloc_fragment`, `T.copy`, `T.clear`, and `T.fill`.
 - `T.gemm(A, B, accumulator, transpose_A=False, transpose_B=False)`.
+- `T.reduce` and sum, absolute-sum, max, absolute-max, min, and bitwise reduction wrappers.
 - Arithmetic, comparisons, `T.cast`, `T.exp`, `T.exp2`, `T.sqrt`, `T.maximum`, and `T.minimum`.
 - Static shapes; `float16`, `bfloat16`, `float32`, and `int32` buffers.
 - Conditional statements, branch-defined scalar values, and branch-aware fragment initialization.
@@ -135,8 +137,11 @@ parallel element loops.
 
 Tensor Core GEMM uses FP16/BF16 operands and FP32 accumulation, with a K tile
 multiple of 16 and a supported warp arrangement. This version uses synchronous
-shared-memory copies. Dynamic shapes, arbitrary Python control flow, data-dependent
-indices, reductions, atomics, asynchronous pipelines, TMA, and WGMMA are outside
+shared-memory copies. Reductions support static axes, shared/fragment operands,
+kept or removed dimensions, and accumulation into initialized outputs. Their
+current lowering uses synchronized shared-memory trees with `batch=1`.
+Dynamic shapes, arbitrary Python control flow, data-dependent
+indices, atomics, asynchronous pipelines, TMA, and WGMMA are outside
 the implemented subset. `T.Pipelined` accepts only synchronous stage counts 0 or 1.
 Unsupported constructs produce compilation errors.
 
