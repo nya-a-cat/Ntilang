@@ -90,6 +90,18 @@ class Region:
     buffer: str
     origin: tuple[Expr, ...]
     shape: tuple[int, ...]
+    axes: tuple[int | None, ...] = ()
+
+    def __post_init__(self):
+        if not self.axes:
+            object.__setattr__(self, "axes", tuple(range(len(self.origin))))
+
+    @property
+    def extents(self):
+        return tuple(1 if axis is None else self.shape[axis] for axis in self.axes)
+
+    def is_full(self, buffer_shape):
+        return self.extents == buffer_shape and all(x == Expr("const", value=0) for x in self.origin)
 
 
 @dataclass(frozen=True)

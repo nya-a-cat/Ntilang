@@ -59,11 +59,25 @@ block in this version, including storage introduced for fragment communication.
 
 ## Memory and copies
 
-`T.copy(source, destination)` copies a whole temporary tile. At least one operand
-is a named shared or fragment buffer, which determines the copy extent. An
-expression such as `A[block_row, block_col]` identifies the origin of a global
-tile, with the same rank as the temporary tile. Slices and partial temporary
-copies are outside this grammar.
+`T.copy(source, destination)` accepts whole buffers, positive unit-stride slices,
+and fixed indices within sliced regions. Slice extents must simplify to static
+integers. Unit dimensions are matched through the remaining non-unit extents.
+For example, `T.copy(A[row, :], tile)` copies a matrix row to a vector tile.
+An operand containing only indices is a tile origin whose extent is inferred
+from the other operand. Two whole buffers require equal shapes. Two indexed
+elements inside a parallel loop form a scalar copy with dtype conversion.
+
+Global-to-global copies and partial shared/fragment copies are supported. A
+partial temporary destination must already be initialized so its untouched
+elements have defined values. A full-region copy initializes its destination.
+Copies between overlapping regions of one temporary buffer capture source
+values before writing the destination. Fragment regions use their physical
+owners or a synchronized shared view when communication is required.
+
+The synchronous lowering accepts `prefer_instruction="sync"`, `disable_tma`,
+and the normal eviction policy. Supported annotation values override individual
+keyword options. Explicit vector widths, custom copy layouts, other eviction
+policies, and asynchronous instruction preferences require further lowering.
 
 Each out-of-bounds global read returns zero. Each out-of-bounds global write is
 suppressed. The implementation emits control-flow guards around reads, so an
@@ -71,11 +85,15 @@ invalid pointer is never dereferenced to compute the masked value.
 
 Collective operations execute at block scope or inside uniform serial loops.
 Shared copies, shared fills, and GEMM include synchronization around shared
-accesses and reuse. Collectives inside `T.Parallel` are rejected.
+accesses and reuse. Parallel loops can initialize or update shared elements at
+their matching logical indices; barriers surround these loops. Cross-element
+reads from a shared tile that is also written in the same parallel loop are
+rejected. Collective tile copies inside `T.Parallel` are rejected.
 
 Global write indices must satisfy the compiler's conservative affine ownership
-rule. Multiple write sites to an output require mutually exclusive branches with
-the same affine ownership mapping. This restriction prevents branches taken by
+rule. Multiple write sites to an output require proven disjoint address ranges
+or mutually exclusive branches with the same affine ownership mapping.
+This restriction prevents branches taken by
 different lanes from writing the same location. Outputs are not read by the kernel.
 Aliasing between parameters is rejected at launch. Input tensors may be read
 by multiple threads. Grid coverage remains part of the source program: positions

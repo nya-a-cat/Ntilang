@@ -7,6 +7,7 @@ from examples.matmul import matmul
 from examples.matmul_relu import matmul_relu
 from examples.piecewise import piecewise
 from examples.softmax import softmax
+from examples.transpose import transpose
 from examples.vector_add import vector_add
 
 pytestmark = pytest.mark.gpu
@@ -76,6 +77,14 @@ def test_softmax_on_gpu(torch_cuda):
     b = torch.empty_like(a)
     softmax(target=target_for(torch))(a, b)
     torch.testing.assert_close(b, torch.softmax(a, dim=1), rtol=2e-5, atol=2e-6)
+
+
+def test_shared_transpose_on_gpu(torch_cuda):
+    torch = torch_cuda
+    a = torch.randn(65, 71, device="cuda")
+    b = torch.empty(71, 65, device="cuda")
+    transpose(target=target_for(torch))(a, b)
+    torch.testing.assert_close(b, a.T, rtol=0, atol=0)
 
 
 def test_nondefault_stream_on_gpu(torch_cuda):

@@ -84,6 +84,7 @@ Choose a target matching the GPU that will execute the kernel. The default
 - [Matrix multiplication with ReLU](examples/matmul_relu.py): scale, tensor bias, and activation in the accumulator's register layout.
 - [Piecewise transform](examples/piecewise.py): data-dependent `if`/`elif`/`else` with guarded output writes.
 - [Softmax](examples/softmax.py): stable row normalization with maximum/sum reductions, fragment broadcasts, and tail masking.
+- [Tiled transpose](examples/transpose.py): sliced copies, shared element stores, and masked output tiles.
 
 Example factories accept `target=`. A shape-specialized factory can also be
 decorated with `@ntilang.jit(target="sm_80")` and return a `@T.prim_func`.
@@ -128,10 +129,15 @@ Fragment broadcasts, transposes expressed as element reads, and other bounded
 cross-element reads use synchronized shared-memory communication. Their source
 fragment must remain unchanged within the parallel loop.
 
+Copies accept static unit-stride slices, fixed dimensions, whole buffers, and
+inferred tile origins. Partial shared/fragment transfers and global-to-global
+copies are supported. Overlapping temporary copies capture source values before
+writing. Shared element stores use the matching parallel tile's ownership.
+
 Global tile loads outside the tensor return zero; global stores outside the
 tensor are masked. The initial write checker accepts disjoint affine tile
-indices. Multiple writes to a parameter require mutually exclusive branches
-with identical ownership. Output parameters cannot also be read. Buffers
+indices. Multiple writes to a parameter require proven disjoint ranges or
+mutually exclusive branches with identical ownership. Output parameters cannot also be read. Buffers
 are allocated at kernel scope, and collective operations execute outside
 parallel element loops.
 

@@ -16,9 +16,9 @@ def typed_copy(dtype, *, target="sm_80"):
         with T.Kernel(1, threads=32) as _bx:
             fragment = T.alloc_fragment((64,), dtype)
             shared = T.alloc_shared((64,), dtype)
-            T.copy(A, fragment)
+            T.copy(A[0], fragment)
             T.copy(fragment, shared)
-            T.copy(shared, B)
+            T.copy(shared, B[0])
 
     return ntilang.compile(kernel, target=target)
 

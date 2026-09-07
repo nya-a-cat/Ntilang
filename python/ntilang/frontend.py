@@ -22,6 +22,7 @@ from .ir import (
     Statement,
     TensorType,
 )
+from .validation import affine
 
 BINOPS = {
     ast.Add: "+",
@@ -88,14 +89,18 @@ class Parser:
         self.fail(node, "Only ntilang.language operations are supported in kernels")
 
     def static(self, node):
-        if isinstance(node, ast.Constant) and type(node.value) in (int, float, str, bool):
+        if isinstance(node, ast.Constant) and (
+            type(node.value) in (int, float, str, bool) or node.value is None
+        ):
             return node.value
         if isinstance(node, ast.Name) and node.id in self.constants:
             value = self.constants[node.id]
             if isinstance(value, language.DType):
                 return str(value)
-            if type(value) in (int, float, str, bool, tuple):
+            if value is None or type(value) in (int, float, str, bool, tuple, dict):
                 return value
+        if isinstance(node, ast.Dict) and all(key is not None for key in node.keys):
+            return {self.static(key): self.static(value) for key, value in zip(node.keys, node.values)}
         if isinstance(node, (ast.Tuple, ast.List)):
             return tuple(self.static(x) for x in node.elts)
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
@@ -268,23 +273,120 @@ class Parser:
             return node.id
         self.fail(node, "Expected a declared buffer")
 
-    def region(self, node, shape):
+    def region_spec(self, node):
         if isinstance(node, ast.Name):
             name = self.buffer_name(node)
-            origin = tuple(Expr("const", value=0) for _ in shape)
+            shape = self.buffers[name].type.shape
+            return name, tuple(Expr("const", value=0) for _ in shape), shape
         elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
             name = self.buffer_name(node.value)
-            origin = self.indices(node.slice)
         else:
-            self.fail(node, "Expected a whole tile or a global tensor tile origin")
-        buf = self.buffers[name]
-        if len(origin) != len(buf.type.shape) or len(shape) != len(origin):
-            self.fail(node, "Copy rank mismatch")
-        if buf.space != "global" and (
-            shape != buf.type.shape or any(x != Expr("const", value=0) for x in origin)
+            self.fail(node, "Expected a buffer, a sliced region, or a tile origin")
+        shape = self.buffers[name].type.shape
+        parts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+        if len(parts) != len(shape):
+            self.fail(node, "Copy regions require one index or slice per buffer dimension")
+        if not any(isinstance(part, ast.Slice) for part in parts):
+            return name, tuple(self.expr(part) for part in parts), None
+        origins, extents = [], []
+        for part, size in zip(parts, shape):
+            if isinstance(part, ast.Slice):
+                if part.step is not None and self.static(part.step) != 1:
+                    self.fail(part, "Copy slices require unit stride")
+                start = Expr("const", value=0) if part.lower is None else self.expr(part.lower)
+                stop = Expr("const", value=size) if part.upper is None else self.expr(part.upper)
+                try:
+                    extent, coefficients = affine(Expr("-", (stop, start)), {})
+                except CompileError:
+                    self.fail(part, "Copy slice extents must simplify to static integers")
+                if coefficients or extent <= 0:
+                    self.fail(part, "Copy slice extents must be positive static integers")
+                origins.append(start)
+                extents.append(extent)
+            else:
+                origins.append(self.expr(part))
+                extents.append(1)
+        return name, tuple(origins), tuple(extents)
+
+    def copy_statement(self, call, node, parallel, nested):
+        options = {
+            "coalesced_width": None,
+            "disable_tma": False,
+            "eviction_policy": None,
+            "prefer_instruction": None,
+            "annotations": None,
+            "loop_layout": None,
+        }
+        if len(call.args) > 2:
+            self.fail(call, "Copy options are keyword-only")
+        args = self.bind_call(call, ["src", "dst", *options], options)
+        settings = {name: self.static(args[name]) for name in options}
+        annotations = settings.pop("annotations")
+        if annotations is not None and type(annotations) is not dict:
+            self.fail(call, "Copy annotations must be a static dictionary")
+        settings["parallel_loop_layout"] = settings.pop("loop_layout")
+        if annotations:
+            if set(annotations) - settings.keys():
+                self.fail(call, "Unsupported copy lowering annotation")
+            settings.update(annotations)
+        if type(settings["disable_tma"]) is not bool:
+            self.fail(call, "Copy disable_tma must be bool")
+        if settings["coalesced_width"] is not None or settings["parallel_loop_layout"] is not None:
+            self.fail(call, "Explicit copy vector widths and layouts need further lowering")
+        if settings["eviction_policy"] not in (None, "evict_normal"):
+            self.fail(call, "This copy lowering supports the normal cache eviction policy")
+        if settings["prefer_instruction"] not in (None, "sync"):
+            self.fail(call, "This copy lowering supports prefer_instruction='sync'")
+        source = self.region_spec(args["src"])
+        destination = self.region_spec(args["dst"])
+        if source[2] is None and destination[2] is None:
+            assignment = ast.Assign(targets=[args["dst"]], value=args["src"])
+            ast.copy_location(assignment, node)
+            return self.statement(assignment, parallel=parallel, nested=nested)
+        if parallel:
+            self.fail(call, "Collective tile operations cannot appear inside T.Parallel")
+        if (
+            isinstance(args["src"], ast.Name)
+            and isinstance(args["dst"], ast.Name)
+            and source[2] != destination[2]
         ):
-            self.fail(node, "Copies of partial shared or fragment buffers are not supported")
-        return Region(name, origin, shape)
+            self.fail(call, "Whole-buffer copies require equal shapes; use an explicit origin or slice")
+
+        def with_extent(spec, other):
+            name, origin, extents = spec
+            if extents is None:
+                extents = other[2]
+                while len(extents) > len(origin) and extents[0] == 1:
+                    extents = extents[1:]
+                if len(extents) > len(origin):
+                    self.fail(call, "Copy origin has insufficient dimensions for the tile")
+                extents = (1,) * (len(origin) - len(extents)) + extents
+            return name, origin, extents
+
+        source = with_extent(source, destination)
+        destination = with_extent(destination, source)
+        src_shape = tuple(size for size in source[2] if size != 1) or (1,)
+        dst_shape = tuple(size for size in destination[2] if size != 1) or (1,)
+        if src_shape != dst_shape:
+            self.fail(call, "Copy regions must have equal non-unit extents")
+        Partition(src_shape, self.threads)
+
+        def region(spec):
+            name, origin, extents = spec
+            axes, axis = [], 0
+            for extent in extents:
+                axes.append(None if extent == 1 else axis)
+                axis += extent != 1
+            return Region(name, origin, src_shape, tuple(axes))
+
+        src, dst = region(source), region(destination)
+        if self.buffers[src.buffer].space != "global" and src.buffer not in self.initialized:
+            self.fail(call, f"Buffer {src.buffer} is read before initialization")
+        if dst.is_full(self.buffers[dst.buffer].type.shape):
+            self.initialized.add(dst.buffer)
+        elif self.buffers[dst.buffer].space != "global" and dst.buffer not in self.initialized:
+            self.fail(call, "Partial temporary copies require an initialized destination")
+        return Statement("copy", (src, dst), self.location(node))
 
     def statement(self, node, *, parallel=False, nested=False):
         loc = self.location(node)
@@ -344,14 +446,14 @@ class Parser:
                 idx = self.indices(target.slice)
                 if len(idx) != len(self.buffers[name].type.shape):
                     self.fail(node, "Store rank mismatch")
-                if self.buffers[name].space == "fragment":
+                if self.buffers[name].space in ("fragment", "shared"):
                     shape, names = self.parallel_context
                     expected = tuple(Expr("var", value=n) for n in names)
                     if self.buffers[name].type.shape != shape or idx != expected:
-                        self.fail(node, "Fragment stores require the matching T.Parallel shape and indices")
+                        self.fail(
+                            node, "Temporary element stores require the matching T.Parallel shape and indices"
+                        )
                     self.initialized.add(name)
-                elif self.buffers[name].space != "global":
-                    self.fail(node, "Shared element stores require a thread-ownership analysis")
                 return Statement("store", (name, idx, value), loc)
         if isinstance(node, ast.For):
             name = self.call_name(node.iter)
@@ -417,6 +519,8 @@ class Parser:
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
             call = node.value
             name = self.call_name(call)
+            if name == "copy":
+                return self.copy_statement(call, node, parallel, nested)
             if parallel:
                 self.fail(node, "Collective tile operations cannot appear inside T.Parallel")
             if name == "reduce" or name.startswith("reduce_"):
@@ -430,24 +534,6 @@ class Parser:
                 value = Expr("const", value=0) if name == "clear" else self.expr(call.args[1])
                 self.initialized.add(buf)
                 return Statement("fill", (buf, value), loc)
-            if name == "copy":
-                if len(call.args) != 2 or call.keywords:
-                    self.fail(node, "T.copy expects exactly source and destination")
-                tiles = [
-                    self.buffers[x.id]
-                    for x in call.args
-                    if isinstance(x, ast.Name)
-                    and x.id in self.buffers
-                    and self.buffers[x.id].space != "global"
-                ]
-                if not tiles:
-                    self.fail(node, "T.copy requires a shared or fragment tile to determine the extent")
-                shape = tiles[0].type.shape
-                src, dst = (self.region(x, shape) for x in call.args)
-                if self.buffers[src.buffer].space != "global" and src.buffer not in self.initialized:
-                    self.fail(node, f"Buffer {src.buffer} is read before initialization")
-                self.initialized.add(dst.buffer)
-                return Statement("copy", (src, dst), loc)
             if name == "gemm":
                 if len(call.args) != 3:
                     self.fail(node, "T.gemm expects A, B, accumulator")

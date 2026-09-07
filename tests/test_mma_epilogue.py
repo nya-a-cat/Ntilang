@@ -24,16 +24,16 @@ def mma_copy_chain(threads=128):
             bias = T.alloc_fragment((32, 64), "float32")
             acc = T.alloc_fragment((32, 64), "float32")
             narrow = T.alloc_fragment((32, 64), "float16")
-            T.copy(Bias, bias)
+            T.copy(Bias[0, 0], bias)
             T.copy(bias, acc)
-            T.copy(A, sa)
-            T.copy(B, sb)
+            T.copy(A[0, 0], sa)
+            T.copy(B[0, 0], sb)
             T.gemm(sa, sb, acc)
             for i, j in T.Parallel(32, 64):
                 acc[i, j] *= 0.5
                 narrow[i, j] = T.maximum(acc[i, j] + bias[i, j], 0.0)
             T.copy(narrow, shared_out)
-            T.copy(shared_out, C)
+            T.copy(shared_out, C[0, 0])
 
     return ntilang.compile(kernel)
 

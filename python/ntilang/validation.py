@@ -55,27 +55,28 @@ def interval(expr, bounds, definitions):
     return result
 
 
-def affine(expr, definitions):
+def affine(expr, definitions, bounds=None):
     """Return constant and integer coefficients, or reject a non-affine expression."""
     if expr.op == "const" and type(expr.value) is int:
         return expr.value, {}
     if expr.op == "phi":
-        alternatives = [affine(x, definitions) for x in expr.args]
+        alternatives = [affine(x, definitions, bounds) for x in expr.args]
         if all(x == alternatives[0] for x in alternatives):
             return alternatives[0]
         raise CompileError("Global writes require branch-independent affine ownership")
     if expr.op == "var":
         if expr.value in definitions:
-            return affine(definitions[expr.value], definitions)
+            return affine(definitions[expr.value], definitions, bounds)
         return 0, {expr.value: 1}
     if expr.op == "cast" and (expr.value.startswith(("int", "uint")) or expr.value == "bool"):
-        return affine(expr.args[0], definitions)
+        interval(expr, {} if bounds is None else bounds, definitions)
+        return affine(expr.args[0], definitions, bounds)
     if expr.op in ("neg", "pos"):
-        const, coeff = affine(expr.args[0], definitions)
+        const, coeff = affine(expr.args[0], definitions, bounds)
         sign = -1 if expr.op == "neg" else 1
         return sign * const, {n: sign * v for n, v in coeff.items()}
     if expr.op in ("+", "-", "*"):
-        (ac, av), (bc, bv) = (affine(x, definitions) for x in expr.args)
+        (ac, av), (bc, bv) = (affine(x, definitions, bounds) for x in expr.args)
         if expr.op in ("+", "-"):
             sign = -1 if expr.op == "-" else 1
             out = av.copy()
@@ -102,7 +103,7 @@ def check_ownership(indices, bounds, definitions):
     recovered = set()
     for index in indices:
         interval(index, bounds, definitions)
-        _, coefficients = affine(index, definitions)
+        _, coefficients = affine(index, definitions, bounds)
         ordered = sorted((abs(c), n) for n, c in coefficients.items() if c and n in active)
         span = 0
         for coefficient, name in ordered:
@@ -140,16 +141,28 @@ def validate(kernel: Kernel):
         if in_serial:
             raise CompileError("Write global outputs after serial tile accumulation loops")
         check_ownership(indices, bounds, definitions)
-        mapping = (tuple(affine(x, definitions) for x in indices), bounds)
-        for previous_path, previous_mapping in writes.get(name, []):
+        mapping = (tuple(affine(x, definitions, bounds) for x in indices), bounds)
+        footprint = tuple(
+            (max(0, low), min(size - 1, high))
+            for (low, high), size in zip(
+                (interval(x, bounds, definitions) for x in indices), buffers[name].type.shape
+            )
+        )
+        for previous_path, previous_mapping, previous_footprint in writes.get(name, []):
+            disjoint = any(
+                high < old_low or old_high < low
+                for (low, high), (old_low, old_high) in zip(footprint, previous_footprint)
+            )
+            if disjoint:
+                continue
             exclusive = any(
                 key in previous_path and previous_path[key] != value for key, value in path.items()
             )
             if not exclusive or mapping != previous_mapping:
                 raise CompileError(
-                    f"Output {name} has multiple write sites without exclusive branches and identical ownership"
+                    f"Output {name} has multiple write sites without disjoint regions or exclusive branches and identical ownership"
                 )
-        writes.setdefault(name, []).append((path.copy(), mapping))
+        writes.setdefault(name, []).append((path.copy(), mapping, footprint))
 
     def statements(body, bounds, definitions, in_serial=False, path=None):
         path = {} if path is None else path
@@ -191,8 +204,16 @@ def validate(kernel: Kernel):
                     tile_bounds = {**bounds, **{n: (0, size - 1) for n, size in zip(tile_names, src.shape)}}
                     for region in (src, dst):
                         indices = tuple(
-                            Expr("+", (origin, Expr("var", value=n)))
-                            for origin, n in zip(region.origin, tile_names)
+                            Expr(
+                                "+",
+                                (
+                                    origin,
+                                    Expr("const", value=0)
+                                    if axis is None
+                                    else Expr("var", value=tile_names[axis]),
+                                ),
+                            )
+                            for origin, axis in zip(region.origin, region.axes)
                         )
                         for index in indices:
                             interval(index, tile_bounds, definitions)

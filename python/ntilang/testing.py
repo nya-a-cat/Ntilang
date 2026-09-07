@@ -114,13 +114,17 @@ def reference(kernel: CompiledKernel, *arrays):
             elif op == "copy":
                 src, dst = args
                 src_origin, dst_origin = (tuple(expr(x) for x in r.origin) for r in (src, dst))
+
+                def indices(origin, axes, coord):
+                    return tuple(o + (0 if axis is None else coord[axis]) for o, axis in zip(origin, axes))
+
                 # Materialize the source before modifying a destination.
                 values = [
-                    (coord, read(src.buffer, tuple(o + i for o, i in zip(src_origin, coord))))
+                    (coord, read(src.buffer, indices(src_origin, src.axes, coord)))
                     for coord in np.ndindex(src.shape)
                 ]
                 for coord, value in values:
-                    write(dst.buffer, tuple(o + i for o, i in zip(dst_origin, coord)), value)
+                    write(dst.buffer, indices(dst_origin, dst.axes, coord), value)
             elif op == "gemm":
                 a, b, c, ta, tb = args
                 av, bv = buffers[a], buffers[b]

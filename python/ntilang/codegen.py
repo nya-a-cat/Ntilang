@@ -101,8 +101,10 @@ class Emitter:
         self.reduction_workspaces = {}
         for stmt in walk(kernel.body):
             if stmt.op == "parallel":
-                _, snapshots = self.parallel_accesses(stmt)
+                _, snapshots, _ = self.parallel_accesses(stmt)
                 self.snapshots.update(snapshots)
+            elif stmt.op == "copy":
+                self.snapshots.update(self.copy_snapshots(*stmt.args))
             elif stmt.op == "reduce":
                 src, dst = stmt.args[:2]
                 key = (src, self.buffers[dst].type.dtype)
@@ -110,7 +112,9 @@ class Emitter:
                     self.reduction_workspaces[key] = f"_nt_reduce_workspace_{len(self.reduction_workspaces)}"
         shared_bytes = 0
         for buffer in kernel.buffers:
-            if buffer.space == "shared" or buffer.name in self.snapshots:
+            for needed in (buffer.name in self.snapshots, buffer.space == "shared"):
+                if not needed:
+                    continue
                 shared_bytes = (shared_bytes + 15) // 16 * 16
                 shared_bytes += prod(buffer.type.shape) * DTYPES[buffer.type.dtype]
         for src, dtype in self.reduction_workspaces:
@@ -123,6 +127,7 @@ class Emitter:
         names, shape, body = stmt.args
         expected = tuple(Expr("var", value=n) for n in names)
         pointwise, snapshots, written = set(), set(), set()
+        shared_used, shared_written, shared_cross_reads = set(), set(), set()
 
         def loads(value):
             if isinstance(value, Expr):
@@ -131,6 +136,10 @@ class Emitter:
                         pointwise.add(value.value)
                     else:
                         snapshots.add(value.value)
+                elif value.op == "load" and self.buffers[value.value].space == "shared":
+                    shared_used.add(value.value)
+                    if self.buffers[value.value].type.shape != shape or value.args != expected:
+                        shared_cross_reads.add(value.value)
                 for arg in value.args:
                     loads(arg)
             elif isinstance(value, (tuple, list)):
@@ -141,12 +150,20 @@ class Emitter:
             loads(inner.args)
             if inner.op == "store" and self.buffers[inner.args[0]].space == "fragment":
                 written.add(inner.args[0])
+            elif inner.op == "store" and self.buffers[inner.args[0]].space == "shared":
+                shared_used.add(inner.args[0])
+                shared_written.add(inner.args[0])
         if snapshots & written:
             raise CompileError(
                 "Cross-element fragment reads require a separate source fragment from parallel writes",
                 stmt.location,
             )
-        return pointwise | written, snapshots
+        if shared_cross_reads & shared_written:
+            raise CompileError(
+                "Cross-element shared reads require a separate source tile from parallel writes",
+                stmt.location,
+            )
+        return pointwise | written, snapshots, bool(shared_used)
 
     def infer_fragment_layouts(self):
         # Connected pointwise operations and whole-tile copies share ownership.
@@ -162,9 +179,10 @@ class Emitter:
         for stmt in walk(self.kernel.body):
             names = set()
             if stmt.op == "parallel":
-                names, _ = self.parallel_accesses(stmt)
+                names, _, _ = self.parallel_accesses(stmt)
             elif stmt.op == "copy":
-                names = {r.buffer for r in stmt.args if self.buffers[r.buffer].space == "fragment"}
+                if all(r.is_full(self.buffers[r.buffer].type.shape) for r in stmt.args):
+                    names = {r.buffer for r in stmt.args if self.buffers[r.buffer].space == "fragment"}
             names = sorted(names)
             for name in names[1:]:
                 parents[root(name)] = root(names[0])
@@ -196,12 +214,20 @@ class Emitter:
         slot = self.unique("mma_slot")
         self.emit(f"for {slot} in cutlass.range_constexpr(cute.size({self.buf(name)})):")
         self.depth += 1
-        return slot, [f"_nt_coords_{layout}[{slot}][{i}]" for i in range(2)], 1
+        physical = iter(f"_nt_coords_{layout}[{slot}][{i}]" for i in range(2))
+        coords = ["0" if size == 1 else next(physical) for size in self.buffers[name].type.shape]
+        return slot, coords, 1
 
     def materialize_fragment(self, name):
         self.emit("cute.arch.sync_threads()")
-        slot, coords, depth = self.loop_fragment(name)
-        self.emit(f"_nt_snapshot_{name}[{', '.join(coords)}] = {self.buf(name)}[{slot}]")
+        if self.buffers[name].space == "fragment":
+            slot, coords, depth = self.loop_fragment(name)
+            value = f"{self.buf(name)}[{slot}]"
+        else:
+            _, coords = self.loop_tile(self.buffers[name].type.shape)
+            depth = 2
+            value = self.access(name, coords)
+        self.emit(f"_nt_snapshot_{name}[{', '.join(coords)}] = {value}")
         self.depth -= depth
         self.emit("cute.arch.sync_threads()")
 
@@ -297,28 +323,73 @@ class Emitter:
         return slot, self.coordinates(flat, shape)
 
     def region_indices(self, region, coords):
-        return [f"({self.expression(origin)} + {coord})" for origin, coord in zip(region.origin, coords)]
+        return [
+            f"({self.expression(origin)} + {coords[axis] if axis is not None else '0'})"
+            for origin, axis in zip(region.origin, region.axes)
+        ]
+
+    def region_coordinates(self, region, buffer_coords):
+        coords = ["0"] * len(region.shape)
+        for index, origin, axis in zip(buffer_coords, region.origin, region.axes):
+            if axis is not None:
+                coords[axis] = f"({index} - {self.expression(origin)})"
+        return coords
+
+    def region_predicate(self, region, buffer_coords):
+        predicates = []
+        for index, origin, size in zip(buffer_coords, region.origin, region.extents):
+            start = self.expression(origin)
+            predicates.append(
+                f"({start} <= {index} and cutlass.Int64({index}) < (cutlass.Int64({start}) + {size}))"
+            )
+        return " and ".join(predicates)
+
+    def copy_snapshots(self, src, dst):
+        if src.buffer == dst.buffer and src != dst:
+            return {src.buffer}
+        if self.buffers[src.buffer].space == "fragment" and (
+            not src.is_full(self.buffers[src.buffer].type.shape)
+            or self.buffers[dst.buffer].space == "fragment"
+            and not dst.is_full(self.buffers[dst.buffer].type.shape)
+        ):
+            return {src.buffer}
+        return set()
 
     def copy(self, src, dst):
+        snapshots = self.copy_snapshots(src, dst)
+        for name in sorted(snapshots):
+            self.materialize_fragment(name)
         # A uniform barrier also protects shared tiles reused after readers finish.
         shared = any(self.buffers[r.buffer].space == "shared" for r in (src, dst))
         if shared:
             self.emit("cute.arch.sync_threads()")
-        fragments = [r.buffer for r in (src, dst) if self.buffers[r.buffer].space == "fragment"]
-        if fragments:
-            slot, coords, depth = self.loop_fragment(fragments[0])
+        if self.buffers[dst.buffer].space == "fragment":
+            slot, buffer_coords, depth = self.loop_fragment(dst.buffer)
+            coords = self.region_coordinates(dst, buffer_coords)
+            if not dst.is_full(self.buffers[dst.buffer].type.shape):
+                self.emit(f"if {self.region_predicate(dst, buffer_coords)}:")
+                self.depth += 1
+                depth += 1
+        elif self.buffers[src.buffer].space == "fragment" and src.buffer not in snapshots:
+            slot, buffer_coords, depth = self.loop_fragment(src.buffer)
+            coords = self.region_coordinates(src, buffer_coords)
         else:
             slot, coords = self.loop_tile(src.shape)
             depth = 2
         src_idx, dst_idx = self.region_indices(src, coords), self.region_indices(dst, coords)
-        if self.buffers[src.buffer].space == "fragment":
+        if self.buffers[src.buffer].space == "fragment" and src.buffer not in snapshots:
             value = f"{self.buf(src.buffer)}[{slot}]"
         else:
             value = self.unique("copy_value")
             self.emit(f"{value} = {self.dtype(src.buffer)}(0)")
             self.emit(f"if {self.predicate(src.buffer, src_idx)}:")
             self.depth += 1
-            self.emit(f"{value} = {self.access(src.buffer, src_idx)}")
+            source = (
+                f"_nt_snapshot_{src.buffer}[{', '.join(src_idx)}]"
+                if src.buffer in snapshots
+                else self.access(src.buffer, src_idx)
+            )
+            self.emit(f"{value} = {source}")
             self.depth -= 1
         if self.buffers[dst.buffer].space == "fragment":
             self.emit(f"{self.buf(dst.buffer)}[{slot}] = {self.dtype(dst.buffer)}({value})")
@@ -328,7 +399,7 @@ class Emitter:
             self.emit(f"{self.access(dst.buffer, dst_idx)} = {self.dtype(dst.buffer)}({value})")
             self.depth -= 1
         self.depth -= depth
-        if shared:
+        if shared or snapshots:
             self.emit("cute.arch.sync_threads()")
 
     def gemm(self, a, b, c, ta, tb):
@@ -521,7 +592,9 @@ class Emitter:
                 self.depth -= 1
             elif op == "parallel":
                 names, shape, inner = args
-                fragments, snapshots = self.parallel_accesses(stmt)
+                fragments, snapshots, shared = self.parallel_accesses(stmt)
+                if shared:
+                    self.emit("cute.arch.sync_threads()")
                 for name in sorted(snapshots):
                     self.materialize_fragment(name)
                 self.active_snapshots = snapshots
@@ -545,6 +618,8 @@ class Emitter:
                 self.parallel = None
                 self.active_snapshots = set()
                 self.depth -= depth
+                if shared:
+                    self.emit("cute.arch.sync_threads()")
             else:
                 raise CompileError(f"Unsupported IR operation {op}", stmt.location)
 
