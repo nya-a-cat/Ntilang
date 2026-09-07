@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
-from .ir import CompileError, Expr, Kernel, integer_limits
+from .ir import DTYPES, CompileError, Expr, Kernel, integer_limits
+from .scalar import BITWISE_OPS, expression_dtype
 
 INT_MIN, INT_MAX = -(2**31), 2**31 - 1
+
+
+def resolved_dtype(expr, bounds, definitions, buffers):
+    def resolve(value):
+        if value.op == "var" and value.value in definitions:
+            return resolve(definitions[value.value])
+        return Expr(value.op, tuple(resolve(arg) for arg in value.args), value.value)
+
+    return expression_dtype(resolve(expr), buffers, {name: "int32" for name in bounds})
 
 
 def interval(expr, bounds, definitions):
@@ -25,9 +35,41 @@ def interval(expr, bounds, definitions):
         low, high = integer_limits(expr.value)
         if result[0] < low or result[1] > high:
             raise CompileError("An integer index cast can change the represented value")
-    elif expr.op in ("neg", "pos"):
+    elif expr.op in ("neg", "pos", "invert"):
         low, high = interval(expr.args[0], bounds, definitions)
-        result = (-high, -low) if expr.op == "neg" else (low, high)
+        result = (-high, -low) if expr.op == "neg" else (~high, ~low) if expr.op == "invert" else (low, high)
+        if expr.op == "invert":
+            dtype = resolved_dtype(expr, bounds, definitions, {})
+            if dtype.startswith("uint"):
+                mask = integer_limits(dtype)[1]
+                result = (mask - high, mask - low)
+    elif expr.op in ("&", "|", "^", "<<", ">>"):
+        a, b = (interval(x, bounds, definitions) for x in expr.args)
+        dtype = resolved_dtype(expr, bounds, definitions, {})
+        type_low, type_high = integer_limits(dtype)
+        if dtype.startswith("uint"):
+
+            def unsigned(values):
+                low, high = values
+                if high < 0:
+                    return (low + type_high + 1, high + type_high + 1)
+                return (0, type_high) if low < 0 else values
+
+            a, b = unsigned(a), unsigned(b)
+        if expr.op in ("<<", ">>"):
+            if b[0] < 0 or b[1] >= DTYPES[dtype] * 8:
+                raise CompileError("Index shift counts must be within the promoted integer width")
+            operation = (lambda x, y: x << y) if expr.op == "<<" else (lambda x, y: x >> y)
+            endpoints = [operation(x, y) for x in a for y in b]
+            result = (min(endpoints), max(endpoints))
+            if result[0] < type_low or result[1] > type_high:
+                raise CompileError("An index shift can overflow its integer dtype")
+        elif expr.op == "&" and (a[0] >= 0 or b[0] >= 0):
+            result = (0, min(high for low, high in (a, b) if low >= 0))
+        elif a[0] >= 0 and b[0] >= 0:
+            result = (0, (1 << max(a[1].bit_length(), b[1].bit_length())) - 1)
+        else:
+            result = (INT_MIN, INT_MAX)
     elif expr.op in ("+", "-", "*", "//", "%"):
         a, b = (interval(x, bounds, definitions) for x in expr.args)
         if expr.op == "+":
@@ -75,6 +117,11 @@ def affine(expr, definitions, bounds=None):
         const, coeff = affine(expr.args[0], definitions, bounds)
         sign = -1 if expr.op == "neg" else 1
         return sign * const, {n: sign * v for n, v in coeff.items()}
+    if expr.op == "<<":
+        shift, coefficients = affine(expr.args[1], definitions, bounds)
+        if not coefficients and 0 <= shift < 32:
+            interval(expr, {} if bounds is None else bounds, definitions)
+            return affine(Expr("*", (expr.args[0], Expr("const", value=1 << shift))), definitions, bounds)
     if expr.op in ("+", "-", "*"):
         (ac, av), (bc, bv) = (affine(x, definitions, bounds) for x in expr.args)
         if expr.op in ("+", "-"):
@@ -127,6 +174,19 @@ def validate(kernel: Kernel):
     initial_bounds = {name: (0, size - 1) for name, size in zip(kernel.block_vars, kernel.grid)}
 
     def expression(expr, bounds, definitions):
+        if expr.op in BITWISE_OPS:
+            dtype = resolved_dtype(expr, bounds, definitions, buffers)
+            if expr.op in ("<<", ">>"):
+                try:
+                    low, high = interval(expr.args[1], bounds, definitions)
+                except CompileError:
+                    # Data-dependent counts retain the upstream valid-count precondition.
+                    pass
+                else:
+                    if low < 0 or high >= DTYPES[dtype] * 8:
+                        raise CompileError(
+                            "Shift count must be nonnegative and smaller than the promoted integer width"
+                        )
         if expr.op in ("//", "%"):
             interval(expr, bounds, definitions)
         if expr.op == "load":

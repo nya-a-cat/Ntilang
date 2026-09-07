@@ -7,7 +7,7 @@ import re
 from math import isfinite, isnan, prod
 
 from .ir import DTYPES, CompileError, Expr, Kernel, Partition, integer_limits
-from .scalar import body_types, expression_dtype
+from .scalar import BITWISE_OPS, body_types, expression_dtype
 
 CUTLASS_TYPES = {
     "float16": "Float16",
@@ -297,6 +297,12 @@ class Emitter:
             self.depth -= 1
             return temp
         values = [self.expression(x) for x in expr.args]
+        if op in BITWISE_OPS:
+            dtype = expression_dtype(expr, self.buffers, self.scalar_types)
+            values = [f"cutlass.{CUTLASS_TYPES[dtype]}({value})" for value in values]
+            if op == "invert":
+                return f"(~{values[0]})"
+            return "(" + f" {op} ".join(values) + ")"
         if op in ("neg", "pos", "not"):
             symbol = {"neg": "-", "pos": "+", "not": "not "}[op]
             return f"({symbol}{values[0]})"

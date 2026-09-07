@@ -2,6 +2,8 @@
 
 from .ir import DTYPES, CompileError
 
+BITWISE_OPS = frozenset(("&", "|", "^", "invert", "<<", ">>"))
+
 
 def promote(left, right):
     if left == right:
@@ -39,6 +41,12 @@ def expression_dtype(expr, buffers, variables):
         return expr.value
     if expr.op in ("<", "<=", ">", ">=", "==", "!=", "and", "or", "not"):
         return "bool"
+    if expr.op in BITWISE_OPS:
+        types = [expression_dtype(arg, buffers, variables) for arg in expr.args]
+        if any(not (dtype.startswith(("int", "uint")) or dtype == "bool") for dtype in types):
+            raise CompileError("Bitwise operations require integer or Boolean operands")
+        if expr.op in ("<<", ">>") and "bool" in types:
+            raise CompileError("Shift operations require integer operands, excluding Boolean")
     result = expression_dtype(expr.args[0], buffers, variables)
     for arg in expr.args[1:]:
         result = promote(result, expression_dtype(arg, buffers, variables))

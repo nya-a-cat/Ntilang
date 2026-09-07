@@ -31,6 +31,19 @@ BINOPS = {
     ast.Div: "/",
     ast.FloorDiv: "//",
     ast.Mod: "%",
+    ast.BitAnd: "&",
+    ast.BitOr: "|",
+    ast.BitXor: "^",
+    ast.LShift: "<<",
+    ast.RShift: ">>",
+}
+BITWISE_CALLS = {
+    "bitwise_and": "&",
+    "bitwise_or": "|",
+    "bitwise_xor": "^",
+    "bitwise_not": "invert",
+    "shift_left": "<<",
+    "shift_right": ">>",
 }
 COMPARISONS = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==", ast.NotEq: "!="}
 STATIC_OPS = {
@@ -39,6 +52,11 @@ STATIC_OPS = {
     ast.Mult: operator.mul,
     ast.FloorDiv: operator.floordiv,
     ast.Mod: operator.mod,
+    ast.BitAnd: operator.and_,
+    ast.BitOr: operator.or_,
+    ast.BitXor: operator.xor,
+    ast.LShift: operator.lshift,
+    ast.RShift: operator.rshift,
 }
 
 
@@ -103,13 +121,17 @@ class Parser:
             return {self.static(key): self.static(value) for key, value in zip(node.keys, node.values)}
         if isinstance(node, (ast.Tuple, ast.List)):
             return tuple(self.static(x) for x in node.elts)
-        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub, ast.Invert)):
             value = self.static(node.operand)
+            if isinstance(node.op, ast.Invert):
+                if type(value) not in (int, bool):
+                    self.fail(node, "Static bitwise inversion requires an integer")
+                return ~value
             return -value if isinstance(node.op, ast.USub) else value
         if isinstance(node, ast.BinOp) and type(node.op) in STATIC_OPS:
             try:
                 return STATIC_OPS[type(node.op)](self.static(node.left), self.static(node.right))
-            except (TypeError, ZeroDivisionError) as exc:
+            except (TypeError, ValueError, ZeroDivisionError) as exc:
                 self.fail(node, f"Invalid static expression: {exc}")
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             if self.constants.get(node.value.id) is language and node.attr in language.DTYPE_NAMES:
@@ -210,7 +232,7 @@ class Parser:
     def indices(self, node):
         parts = node.elts if isinstance(node, ast.Tuple) else [node]
         if any(isinstance(p, ast.Slice) for p in parts):
-            self.fail(node, "Use a tile origin such as A[row, col] in T.copy; slices are not supported yet")
+            self.fail(node, "Scalar element access requires indices; use slices in T.copy")
         return tuple(self.expr(p) for p in parts)
 
     def expr(self, node):
@@ -233,8 +255,8 @@ class Parser:
             return Expr("load", indices, name)
         if isinstance(node, ast.BinOp) and type(node.op) in BINOPS:
             return Expr(BINOPS[type(node.op)], (self.expr(node.left), self.expr(node.right)))
-        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Not)):
-            op = "neg" if isinstance(node.op, ast.USub) else "pos" if isinstance(node.op, ast.UAdd) else "not"
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Not, ast.Invert)):
+            op = {ast.USub: "neg", ast.UAdd: "pos", ast.Not: "not", ast.Invert: "invert"}[type(node.op)]
             return Expr(op, (self.expr(node.operand),))
         if isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]) in COMPARISONS:
             return Expr(
@@ -246,6 +268,12 @@ class Parser:
             )
         if isinstance(node, ast.Call):
             name = self.call_name(node)
+            if name in BITWISE_CALLS:
+                parameters = ["x"] if name == "bitwise_not" else ["x", "y"]
+                args = self.bind_call(node, [*parameters, "span"], {"span": None})
+                if self.static(args["span"]) is not None:
+                    self.fail(node, "Explicit source span objects require further parser integration")
+                return Expr(BITWISE_CALLS[name], tuple(self.expr(args[key]) for key in parameters))
             if name in language.DTYPE_NAMES and len(node.args) == 1 and not node.keywords:
                 return Expr("cast", (self.expr(node.args[0]),), language.DTYPE_NAMES[name])
             if name == "ceildiv":

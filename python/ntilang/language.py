@@ -113,6 +113,12 @@ for _name in (
     "max",
     "min",
     "cast",
+    "bitwise_and",
+    "bitwise_or",
+    "bitwise_xor",
+    "bitwise_not",
+    "shift_left",
+    "shift_right",
 ):
     _marker = _syntax_operation(_name)
     globals()[_name] = _marker

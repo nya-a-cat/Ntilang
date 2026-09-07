@@ -69,6 +69,18 @@ The 169 pairwise basic-type addition promotions are checked against NVIDIA's
 numeric implementation. Vector and sub-byte dtype variants, external constructor
 behavior, and the remaining dtype utility APIs still need implementation.
 
+Bitwise operators and their six upstream function spellings are implemented for
+basic integer types, with Boolean support for non-shift operations. Lowering
+uses explicit common-type conversions. Static shift counts, unsigned index
+inversion, and narrow index overflow have dedicated checks. General bitwise
+output permutations and non-default source span objects remain open.
+
+The pinned upstream numeric matching source also reveals a remaining difference:
+floating/integer scalar promotion currently follows CuTe's width rules, while
+TileLang's TIR generally converts the integer to the floating operand type.
+Aligning those conversions across arithmetic, comparisons, and scalar joins is
+required compatibility work.
+
 Loop steps and empty iteration domains are preserved. The supported `unroll`
 form emits CuTe compile-time iteration. Loop annotations, partial unroll factors,
 dynamic bounds, and vectorized loop lowering require further implementation.

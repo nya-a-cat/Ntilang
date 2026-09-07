@@ -115,6 +115,7 @@ the same argument contract.
 - `T.gemm(A, B, accumulator, transpose_A=False, transpose_B=False)`.
 - `T.reduce` and sum, absolute-sum, max, absolute-max, min, and bitwise reduction wrappers.
 - Arithmetic, comparisons, dtype constructors, `T.cast`, `T.exp`, `T.exp2`, `T.sqrt`, `T.max`, and `T.min`.
+- Integer and Boolean bitwise operations, integer shifts, and their `T.bitwise_*` / `T.shift_*` spellings.
 - Static shapes; Boolean, signed/unsigned 8/16/32/64-bit integers, FP16, BF16, FP32, and FP64.
 - Conditional statements, branch-defined scalar values, and branch-aware fragment initialization.
 

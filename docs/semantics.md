@@ -122,6 +122,22 @@ remainder used with `//` and `%` are restricted to statically bounded nonnegativ
 integer expressions and positive constant divisors. Data-dependent indexing is
 outside the supported subset.
 
+Integer expressions support `&`, `|`, `^`, `~`, `<<`, and `>>`, together with
+`T.bitwise_and`, `T.bitwise_or`, `T.bitwise_xor`, `T.bitwise_not`, `T.shift_left`,
+and `T.shift_right`. Function spellings accept their upstream operand keyword
+names and the default `span=None`. Binary operands are explicitly converted to
+their common integer type before lowering. Boolean bitwise operations preserve
+one-bit semantics; shifts require integer operands excluding Boolean. Right
+shift is arithmetic for signed types and logical for unsigned types.
+
+A shift count must be nonnegative and smaller than the promoted operand width.
+The compiler rejects invalid statically bounded counts. Data-dependent counts
+retain this source-program precondition. Index analysis tracks unsigned
+conversion, inversion, and shift width; a potentially wrapping index shift is
+rejected. A constant left shift can participate in the affine ownership proof.
+Masks can bound input indices, while general bitwise output permutations still
+require additional ownership analysis.
+
 `T.maximum` and `T.minimum` propagate NaNs. The generator does not request fast
 math for exponential and square-root operations. Floating-point operations
 follow the target compiler's CUDA semantics; bitwise identity with NumPy is not
