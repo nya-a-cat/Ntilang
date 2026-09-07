@@ -10,7 +10,18 @@ import textwrap
 from math import prod
 
 from . import language
-from .ir import Buffer, CompileError, Expr, Kernel, Partition, Region, SourceLocation, Statement, TensorType
+from .ir import (
+    DTYPES,
+    Buffer,
+    CompileError,
+    Expr,
+    Kernel,
+    Partition,
+    Region,
+    SourceLocation,
+    Statement,
+    TensorType,
+)
 
 BINOPS = {
     ast.Add: "+",
@@ -64,6 +75,8 @@ class Parser:
                 return fn.attr
         if isinstance(fn, ast.Name):
             value = self.constants.get(fn.id, getattr(builtins, fn.id, None))
+            if isinstance(value, language.DType):
+                return str(value)
             if value is builtins.range:
                 return "serial"
             if callable(value) and value in language._MARKER_NAMES:
@@ -79,6 +92,8 @@ class Parser:
             return node.value
         if isinstance(node, ast.Name) and node.id in self.constants:
             value = self.constants[node.id]
+            if isinstance(value, language.DType):
+                return str(value)
             if type(value) in (int, float, str, bool, tuple):
                 return value
         if isinstance(node, (ast.Tuple, ast.List)):
@@ -92,13 +107,8 @@ class Parser:
             except (TypeError, ZeroDivisionError) as exc:
                 self.fail(node, f"Invalid static expression: {exc}")
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            if self.constants.get(node.value.id) is language and node.attr in (
-                "float16",
-                "bfloat16",
-                "float32",
-                "int32",
-            ):
-                return node.attr
+            if self.constants.get(node.value.id) is language and node.attr in language.DTYPE_NAMES:
+                return language.DTYPE_NAMES[node.attr]
         if (
             isinstance(node, ast.Call)
             and self.call_name(node) == "ceildiv"
@@ -183,7 +193,9 @@ class Parser:
         kept = shape[:dim] + (1,) + shape[dim + 1 :]
         if destination.type.shape not in (removed, kept):
             self.fail(call, f"Reduction output shape must be {removed} or {kept}")
-        if kind.startswith("bit") and destination.type.dtype != "int32":
+        if kind.startswith("bit") and not (
+            destination.type.dtype.startswith(("int", "uint")) or destination.type.dtype == "bool"
+        ):
             self.fail(call, "Bitwise reductions require an integer output dtype")
         if src not in self.initialized or not clear and dst not in self.initialized:
             self.fail(call, "Reduction reads a buffer before initialization")
@@ -229,14 +241,25 @@ class Parser:
             )
         if isinstance(node, ast.Call):
             name = self.call_name(node)
+            if name in language.DTYPE_NAMES and len(node.args) == 1 and not node.keywords:
+                return Expr("cast", (self.expr(node.args[0]),), language.DTYPE_NAMES[name])
             if name == "ceildiv":
                 return Expr("const", value=self.static(node))
-            arity = {"exp": 1, "exp2": 1, "sqrt": 1, "maximum": 2, "minimum": 2, "cast": 2}
+            arity = {
+                "exp": 1,
+                "exp2": 1,
+                "sqrt": 1,
+                "maximum": 2,
+                "minimum": 2,
+                "max": 2,
+                "min": 2,
+                "cast": 2,
+            }
             if name in arity and len(node.args) == arity[name] and not node.keywords:
                 if name == "cast":
                     dtype = self.static(node.args[1])
                     TensorType((1,), dtype)
-                    return Expr("cast", (self.expr(node.args[0]),), dtype)
+                    return Expr("cast", (self.expr(node.args[0]),), TensorType((1,), dtype).dtype)
                 return Expr(name, tuple(self.expr(x) for x in node.args))
         self.fail(node, f"Unsupported expression: {ast.dump(node, include_attributes=False)}")
 
@@ -503,10 +526,7 @@ class Parser:
         for buffer in self.allocated:
             if buffer.space == "shared":
                 shared_bytes = language.ceildiv(shared_bytes, 16) * 16
-                shared_bytes += (
-                    prod(buffer.type.shape)
-                    * {"float16": 2, "bfloat16": 2, "float32": 4, "int32": 4}[buffer.type.dtype]
-                )
+                shared_bytes += prod(buffer.type.shape) * DTYPES[buffer.type.dtype]
         if shared_bytes > 48 * 1024:
             self.fail(fn, "This version supports at most 48 KiB of shared memory per block")
         return Kernel(

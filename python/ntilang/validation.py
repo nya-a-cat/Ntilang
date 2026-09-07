@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .ir import CompileError, Expr, Kernel
+from .ir import CompileError, Expr, Kernel, integer_limits
 
 INT_MIN, INT_MAX = -(2**31), 2**31 - 1
 
@@ -20,6 +20,11 @@ def interval(expr, bounds, definitions):
         if expr.value not in bounds:
             raise CompileError("Indices must use integer block/loop variables and static constants")
         result = bounds[expr.value]
+    elif expr.op == "cast" and (expr.value.startswith(("int", "uint")) or expr.value == "bool"):
+        result = interval(expr.args[0], bounds, definitions)
+        low, high = integer_limits(expr.value)
+        if result[0] < low or result[1] > high:
+            raise CompileError("An integer index cast can change the represented value")
     elif expr.op in ("neg", "pos"):
         low, high = interval(expr.args[0], bounds, definitions)
         result = (-high, -low) if expr.op == "neg" else (low, high)
@@ -63,6 +68,8 @@ def affine(expr, definitions):
         if expr.value in definitions:
             return affine(definitions[expr.value], definitions)
         return 0, {expr.value: 1}
+    if expr.op == "cast" and (expr.value.startswith(("int", "uint")) or expr.value == "bool"):
+        return affine(expr.args[0], definitions)
     if expr.op in ("neg", "pos"):
         const, coeff = affine(expr.args[0], definitions)
         sign = -1 if expr.op == "neg" else 1
@@ -94,6 +101,7 @@ def check_ownership(indices, bounds, definitions):
     active = {name for name, (low, high) in bounds.items() if high > low}
     recovered = set()
     for index in indices:
+        interval(index, bounds, definitions)
         _, coefficients = affine(index, definitions)
         ordered = sorted((abs(c), n) for n, c in coefficients.items() if c and n in active)
         span = 0

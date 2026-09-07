@@ -5,7 +5,41 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import prod
 
-DTYPES = {"float16": 2, "bfloat16": 2, "float32": 4, "int32": 4}
+DTYPES = {
+    "bool": 1,
+    "int8": 1,
+    "int16": 2,
+    "int32": 4,
+    "int64": 8,
+    "uint8": 1,
+    "uint16": 2,
+    "uint32": 4,
+    "uint64": 8,
+    "float16": 2,
+    "bfloat16": 2,
+    "float32": 4,
+    "float64": 8,
+}
+DTYPE_ALIASES = {
+    "short": "int16",
+    "int": "int32",
+    "uint": "uint32",
+    "long": "int64",
+    "half": "float16",
+    "float": "float32",
+    "double": "float64",
+}
+
+
+def integer_limits(dtype):
+    if dtype == "bool":
+        return 0, 1
+    bits = DTYPES[dtype] * 8
+    if dtype.startswith("uint"):
+        return 0, 2**bits - 1
+    if dtype.startswith("int"):
+        return -(2 ** (bits - 1)), 2 ** (bits - 1) - 1
+    raise ValueError(f"{dtype} is not an integer dtype")
 
 
 @dataclass(frozen=True)
@@ -28,6 +62,7 @@ class TensorType:
     dtype: str
 
     def __post_init__(self):
+        object.__setattr__(self, "dtype", str(DTYPE_ALIASES.get(self.dtype, self.dtype)))
         if not self.shape or any(type(n) is not int or n <= 0 for n in self.shape):
             raise CompileError("Tensor dimensions must be positive static integers")
         if self.dtype not in DTYPES:

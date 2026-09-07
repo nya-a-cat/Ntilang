@@ -6,14 +6,21 @@ import ast
 import re
 from math import isfinite, isnan, prod
 
-from .ir import DTYPES, CompileError, Expr, Kernel, Partition
+from .ir import DTYPES, CompileError, Expr, Kernel, Partition, integer_limits
+from .scalar import body_types, expression_dtype
 
 CUTLASS_TYPES = {
     "float16": "Float16",
     "bfloat16": "BFloat16",
     "float32": "Float32",
     "int32": "Int32",
+    "int8": "Int8",
+    "int16": "Int16",
     "int64": "Int64",
+    "uint8": "Uint8",
+    "uint16": "Uint16",
+    "uint32": "Uint32",
+    "uint64": "Uint64",
     "float64": "Float64",
     "bool": "Boolean",
 }
@@ -201,52 +208,6 @@ class Emitter:
     def emit(self, line=""):
         self.lines.append("    " * self.depth + line if line else "")
 
-    @staticmethod
-    def common_type(left, right):
-        if left == right:
-            return left
-        if left == "bool":
-            return right
-        if right == "bool":
-            return left
-        widths = {"int32": 32, "int64": 64, "float16": 16, "bfloat16": 16, "float32": 32, "float64": 64}
-        width = max(widths[left], widths[right])
-        if left.startswith("int") and right.startswith("int"):
-            return f"int{width}"
-        return f"float{width}"
-
-    def expression_type(self, expr, types):
-        if expr.op == "const":
-            if type(expr.value) is int and not -(2**31) <= expr.value < 2**31:
-                if not -(2**63) <= expr.value < 2**63:
-                    raise CompileError("Scalar integer constants must fit signed 64-bit arithmetic")
-                return "int64"
-            return {bool: "bool", int: "int32", float: "float32"}[type(expr.value)]
-        if expr.op == "var":
-            return types[expr.value]
-        if expr.op == "load":
-            return self.buffers[expr.value].type.dtype
-        if expr.op == "cast":
-            return expr.value
-        if expr.op in ("<", "<=", ">", ">=", "==", "!=", "and", "or", "not"):
-            return "bool"
-        result = self.expression_type(expr.args[0], types)
-        for arg in expr.args[1:]:
-            result = self.common_type(result, self.expression_type(arg, types))
-        return "float32" if expr.op == "/" and result in ("int32", "int64", "bool") else result
-
-    def body_types(self, body, types):
-        types = types.copy()
-        for stmt in body:
-            if stmt.op == "let":
-                types[stmt.args[0]] = self.expression_type(stmt.args[1], types)
-            elif stmt.op == "if":
-                then_types = self.body_types(stmt.args[1], types)
-                else_types = self.body_types(stmt.args[2], types)
-                for name in then_types.keys() & else_types.keys():
-                    types[name] = self.common_type(then_types[name], else_types[name])
-        return types
-
     def unique(self, label):
         self.counter += 1
         return f"_nt_{label}_{self.counter}"
@@ -317,9 +278,9 @@ class Emitter:
             return f"cutlass.{CUTLASS_TYPES[expr.value]}({values[0]})"
         if op in ("exp", "exp2", "sqrt"):
             return f"cute.math.{op}({values[0]})"
-        if op in ("maximum", "minimum"):
-            function = "max" if op == "maximum" else "min"
-            return f"cute.math.{function}({', '.join(values)}, propagate_nan=True)"
+        if op in ("maximum", "minimum", "max", "min"):
+            function = "max" if op in ("maximum", "max") else "min"
+            return f"cute.math.{function}({', '.join(values)}, propagate_nan={op in ('maximum', 'minimum')})"
         return "(" + f" {op} ".join(values) + ")"
 
     def coordinates(self, flat, shape):
@@ -429,7 +390,7 @@ class Emitter:
             value = self.access(src, coords)
         value_name = self.unique("reduce_value")
         self.emit(f"{value_name} = {self.dtype(dst)}({value})")
-        if kind in ("abssum", "absmax"):
+        if kind in ("abssum", "absmax") and not (dtype.startswith("uint") or dtype == "bool"):
             value_name = f"cute.math.max({value_name}, -{value_name}, propagate_nan=False)"
         self.emit(f"{access(coords)} = {self.dtype(dst)}({value_name})")
         self.depth -= depth
@@ -464,12 +425,13 @@ class Emitter:
             source_coords.insert(dim, "0")
         if clear:
             identity = "0"
+            integer = dtype.startswith(("int", "uint")) or dtype == "bool"
             if kind == "max":
-                identity = str(-(2**31)) if dtype == "int32" else "float('-inf')"
+                identity = str(integer_limits(dtype)[0]) if integer else "float('-inf')"
             elif kind == "min":
-                identity = str(2**31 - 1) if dtype == "int32" else "float('inf')"
+                identity = str(integer_limits(dtype)[1]) if integer else "float('inf')"
             elif kind == "bitand":
-                identity = "-1"
+                identity = "-1" if dtype.startswith("int") else str(integer_limits(dtype)[1])
             initial = f"{self.dtype(dst)}({identity})"
         else:
             initial = destination
@@ -488,7 +450,7 @@ class Emitter:
             elif op == "if":
                 condition, then_body, else_body = args
                 value = self.expression(condition)
-                merged_types = self.body_types((stmt,), self.scalar_types)
+                merged_types = body_types((stmt,), self.scalar_types, self.buffers)
                 for name in sorted(merged_types.keys() - self.scalar_types.keys()):
                     self.emit(f"{self.var(name)} = cutlass.{CUTLASS_TYPES[merged_types[name]]}(0)")
                 self.scalar_types = merged_types.copy()
@@ -522,7 +484,9 @@ class Emitter:
                 self.reduction(*args)
             elif op == "let":
                 value = self.expression(args[1])
-                dtype = self.scalar_types.get(args[0]) or self.expression_type(args[1], self.scalar_types)
+                dtype = self.scalar_types.get(args[0]) or expression_dtype(
+                    args[1], self.buffers, self.scalar_types
+                )
                 self.scalar_types[args[0]] = dtype
                 self.emit(f"{self.var(args[0])} = cutlass.{CUTLASS_TYPES[dtype]}({value})")
             elif op == "store":

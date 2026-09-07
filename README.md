@@ -113,8 +113,8 @@ the same argument contract.
 - `T.alloc_shared`, `T.alloc_fragment`, `T.copy`, `T.clear`, and `T.fill`.
 - `T.gemm(A, B, accumulator, transpose_A=False, transpose_B=False)`.
 - `T.reduce` and sum, absolute-sum, max, absolute-max, min, and bitwise reduction wrappers.
-- Arithmetic, comparisons, `T.cast`, `T.exp`, `T.exp2`, `T.sqrt`, `T.maximum`, and `T.minimum`.
-- Static shapes; `float16`, `bfloat16`, `float32`, and `int32` buffers.
+- Arithmetic, comparisons, dtype constructors, `T.cast`, `T.exp`, `T.exp2`, `T.sqrt`, `T.max`, and `T.min`.
+- Static shapes; Boolean, signed/unsigned 8/16/32/64-bit integers, FP16, BF16, FP32, and FP64.
 - Conditional statements, branch-defined scalar values, and branch-aware fragment initialization.
 
 Fragments support element assignment and augmented assignment inside a

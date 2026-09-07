@@ -8,12 +8,28 @@ from dataclasses import dataclass
 from functools import wraps
 from typing import Callable
 
-from .ir import TensorType
+from .ir import DTYPE_ALIASES, DTYPES, TensorType
 
-float16 = "float16"
-bfloat16 = "bfloat16"
-float32 = "float32"
-int32 = "int32"
+
+class DType(str):
+    """A dtype name that also denotes a scalar cast inside parsed kernels."""
+
+    @property
+    def bits(self):
+        return 1 if self == "bool" else DTYPES[self] * 8
+
+    @property
+    def bytes(self):
+        return DTYPES[self]
+
+    def __call__(self, value):
+        raise RuntimeError(f"T.{self}(value) is a scalar cast inside a @T.prim_func body")
+
+
+DTYPE_NAMES = {**{name: name for name in DTYPES}, **DTYPE_ALIASES}
+for _dtype_name, _canonical_dtype in DTYPE_NAMES.items():
+    globals()[_dtype_name] = DType(_canonical_dtype)
+del _dtype_name, _canonical_dtype
 
 
 def Tensor(shape, dtype="float32") -> TensorType:
@@ -94,6 +110,8 @@ for _name in (
     "sqrt",
     "maximum",
     "minimum",
+    "max",
+    "min",
     "cast",
 ):
     _marker = _syntax_operation(_name)

@@ -5,7 +5,8 @@ This document describes the implemented Ntilang 0.1 subset.
 ## Parameters and shapes
 
 Every parameter is a `T.Tensor(shape, dtype)` with positive static dimensions.
-The dtype is one of `float16`, `bfloat16`, `float32`, or `int32`. Tensor size and
+The dtype is Boolean, signed or unsigned 8/16/32/64-bit integer, or
+`float16`, `bfloat16`, `float32`, or `float64`. Tensor size and
 every intermediate integer index expression must fit signed 32-bit arithmetic.
 Runtime tensors are contiguous in row-major order, 16-byte aligned, on the same
 CUDA device, and have pairwise disjoint storage.
@@ -14,6 +15,13 @@ CUDA device, and have pairwise disjoint storage.
 The body contains one `with T.Kernel(..., threads=...)` block. Grid dimensions
 are positive static integers within CUDA limits. Block and loop variables and
 scalar local assignments use fresh names. Names beginning with `_nt_` are reserved.
+
+Dtype symbols work as tensor dtype names and scalar casts within parsed bodies,
+for example `T.Tensor((32,), T.float32)` and `T.float32(value)`. Common aliases
+include `short`, `int`, `uint`, `long`, `half`, `float`, and `double`. Dtype
+descriptors expose `bits` and `bytes`; Boolean has one logical bit and one byte
+of tensor storage. Sub-byte and vector dtype variants remain open compatibility
+work. Calling a dtype constructor outside a parsed body is currently unsupported.
 
 ## Tiles and iteration
 
@@ -101,6 +109,12 @@ math for exponential and square-root operations. Floating-point operations
 follow the target compiler's CUDA semantics; bitwise identity with NumPy is not
 specified.
 
+The upstream `T.max` and `T.min` spellings prefer a non-NaN operand. The two
+longer spellings are Ntilang extensions. Scalar promotion follows the checked
+CuTe numeric rules, including integer signedness and width, promotion of narrow
+integers with default `int32` constants, and floating/integer width conversion.
+The reference evaluator applies these rules explicitly before arithmetic.
+
 `T.gemm(A, B, C)` means `C += A @ B`, after optional transposition of A and/or B.
 A and B are complete shared tiles with matching FP16 or BF16 dtype. C is an FP32
 fragment initialized by fill, copy, or a complete parallel assignment. GEMM supports 32, 64, 128, or 256
@@ -146,7 +160,7 @@ trusted and tested. An end-to-end machine-checked semantic-preservation theorem
 is future work.
 
 The NumPy evaluator implements serial mathematical tile semantics. It supports
-FP16, FP32, and INT32 buffers and uses FP32 matrix multiplication for GEMM. It
+the basic numeric and Boolean buffer types except BF16, and uses FP32 matrix multiplication for GEMM. It
 does not simulate physical lane scheduling, register allocation, Tensor Core
 rounding, or performance. GPU tests are the next validation layer for executable
 behavior.

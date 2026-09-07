@@ -23,6 +23,7 @@ This is a name inventory; implementation status requires separate signature,
 behavior, interaction, and hardware checks. Ntilang currently implements only
 parts of this surface. Its `maximum` and `minimum` spellings are extensions;
 the upstream facade exports `max` and `min`.
+Both upstream spellings are now implemented with their non-NaN preference.
 
 ## Current work
 
@@ -52,6 +53,11 @@ conversion, accumulation, and FP16/BF16 NaN controls have source and compiler
 coverage. Stable Softmax exercises reductions with broadcast communication.
 Batch scheduling, packed reduction annotations, local scopes, regions, and
 reducer epoch APIs remain open compatibility work.
+
+Basic Boolean/integer/floating dtypes and scalar cast constructors are implemented.
+The 169 pairwise basic-type addition promotions are checked against NVIDIA's
+numeric implementation. Vector and sub-byte dtype variants, external constructor
+behavior, and the remaining dtype utility APIs still need implementation.
 
 Loop steps and empty iteration domains are preserved. The supported `unroll`
 form emits CuTe compile-time iteration. Loop annotations, partial unroll factors,
