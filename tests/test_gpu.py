@@ -4,6 +4,7 @@ import pytest
 
 from examples.fragment_affine import fragment_affine
 from examples.matmul import matmul
+from examples.matmul_relu import matmul_relu
 from examples.vector_add import vector_add
 
 pytestmark = pytest.mark.gpu
@@ -46,6 +47,16 @@ def test_gemm_on_gpu(torch_cuda):
     c = torch.empty(65, 71, device="cuda", dtype=torch.float32)
     matmul(target=target_for(torch))(a, b, c)
     torch.testing.assert_close(c, a.float() @ b.float(), rtol=1e-4, atol=1e-4)
+
+
+def test_gemm_relu_on_gpu(torch_cuda):
+    torch = torch_cuda
+    a = torch.randn(65, 37, device="cuda", dtype=torch.float16)
+    b = torch.randn(37, 71, device="cuda", dtype=torch.float16)
+    bias = torch.randn(65, 71, device="cuda", dtype=torch.float32)
+    c = torch.empty_like(bias)
+    matmul_relu(target=target_for(torch))(a, b, bias, c)
+    torch.testing.assert_close(c, torch.relu((a.float() @ b.float()) * 0.5 + bias), rtol=1e-4, atol=1e-4)
 
 
 def test_nondefault_stream_on_gpu(torch_cuda):

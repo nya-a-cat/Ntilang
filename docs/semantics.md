@@ -17,11 +17,15 @@ scalar local assignments use fresh names. Names beginning with `_nt_` are reserv
 
 ## Tiles and iteration
 
-`T.Parallel(d0, ..., dn)` defines a logical row-major tile. Its logical elements
-are distributed over threads as `flat = thread + slot * threads`; excess slots
-do not execute the body. This ownership is shared by linear register fragments.
+`T.Parallel(d0, ..., dn)` defines a logical tile. Without an MMA layout constraint,
+its elements are distributed as `flat = thread + slot * threads` in row-major
+order; excess slots do not execute the body.
 Fragment indexing uses the exact variables of a parallel loop with the same
-shape. MMA fragments have their own CuTe-defined distribution.
+shape. Parallel operations connected to an MMA accumulator use its CuTe-defined
+coordinate partition. Whole-fragment copies and pointwise operations propagate
+that partition through connected fragments, including earlier initialization
+and copies. Connections between incompatible MMA partitions currently require
+a layout conversion and produce a compilation error.
 
 `T.serial(stop)`, `T.serial(start, stop)`, and `T.serial(start, stop, step)` follow
 Python's static integer range semantics, including negative steps and empty
@@ -31,11 +35,11 @@ domain and uses CuTe compile-time iteration. Its tuning annotations remain open
 compatibility work. Global outputs are currently written after serial
 accumulation loops. `T.Pipelined(..., num_stages=0 or 1)` is synchronous.
 
-Linear fragment elements can be assigned or updated with operators such as
+Fragment elements can be assigned or updated with operators such as
 `+=` inside the matching parallel tile. An unconditional full parallel write
 initializes the fragment. Empty loops do not initialize their body allocations
-or buffers. MMA fragment layout propagation into elementwise epilogues remains
-open work.
+or buffers. MMA epilogues support scalar expressions and additional fragments
+with the same logical shape, including fragments with a different storage dtype.
 
 Shared and fragment buffers are allocated directly inside the kernel block.
 Initialization is required before reads. `T.clear(tile)` and `T.fill(tile, value)`
@@ -79,10 +83,11 @@ specified.
 
 `T.gemm(A, B, C)` means `C += A @ B`, after optional transposition of A and/or B.
 A and B are complete shared tiles with matching FP16 or BF16 dtype. C is an FP32
-fragment initialized by `T.clear` or `T.fill`. GEMM supports 32, 64, 128, or 256
+fragment initialized by fill, copy, or a complete parallel assignment. GEMM supports 32, 64, 128, or 256
 threads, compatible M/N warp tiling, and K tile sizes divisible by 16. Multiple
-GEMMs can accumulate into C with the same layout. The final copy from C writes
-global memory through the accumulator's CuTe coordinate partition.
+GEMMs can accumulate into C with the same layout. Copies involving C use the
+accumulator's CuTe coordinate partition, with shared-memory synchronization
+when appropriate. Elementwise epilogues preserve that coordinate mapping.
 
 The current backend uses the SM80 warp MMA instruction family. Its shared copies
 and register operand loads are synchronous. GPU numerical tests use tolerances

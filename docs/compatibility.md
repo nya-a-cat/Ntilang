@@ -22,6 +22,11 @@ and warp MMA GEMM. Fragment element assignment and augmented assignment use the
 same per-thread ownership as the enclosing parallel tile. CPU semantic tests and
 real CuTe compilation tests are kept separately from GPU execution tests.
 
+MMA coordinate partitions propagate through pointwise operations and whole-tile
+fragment copies. Accumulators support elementwise epilogues, initialization from
+global/shared/fragment copies, and copies through shared output tiles. Connections
+between incompatible register partitions still need explicit layout conversion.
+
 Loop steps and empty iteration domains are preserved. The supported `unroll`
 form emits CuTe compile-time iteration. Loop annotations, partial unroll factors,
 dynamic bounds, and vectorized loop lowering require further implementation.

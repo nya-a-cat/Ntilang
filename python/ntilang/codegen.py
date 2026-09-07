@@ -76,18 +76,78 @@ class Emitter:
                         "All GEMMs sharing an accumulator require the same MMA layout", stmt.location
                     )
                 self.mmas[c] = plan
-        for stmt in walk(kernel.body):
-            if stmt.op == "copy":
-                src, dst = stmt.args
-                if dst.buffer in self.mmas:
-                    raise CompileError(
-                        "Initialize MMA accumulators with T.clear/T.fill; copy into them is not supported",
-                        stmt.location,
-                    )
-                if src.buffer in self.mmas and self.buffers[dst.buffer].space != "global":
-                    raise CompileError(
-                        "MMA accumulator copies currently require a global destination", stmt.location
-                    )
+        self.fragment_layouts = self.infer_fragment_layouts()
+
+    def fragment_references(self, value):
+        if isinstance(value, Expr):
+            names = {value.value} if value.op == "load" else set()
+            for arg in value.args:
+                names.update(self.fragment_references(arg))
+            return {n for n in names if self.buffers[n].space == "fragment"}
+        if isinstance(value, (tuple, list)):
+            names = set()
+            for arg in value:
+                names.update(self.fragment_references(arg))
+            return names
+        return set()
+
+    def parallel_fragments(self, body):
+        names = set()
+        for stmt in walk(body):
+            names.update(self.fragment_references(stmt.args))
+            if stmt.op == "store" and self.buffers[stmt.args[0]].space == "fragment":
+                names.add(stmt.args[0])
+        return names
+
+    def infer_fragment_layouts(self):
+        # Connected pointwise operations and whole-tile copies share ownership.
+        # Propagate before allocation so a fragment's earlier writes use the same
+        # mapping as its later MMA consumer.
+        parents = {b.name: b.name for b in self.kernel.buffers if b.space == "fragment"}
+
+        def root(name):
+            while parents[name] != name:
+                name = parents[name]
+            return name
+
+        for stmt in walk(self.kernel.body):
+            names = set()
+            if stmt.op == "parallel":
+                names = self.parallel_fragments(stmt.args[2])
+            elif stmt.op == "copy":
+                names = {r.buffer for r in stmt.args if self.buffers[r.buffer].space == "fragment"}
+            names = sorted(names)
+            for name in names[1:]:
+                parents[root(name)] = root(names[0])
+        seeds = {}
+        for name, plan in self.mmas.items():
+            group = root(name)
+            if group in seeds:
+                previous = self.mmas[seeds[group]]
+                if (plan[:2], plan[3:5]) != (previous[:2], previous[3:5]):
+                    raise CompileError("Connected MMA fragments require a register layout conversion")
+            else:
+                seeds[group] = name
+        return {name: seeds.get(root(name)) for name in parents}
+
+    def fragment_slot(self, name, indices):
+        buf = self.buffers[name]
+        if self.parallel is None or self.parallel[0] != buf.type.shape:
+            raise CompileError("Fragment indexing requires a matching T.Parallel shape")
+        expected = tuple(Expr("var", value=n) for n in self.parallel[1])
+        if indices != expected:
+            raise CompileError("Fragment indexing requires the exact T.Parallel induction variables")
+        return f"{self.buf(name)}[{self.parallel[2]}]"
+
+    def loop_fragment(self, name):
+        layout = self.fragment_layouts[name]
+        if layout is None:
+            slot, coords = self.loop_tile(self.buffers[name].type.shape)
+            return slot, coords, 2
+        slot = self.unique("mma_slot")
+        self.emit(f"for {slot} in cutlass.range_constexpr(cute.size({self.buf(name)})):")
+        self.depth += 1
+        return slot, [f"_nt_coords_{layout}[{slot}][{i}]" for i in range(2)], 1
 
     def emit(self, line=""):
         self.lines.append("    " * self.depth + line if line else "")
@@ -132,14 +192,7 @@ class Emitter:
             indices = [self.expression(x) for x in expr.args]
             temp = self.unique("load")
             if buf.space == "fragment":
-                if name in self.mmas or self.parallel is None or self.parallel[0] != buf.type.shape:
-                    raise CompileError(
-                        "Fragment indexing requires a matching T.Parallel shape and linear layout"
-                    )
-                expected = tuple(Expr("var", value=n) for n in self.parallel[1])
-                if expr.args != expected:
-                    raise CompileError("Fragment loads require the exact T.Parallel induction variables")
-                return f"{self.buf(name)}[{self.parallel[2]}]"
+                return self.fragment_slot(name, expr.args)
             self.emit(f"{temp} = {self.dtype(name)}(0)")
             self.emit(f"if {self.predicate(name, indices)}:")
             self.depth += 1
@@ -176,25 +229,16 @@ class Emitter:
         return [f"({self.expression(origin)} + {coord})" for origin, coord in zip(region.origin, coords)]
 
     def copy(self, src, dst):
-        if src.buffer in self.mmas:
-            slot = self.unique("mma_store")
-            coords_name = f"_nt_coords_{src.buffer}"
-            self.emit(f"for {slot} in cutlass.range_constexpr(cute.size({self.buf(src.buffer)})):")
-            self.depth += 1
-            coords = [f"{coords_name}[{slot}][{i}]" for i in range(2)]
-            out = self.region_indices(dst, coords)
-            self.emit(f"if {self.predicate(dst.buffer, out)}:")
-            self.depth += 1
-            self.emit(
-                f"{self.access(dst.buffer, out)} = {self.dtype(dst.buffer)}({self.buf(src.buffer)}[{slot}])"
-            )
-            self.depth -= 2
-            return
         # A uniform barrier also protects shared tiles reused after readers finish.
         shared = any(self.buffers[r.buffer].space == "shared" for r in (src, dst))
         if shared:
             self.emit("cute.arch.sync_threads()")
-        slot, coords = self.loop_tile(src.shape)
+        fragments = [r.buffer for r in (src, dst) if self.buffers[r.buffer].space == "fragment"]
+        if fragments:
+            slot, coords, depth = self.loop_fragment(fragments[0])
+        else:
+            slot, coords = self.loop_tile(src.shape)
+            depth = 2
         src_idx, dst_idx = self.region_indices(src, coords), self.region_indices(dst, coords)
         if self.buffers[src.buffer].space == "fragment":
             value = f"{self.buf(src.buffer)}[{slot}]"
@@ -212,7 +256,7 @@ class Emitter:
             self.depth += 1
             self.emit(f"{self.access(dst.buffer, dst_idx)} = {self.dtype(dst.buffer)}({value})")
             self.depth -= 1
-        self.depth -= 2
+        self.depth -= depth
         if shared:
             self.emit("cute.arch.sync_threads()")
 
@@ -276,12 +320,8 @@ class Emitter:
                 coords = [self.expression(x) for x in indices]
                 value = self.expression(value)
                 if self.buffers[name].space == "fragment":
-                    if name in self.mmas:
-                        raise CompileError(
-                            "MMA fragment element stores require its inferred coordinate layout",
-                            stmt.location,
-                        )
-                    self.emit(f"{self.buf(name)}[{self.parallel[2]}] = {self.dtype(name)}({value})")
+                    slot = self.fragment_slot(name, indices)
+                    self.emit(f"{slot} = {self.dtype(name)}({value})")
                     continue
                 self.emit(f"if {self.predicate(name, coords)}:")
                 self.depth += 1
@@ -304,13 +344,22 @@ class Emitter:
                 self.depth -= 1
             elif op == "parallel":
                 names, shape, inner = args
-                slot, coords = self.loop_tile(shape)
+                fragments = sorted(self.parallel_fragments(inner))
+                if fragments:
+                    if any(self.buffers[n].type.shape != shape for n in fragments):
+                        raise CompileError(
+                            "Fragment indexing requires a matching T.Parallel shape", stmt.location
+                        )
+                    slot, coords, depth = self.loop_fragment(fragments[0])
+                else:
+                    slot, coords = self.loop_tile(shape)
+                    depth = 2
                 for name, coord in zip(names, coords):
                     self.emit(f"{self.var(name)} = {coord}")
                 self.parallel = (shape, names, slot)
                 self.statements(inner)
                 self.parallel = None
-                self.depth -= 2
+                self.depth -= depth
             else:
                 raise CompileError(f"Unsupported IR operation {op}", stmt.location)
 
@@ -345,6 +394,13 @@ class Emitter:
                 )
             elif b.name in self.mmas:
                 self.emit(f"{self.buf(b.name)} = _nt_mma_{b.name}.make_fragment_C(_nt_coords_{b.name}.shape)")
+            elif self.fragment_layouts[b.name] is not None:
+                layout = self.fragment_layouts[b.name]
+                template = self.unique("fragment_layout")
+                self.emit(f"{template} = _nt_mma_{layout}.make_fragment_C(_nt_coords_{layout}.shape)")
+                self.emit(
+                    f"{self.buf(b.name)} = cute.make_rmem_tensor({template}.layout, {self.dtype(b.name)})"
+                )
             else:
                 self.emit(
                     f"{self.buf(b.name)} = cute.make_rmem_tensor(({Partition(b.type.shape, self.kernel.threads).slots},), {self.dtype(b.name)})"

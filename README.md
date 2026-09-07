@@ -81,6 +81,7 @@ Choose a target matching the GPU that will execute the kernel. The default
 - [Vector addition](examples/vector_add.py): non-divisible dimensions and predicated loads/stores.
 - [Fragment affine transform](examples/fragment_affine.py): global-to-register tile copy and elementwise use.
 - [Tiled matrix multiplication](examples/matmul.py): shared tiles, FP16 inputs, FP32 accumulation, and CuTe's `MmaF16BF16Op`.
+- [Matrix multiplication with ReLU](examples/matmul_relu.py): scale, tensor bias, and activation in the accumulator's register layout.
 
 Example factories accept `target=`. A shape-specialized factory can also be
 decorated with `@ntilang.jit(target="sm_80")` and return a `@T.prim_func`.
@@ -112,8 +113,10 @@ the same argument contract.
 - Arithmetic, comparisons, `T.cast`, `T.exp`, `T.exp2`, `T.sqrt`, `T.maximum`, and `T.minimum`.
 - Static shapes; `float16`, `bfloat16`, `float32`, and `int32` buffers.
 
-Linear fragments support element assignment and augmented assignment inside a
-matching parallel tile. Serial and unrolled loops accept static start/stop/step,
+Fragments support element assignment and augmented assignment inside a
+matching parallel tile. MMA layouts propagate through pointwise operations and
+whole-fragment copies, allowing accumulator epilogues and initialization from
+other tiles. Serial and unrolled loops accept static start/stop/step,
 including reverse and empty ranges. Imported language-operation aliases retain
 their operation identity.
 
