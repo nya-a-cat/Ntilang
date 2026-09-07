@@ -35,6 +35,12 @@ and warp MMA GEMM. Fragment element assignment and augmented assignment use the
 same per-thread ownership as the enclosing parallel tile. CPU semantic tests and
 real CuTe compilation tests are kept separately from GPU execution tests.
 
+Contiguous rectangular nests of `T.Parallel` loops share the flattened logical
+domain used by the equivalent multidimensional `T.Parallel` spelling. This
+preserves fragment/shared ownership, guarded global accesses, deepest-body local
+scalars, and cross-element temporary reads. Statements between parallel levels,
+dependent extents, and explicit nested layout annotations need further lowering.
+
 Conditional statements support branch-defined scalar joins, conditional fragment
 updates, and uniform collective branches. Initialization is intersected across
 paths. Multiple global stores are accepted for proven disjoint ranges or in
@@ -129,7 +135,7 @@ loop lowering require further implementation.
 - Tensor declarations: symbolic/dynamic dimensions, strides, local/global
   allocations, scalar variables, general buffer regions and slicing, views, reshape,
   reinterpretation, pointers, and dtype coverage.
-- Iteration and scheduling: all loop options, nested parallel layout inference,
+- Iteration and scheduling: all loop options, general nested parallel layout inference,
   vectorization, persistent scheduling, pipeline stages/order/group/sync metadata,
   swizzles, and warp-specialization schedules.
 - Tile operations: complete copy signatures, transpose, im2col, all reduction

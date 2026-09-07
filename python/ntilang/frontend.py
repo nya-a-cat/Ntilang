@@ -557,6 +557,34 @@ class Parser:
             self.fail(call, "Partial temporary copies require an initialized destination")
         return Statement("copy", (src, dst), self.location(node))
 
+    def parallel_nest(self, node):
+        """Collect a rectangular perfect nest into one ownership domain."""
+        extents, targets = [], []
+        bound_names = self.variables.copy()
+        while True:
+            self.keywords(node.iter, set())
+            if node.orelse:
+                self.fail(node, "Loop else clauses are not supported")
+            level_targets = (
+                node.target.elts if isinstance(node.target, (ast.Tuple, ast.List)) else [node.target]
+            )
+            if len(level_targets) != len(node.iter.args):
+                self.fail(node, "T.Parallel needs one variable per extent")
+            for extent in node.iter.args:
+                if any(isinstance(part, ast.Name) and part.id in bound_names for part in ast.walk(extent)):
+                    self.fail(extent, "Parallel extents require static rectangular domains")
+                extents.append(self.static(extent))
+            targets.extend(level_targets)
+            bound_names.update(target.id for target in level_targets if isinstance(target, ast.Name))
+            body = node.body
+            if (
+                len(body) != 1
+                or not isinstance(body[0], ast.For)
+                or self.call_name(body[0].iter) != "Parallel"
+            ):
+                return tuple(extents), targets, body
+            node = body[0]
+
     def statements(self, nodes, *, parallel=False, nested=False):
         body = []
         for node in nodes:
@@ -693,20 +721,25 @@ class Parser:
             if name not in ("Parallel", "serial", "Serial", "Pipelined", "unroll", "Unroll"):
                 self.fail(node, f"Unsupported loop {name}")
             if parallel and name == "Parallel":
-                self.fail(node, "Nested T.Parallel loops are not supported; use T.Parallel(M, N)")
+                self.fail(node, "Parallel nesting currently requires a contiguous rectangular loop nest")
             annotations = ()
-            if name in ("serial", "Serial", "unroll", "Unroll"):
+            loop_body = node.body
+            targets = node.target.elts if isinstance(node.target, (ast.Tuple, ast.List)) else [node.target]
+            if name == "Parallel":
+                extents, targets, loop_body = self.parallel_nest(node)
+            elif name in ("serial", "Serial", "unroll", "Unroll"):
                 extents, annotations = self.loop_signature(node.iter, name)
             else:
                 kw = self.keywords(node.iter, {"num_stages"} if name == "Pipelined" else set())
                 if kw.get("num_stages", 1) not in (0, 1):
                     self.fail(node, "Asynchronous multi-stage pipelines are not implemented; use T.serial")
                 extents = tuple(self.static(a) for a in node.iter.args)
-            targets = node.target.elts if isinstance(node.target, (ast.Tuple, ast.List)) else [node.target]
             if not targets or any(not isinstance(t, ast.Name) for t in targets):
                 self.fail(node, "Loop targets must be names")
             names = tuple(t.id for t in targets)
-            if any(n in self.variables or n in self.buffers or n.startswith("_nt_") for n in names):
+            if len(set(names)) != len(names) or any(
+                n in self.variables or n in self.buffers or n.startswith("_nt_") for n in names
+            ):
                 self.fail(node, "Loop variables must have unique, non-reserved names")
             if name == "Parallel":
                 Partition(extents, self.threads)
@@ -749,7 +782,7 @@ class Parser:
             if name == "Parallel":
                 self.parallel_context = (extents, names)
             self.loops.append(name)
-            body = self.statements(node.body, parallel=parallel or name == "Parallel", nested=True)
+            body = self.statements(loop_body, parallel=parallel or name == "Parallel", nested=True)
             self.loops.pop()
             self.variables = old_vars
             self.parallel_context = old_parallel
