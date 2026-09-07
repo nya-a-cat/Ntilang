@@ -271,6 +271,15 @@ class Emitter:
         shape = self.buffers[name].type.shape
         return " and ".join(f"(0 <= ({idx}) and ({idx}) < {dim})" for idx, dim in zip(indices, shape))
 
+    def index_expression(self, expr):
+        value = self.expression(expr)
+        dtype = expression_dtype(expr, self.buffers, self.scalar_types)
+        # CuTe coordinates accept i32/i64. Widen after source arithmetic so
+        # narrow integer operations retain their original dtype semantics.
+        if dtype in ("int8", "uint8", "int16", "uint16"):
+            return f"cutlass.Int32({value})"
+        return value
+
     def expression(self, expr: Expr):
         op = expr.op
         if op in CHOICE_OPS:
@@ -287,7 +296,7 @@ class Emitter:
         if op == "load":
             name = expr.value
             buf = self.buffers[name]
-            indices = [self.expression(x) for x in expr.args]
+            indices = [self.index_expression(x) for x in expr.args]
             temp = self.unique("load")
             if buf.space == "fragment":
                 expected = (
@@ -396,7 +405,7 @@ class Emitter:
 
     def region_indices(self, region, coords):
         return [
-            f"({self.expression(origin)} + {coords[axis] if axis is not None else '0'})"
+            f"({self.index_expression(origin)} + {coords[axis] if axis is not None else '0'})"
             for origin, axis in zip(region.origin, region.axes)
         ]
 
@@ -404,13 +413,13 @@ class Emitter:
         coords = ["0"] * len(region.shape)
         for index, origin, axis in zip(buffer_coords, region.origin, region.axes):
             if axis is not None:
-                coords[axis] = f"({index} - {self.expression(origin)})"
+                coords[axis] = f"({index} - {self.index_expression(origin)})"
         return coords
 
     def region_predicate(self, region, buffer_coords):
         predicates = []
         for index, origin, size in zip(buffer_coords, region.origin, region.extents):
-            start = self.expression(origin)
+            start = self.index_expression(origin)
             predicates.append(
                 f"({start} <= {index} and cutlass.Int64({index}) < (cutlass.Int64({start}) + {size}))"
             )
@@ -697,7 +706,7 @@ class Emitter:
             self.emit(f"{self.var(args[0])} = {self.expression(args[1])}")
         elif op == "store":
             name, indices, value = args
-            coords = [self.expression(x) for x in indices]
+            coords = [self.index_expression(x) for x in indices]
             value = self.expression(value)
             if self.buffers[name].space == "fragment":
                 slot = self.fragment_slot(name, indices)
