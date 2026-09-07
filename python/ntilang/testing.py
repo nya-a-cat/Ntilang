@@ -11,7 +11,7 @@ import operator
 
 from .compiler import CompiledKernel
 from .ir import integer_limits
-from .scalar import body_types, expression_dtype, operand_dtype
+from .scalar import INTEGER_DIVISION_OPS, body_types, expression_dtype, operand_dtype
 
 
 def reference(kernel: CompiledKernel, *arrays):
@@ -90,6 +90,24 @@ def reference(kernel: CompiledKernel, *arrays):
         dtype = expression_dtype(e, buffer_types, variable_types)
         arg_dtype = operand_dtype(e, buffer_types, variable_types)
         args = [cast(value, arg_dtype) for value in args]
+        if e.op in INTEGER_DIVISION_OPS:
+            a, b = map(int, args)
+            if b == 0:
+                raise ValueError("Integer division requires a nonzero divisor")
+            low, high = integer_limits(dtype)
+            if a == low and b == -1:
+                raise ValueError("Signed minimum divided by -1 overflows the integer dtype")
+            if e.op == "ceildiv":
+                numerator = cast(cast(a + b, dtype) - cast(1, dtype), dtype)
+                result = int(numerator) // b
+            elif e.op == "//":
+                result = a // b
+            elif e.op == "%":
+                result = a % b
+            else:
+                quotient = (abs(a) // abs(b)) * (-1 if (a < 0) != (b < 0) else 1)
+                result = quotient if e.op == "truncdiv" else a - quotient * b
+            return cast(result, dtype)
         return cast(ops[e.op](*args), dtype)
 
     def statements(body):

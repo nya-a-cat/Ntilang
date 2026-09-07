@@ -45,6 +45,14 @@ BITWISE_CALLS = {
     "shift_left": "<<",
     "shift_right": ">>",
 }
+DIVISION_CALLS = {
+    "floordiv": "//",
+    "floormod": "%",
+    "truncdiv": "truncdiv",
+    "truncmod": "truncmod",
+    "ceildiv": "ceildiv",
+    "cdiv": "ceildiv",
+}
 COMPARISONS = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==", ast.NotEq: "!="}
 STATIC_OPS = {
     ast.Add: operator.add,
@@ -102,6 +110,8 @@ class Parser:
                 return language._MARKER_NAMES[value]
             if value is language.ceildiv:
                 return "ceildiv"
+            if value is language.align_up:
+                return "align_up"
             if value is language.Tensor:
                 return "Tensor"
         self.fail(node, "Only ntilang.language operations are supported in kernels")
@@ -136,14 +146,13 @@ class Parser:
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             if self.constants.get(node.value.id) is language and node.attr in language.DTYPE_NAMES:
                 return language.DTYPE_NAMES[node.attr]
-        if (
-            isinstance(node, ast.Call)
-            and self.call_name(node) == "ceildiv"
-            and len(node.args) == 2
-            and not node.keywords
-        ):
+        if isinstance(node, ast.Call) and self.call_name(node) in ("ceildiv", "cdiv", "align_up"):
+            name = self.call_name(node)
+            parameters = ["x", "y"] if name == "align_up" else ["lhs", "rhs", "span"]
+            args = self.bind_call(node, parameters, {} if name == "align_up" else {"span": None})
             try:
-                return language.ceildiv(*(self.static(x) for x in node.args))
+                operation = language.align_up if name == "align_up" else language.ceildiv
+                return operation(*(self.static(args[key]) for key in parameters))
             except (TypeError, ValueError) as exc:
                 self.fail(node, str(exc))
         self.fail(node, "Expected a static specialization constant")
@@ -271,6 +280,16 @@ class Parser:
             )
         if isinstance(node, ast.Call):
             name = self.call_name(node)
+            if name in DIVISION_CALLS:
+                parameters = ["lhs", "rhs"] if name in ("ceildiv", "cdiv") else ["a", "b"]
+                args = self.bind_call(node, [*parameters, "span"], {"span": None})
+                if self.static(args["span"]) is not None:
+                    self.fail(node, "Explicit source span objects require further parser integration")
+                return Expr(DIVISION_CALLS[name], tuple(self.expr(args[key]) for key in parameters))
+            if name == "align_up":
+                args = self.bind_call(node, ["x", "y"], {})
+                left, right = (self.expr(args[key]) for key in ("x", "y"))
+                return Expr("*", (Expr("ceildiv", (left, right)), right))
             if name in BITWISE_CALLS:
                 parameters = ["x"] if name == "bitwise_not" else ["x", "y"]
                 args = self.bind_call(node, [*parameters, "span"], {"span": None})
@@ -279,8 +298,6 @@ class Parser:
                 return Expr(BITWISE_CALLS[name], tuple(self.expr(args[key]) for key in parameters))
             if name in language.DTYPE_NAMES and len(node.args) == 1 and not node.keywords:
                 return Expr("cast", (self.expr(node.args[0]),), language.DTYPE_NAMES[name])
-            if name == "ceildiv":
-                return Expr("const", value=self.static(node))
             arity = {
                 "exp": 1,
                 "exp2": 1,

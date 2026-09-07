@@ -114,13 +114,11 @@ barriers. Branch-dependent global write mappings remain outside the currently
 implemented ownership proof. `while`, scalar mutation, and loop exits still need
 implementation.
 
-## Arithmetic and GEMM
+## Scalar arithmetic
 
 Scalar arithmetic lowers to CuTe's numeric operations with explicit casts on
-operands, stores, and copies. `T.cast(value, dtype)` requests a conversion. Division and
-remainder used with `//` and `%` are restricted to statically bounded nonnegative
-integer expressions and positive constant divisors. Data-dependent indexing is
-outside the supported subset.
+operands, stores, and copies. `T.cast(value, dtype)` requests a conversion.
+Data-dependent indexing is outside the supported subset.
 
 Integer expressions support `&`, `|`, `^`, `~`, `<<`, and `>>`, together with
 `T.bitwise_and`, `T.bitwise_or`, `T.bitwise_xor`, `T.bitwise_not`, `T.shift_left`,
@@ -158,6 +156,39 @@ to FP16, so rounding can occur before addition. Both generated source and the
 reference evaluator apply the same conversion. Integer `/` requires an explicit
 division choice or a floating cast, following the source language's ambiguity
 check. Logical operations require Boolean operands.
+
+## Integer division and remainder
+
+`//` and `T.floordiv` round the quotient toward negative infinity; `%` and
+`T.floormod` return the corresponding remainder, whose sign follows the divisor.
+`T.truncdiv` rounds toward zero, and `T.truncmod` returns the corresponding
+remainder, whose sign follows the dividend. Operands may be signed or unsigned
+integer expressions, including tensor values. The function forms accept `a`,
+`b`, and default `span=None`.
+
+The backend materializes typed operands before division so the CuTe runtime
+operators are used consistently for constants and variables. Its native integer
+`//` already rounds down. Given the native truncating remainder `r`, the floor
+remainder is `r + b` when `r != 0` and the operand signs differ, and `r` otherwise.
+The truncating quotient adds one to the floor quotient under the same condition.
+Unsigned division needs no sign correction. These transformations use integer
+arithmetic throughout, including for 64-bit operands.
+
+Integer divisors must be nonzero. Signed minimum divided by `-1` is excluded
+because the quotient is unrepresentable. Proven constant violations are rejected;
+data-dependent operands retain these preconditions on every executed logical
+element. Source programs must guard any padded elements that could violate them.
+Index bounds additionally require a divisor interval excluding zero and track
+both signs. An exactly divisible variable part can preserve affine ownership.
+
+`T.ceildiv` and its alias `T.cdiv` accept expressions and specialization integers.
+They preserve the pinned upstream formula `(lhs + rhs - 1) // rhs`, including
+its behavior for negative divisors. With a positive divisor and representable
+intermediates, this equals the mathematical ceiling. `T.align_up(x, y)` is
+`T.cdiv(x, y) * y`. The index checker rejects numerator or final-result overflow;
+data-value arithmetic retains the source dtype's overflow constraints.
+
+## GEMM
 
 `T.gemm(A, B, C)` means `C += A @ B`, after optional transposition of A and/or B.
 A and B are complete shared tiles with matching FP16 or BF16 dtype. C is an FP32

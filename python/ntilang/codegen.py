@@ -7,7 +7,14 @@ import re
 from math import isfinite, isnan, prod
 
 from .ir import DTYPES, CompileError, Expr, Kernel, Partition, integer_limits
-from .scalar import BINARY_NUMERIC_OPS, BITWISE_OPS, body_types, expression_dtype, operand_dtype
+from .scalar import (
+    BINARY_NUMERIC_OPS,
+    BITWISE_OPS,
+    INTEGER_DIVISION_OPS,
+    body_types,
+    expression_dtype,
+    operand_dtype,
+)
 
 CUTLASS_TYPES = {
     "float16": "Float16",
@@ -301,6 +308,8 @@ class Emitter:
             expression_dtype(expr, self.buffers, self.scalar_types)
             dtype = operand_dtype(expr, self.buffers, self.scalar_types)
             values = [f"cutlass.{CUTLASS_TYPES[dtype]}({value})" for value in values]
+        if op in INTEGER_DIVISION_OPS:
+            return self.integer_division(op, values, dtype)
         if op in BITWISE_OPS:
             if op == "invert":
                 return f"(~{values[0]})"
@@ -316,6 +325,28 @@ class Emitter:
             function = "max" if op in ("maximum", "max") else "min"
             return f"cute.math.{function}({', '.join(values)}, propagate_nan={op in ('maximum', 'minimum')})"
         return "(" + f" {op} ".join(values) + ")"
+
+    def integer_division(self, op, values, dtype):
+        # Materialize MLIR values so `%` always has CuTe's runtime remainder
+        # semantics, including when both source operands are constants.
+        type_name = f"cutlass.{CUTLASS_TYPES[dtype]}"
+        lhs, rhs = self.unique("div_lhs"), self.unique("div_rhs")
+        self.emit(f"{lhs} = {type_name}({values[0]}.ir_value())")
+        self.emit(f"{rhs} = {type_name}({values[1]}.ir_value())")
+        if op == "ceildiv":
+            return f"(({lhs} + {rhs} - {type_name}(1)) // {rhs})"
+        if op == "//":
+            return f"({lhs} // {rhs})"
+        remainder = self.unique("remainder")
+        self.emit(f"{remainder} = {lhs} % {rhs}")
+        if op == "truncmod":
+            return remainder
+        if dtype.startswith("uint"):
+            return remainder if op == "%" else f"({lhs} // {rhs})"
+        correction = f"{type_name}(({remainder} != 0) and (({lhs} < 0) != ({rhs} < 0)))"
+        if op == "%":
+            return f"({remainder} + {correction} * {rhs})"
+        return f"(({lhs} // {rhs}) + {correction})"
 
     def coordinates(self, flat, shape):
         return [f"(({flat} // {prod(shape[i + 1 :])}) % {dim})" for i, dim in enumerate(shape)]

@@ -80,7 +80,14 @@ comparisons, and scalar joins. Floating/integer pairs preserve the floating
 operand's dtype. Bitwise integer literals adopt the other operand's integer
 type. Integer `/` and non-Boolean logical operands are rejected according to
 the source contract. General constant folding, non-default constructor forms,
-and remaining division signatures still need implementation.
+and remaining scalar signatures still need implementation.
+
+Floor and truncating integer division/remainder support signed and unsigned
+data operands. The index analysis handles either divisor sign and bounded
+nonzero variable divisors. Expression `ceildiv`, `cdiv`, and `align_up` preserve
+the pinned upstream formula and participate in static shape specialization.
+Zero-divisor and signed-overflow preconditions remain explicit. Floating
+remainder intrinsics and broader path-sensitive arithmetic analysis remain open.
 
 Loop steps and empty iteration domains are preserved. The supported `unroll`
 form emits CuTe compile-time iteration. Loop annotations, partial unroll factors,

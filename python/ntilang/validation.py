@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .ir import DTYPES, CompileError, Expr, Kernel, integer_limits
-from .scalar import BINARY_NUMERIC_OPS, BITWISE_OPS, expression_dtype
+from .scalar import BINARY_NUMERIC_OPS, BITWISE_OPS, INTEGER_DIVISION_OPS, expression_dtype
 
 INT_MIN, INT_MAX = -(2**31), 2**31 - 1
 
@@ -72,7 +72,42 @@ def interval(expr, bounds, definitions):
             result = (0, (1 << max(a[1].bit_length(), b[1].bit_length())) - 1)
         else:
             result = (INT_MIN, INT_MAX)
-    elif expr.op in ("+", "-", "*", "//", "%"):
+    elif expr.op in INTEGER_DIVISION_OPS:
+        a, b = (interval(x, bounds, definitions) for x in expr.args)
+        dtype = resolved_dtype(expr, bounds, definitions, {})
+        type_low, type_high = integer_limits(dtype)
+        if dtype.startswith("uint") and (a[0] < 0 or b[0] < 0):
+            raise CompileError("An unsigned index operand conversion can change the represented value")
+        if b[0] <= 0 <= b[1]:
+            raise CompileError("An index divisor can be zero")
+        if expr.op == "ceildiv":
+            total = (a[0] + b[0], a[1] + b[1])
+            if total[0] < type_low or total[1] > type_high or total[0] - 1 < type_low:
+                raise CompileError("The ceildiv numerator can overflow its integer dtype")
+            a = (total[0] - 1, total[1] - 1)
+        if dtype.startswith("int") and a[0] <= type_low <= a[1] and b[0] <= -1 <= b[1]:
+            raise CompileError("Signed minimum divided by -1 can overflow the integer dtype")
+        if expr.op in ("//", "ceildiv", "truncdiv"):
+
+            def quotient(x, y):
+                if expr.op == "truncdiv":
+                    return (abs(x) // abs(y)) * (-1 if (x < 0) != (y < 0) else 1)
+                return x // y
+
+            endpoints = [quotient(x, y) for x in a for y in b]
+            result = (min(endpoints), max(endpoints))
+        elif a[0] == a[1] and b[0] == b[1]:
+            if expr.op == "%":
+                result = (a[0] % b[0],) * 2
+            else:
+                remainder = abs(a[0]) % abs(b[0]) * (-1 if a[0] < 0 else 1)
+                result = (remainder,) * 2
+        elif expr.op == "%":
+            result = (0, b[1] - 1) if b[0] > 0 else (b[0] + 1, 0)
+        else:
+            magnitude = max(abs(b[0]), abs(b[1])) - 1
+            result = (max(a[0], -magnitude) if a[0] < 0 else 0, min(a[1], magnitude) if a[1] > 0 else 0)
+    elif expr.op in ("+", "-", "*"):
         a, b = (interval(x, bounds, definitions) for x in expr.args)
         if expr.op == "+":
             result = (a[0] + b[0], a[1] + b[1])
@@ -81,21 +116,15 @@ def interval(expr, bounds, definitions):
         elif expr.op == "*":
             products = [x * y for x in a for y in b]
             result = (min(products), max(products))
-        elif b[0] != b[1] or b[0] <= 0:
-            raise CompileError("Index division/remainder requires a positive static divisor")
-        elif expr.op == "//":
-            # CuTe integer division truncates toward zero; reject negative cases.
-            if a[0] < 0:
-                raise CompileError("Index division requires a nonnegative dividend")
-            result = (a[0] // b[0], a[1] // b[0])
-        else:
-            if a[0] < 0:
-                raise CompileError("Index remainder requires a nonnegative dividend")
-            result = (0, b[0] - 1)
     else:
         raise CompileError("Data-dependent or non-integer indexing is not supported")
     if result[0] < INT_MIN or result[1] > INT_MAX:
         raise CompileError("An index expression can overflow signed 32-bit arithmetic")
+    if expr.op in INTEGER_DIVISION_OPS | {"+", "-", "*", "neg", "pos"}:
+        dtype = resolved_dtype(expr, bounds, definitions, {})
+        low, high = integer_limits(dtype)
+        if result[0] < low or result[1] > high:
+            raise CompileError("An index expression can overflow its integer dtype")
     return result
 
 
@@ -124,6 +153,16 @@ def affine(expr, definitions, bounds=None):
         if not coefficients and 0 <= shift < 32:
             interval(expr, {} if bounds is None else bounds, definitions)
             return affine(Expr("*", (expr.args[0], Expr("const", value=1 << shift))), definitions, bounds)
+    if expr.op in ("//", "truncdiv", "ceildiv"):
+        divisor, variables = affine(expr.args[1], definitions, bounds)
+        constant, coefficients = affine(expr.args[0], definitions, bounds)
+        if not variables and divisor and all(value % divisor == 0 for value in coefficients.values()):
+            if expr.op == "truncdiv" and constant % divisor:
+                raise CompileError("Truncating division needs an exactly divisible affine numerator")
+            interval(expr, {} if bounds is None else bounds, definitions)
+            if expr.op == "ceildiv":
+                constant += divisor - 1
+            return constant // divisor, {name: value // divisor for name, value in coefficients.items()}
     if expr.op in ("+", "-", "*"):
         (ac, av), (bc, bv) = (affine(x, definitions, bounds) for x in expr.args)
         if expr.op in ("+", "-"):
@@ -189,8 +228,22 @@ def validate(kernel: Kernel):
                         raise CompileError(
                             "Shift count must be nonnegative and smaller than the promoted integer width"
                         )
-        if expr.op in ("//", "%"):
-            interval(expr, bounds, definitions)
+        if expr.op in INTEGER_DIVISION_OPS:
+            operands = []
+            for arg in expr.args:
+                try:
+                    operands.append(interval(arg, bounds, definitions))
+                except CompileError:
+                    operands.append(None)
+            left, right = operands
+            if right == (0, 0):
+                raise CompileError("Integer division requires a nonzero divisor")
+            if expr.op == "ceildiv" and left is not None and right is not None:
+                interval(expr, bounds, definitions)
+            elif left is not None and right == (-1, -1):
+                low = integer_limits(dtype)[0]
+                if dtype.startswith("int") and left == (low, low):
+                    raise CompileError("Signed minimum divided by -1 overflows the integer dtype")
         if expr.op == "load":
             if buffers[expr.value].space == "global":
                 reads.add(expr.value)

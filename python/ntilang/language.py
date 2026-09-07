@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import inspect
 from dataclasses import dataclass
 from functools import wraps
@@ -36,10 +37,21 @@ def Tensor(shape, dtype="float32") -> TensorType:
     return TensorType(tuple(shape), dtype)
 
 
-def ceildiv(a: int, b: int) -> int:
-    if b <= 0:
-        raise ValueError("ceildiv requires a positive divisor")
-    return -(-a // b)
+def ceildiv(lhs: int, rhs: int, span=None) -> int:
+    if type(lhs) is not builtins.int or type(rhs) is not builtins.int:
+        raise TypeError("ceildiv specialization arguments must be integers")
+    if span is not None:
+        raise ValueError("Explicit source span objects require parser integration")
+    if rhs == 0:
+        raise ValueError("ceildiv requires a nonzero divisor")
+    return (lhs + rhs - 1) // rhs
+
+
+cdiv = ceildiv
+
+
+def align_up(x: int, y: int) -> int:
+    return ceildiv(x, y) * y
 
 
 @dataclass(frozen=True)
@@ -119,6 +131,10 @@ for _name in (
     "bitwise_not",
     "shift_left",
     "shift_right",
+    "floordiv",
+    "floormod",
+    "truncdiv",
+    "truncmod",
 ):
     _marker = _syntax_operation(_name)
     globals()[_name] = _marker

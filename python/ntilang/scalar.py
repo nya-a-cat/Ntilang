@@ -3,8 +3,10 @@
 from .ir import DTYPES, CompileError, integer_limits
 
 BITWISE_OPS = frozenset(("&", "|", "^", "invert", "<<", ">>"))
-BINARY_NUMERIC_OPS = frozenset(
-    ("+", "-", "*", "/", "//", "%", "<", "<=", ">", ">=", "==", "!=", "maximum", "minimum", "max", "min")
+INTEGER_DIVISION_OPS = frozenset(("//", "%", "truncdiv", "truncmod", "ceildiv"))
+BINARY_NUMERIC_OPS = (
+    frozenset(("+", "-", "*", "/", "<", "<=", ">", ">=", "==", "!=", "maximum", "minimum", "max", "min"))
+    | INTEGER_DIVISION_OPS
 )
 
 
@@ -72,6 +74,11 @@ def expression_dtype(expr, buffers, variables):
             raise CompileError("Bitwise operations require integer or Boolean operands")
         if expr.op in ("<<", ">>") and "bool" in types:
             raise CompileError("Shift operations require integer operands, excluding Boolean")
+    if expr.op in INTEGER_DIVISION_OPS:
+        if any(
+            not expression_dtype(arg, buffers, variables).startswith(("int", "uint")) for arg in expr.args
+        ):
+            raise CompileError("Integer division and remainder require integer operands, excluding Boolean")
     result = operand_dtype(expr, buffers, variables)
     if expr.op in ("<", "<=", ">", ">=", "==", "!="):
         return "bool"
