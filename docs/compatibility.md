@@ -95,7 +95,7 @@ Legacy TIR annotation semantics and buffer annotations remain open.
 `alloc_var` supports basic scalar dtypes in the local.var scope, initialization,
 assignment, augmented assignment, serial/unrolled loop-carried values, and
 conditional updates. Cross-parallel persistent scalar state, mutable index
-range analysis, alternative allocation scopes, and buffer-style scalar access
+ownership/range refinement, alternative allocation scopes, and buffer-style scalar access
 remain open.
 
 Boolean while loops support mutable loop-carried values, nested loops,
@@ -116,8 +116,11 @@ remainder intrinsics and broader path-sensitive arithmetic analysis remain open.
 Loop steps and empty iteration domains are preserved. Serial/unroll loops accept
 keyword start/stop/step arguments. Unroll's explicit expansion, full-unroll hint,
 factor hint, and corresponding annotation precedence are implemented separately.
-Other loop annotations, dynamic bounds, and vectorized loop lowering require
-further implementation.
+Integer runtime start/stop bounds use captured values, static steps, 64-bit
+trip-count arithmetic, and checked induction ranges. Data-dependent gathers
+use guarded loads with dtype/min/max/bit-mask interval reasoning. More general
+typed index domains, runtime steps, other loop annotations, and vectorized
+loop lowering require further implementation.
 
 ## Remaining language families
 

@@ -26,18 +26,19 @@ def resolved_dtype(expr, bounds, definitions, buffers, *, ignore_predicates=Fals
     )
 
 
-def predicate_bounds(condition, truth, bounds, definitions):
+def predicate_bounds(condition, truth, bounds, definitions, buffers=None):
     """Refine an integer interval for a necessary single-variable predicate."""
+    buffers = {} if buffers is None else buffers
     if condition.op == "const" and type(condition.value) is bool:
         return bounds.copy() if condition.value == truth else None
     if condition.op == "var" and condition.value in definitions:
-        return predicate_bounds(definitions[condition.value], truth, bounds, definitions)
+        return predicate_bounds(definitions[condition.value], truth, bounds, definitions, buffers)
     if condition.op == "not":
-        return predicate_bounds(condition.args[0], not truth, bounds, definitions)
+        return predicate_bounds(condition.args[0], not truth, bounds, definitions, buffers)
     if condition.op == ("and" if truth else "or"):
         result = bounds.copy()
         for child in condition.args:
-            result = predicate_bounds(child, truth, result, definitions)
+            result = predicate_bounds(child, truth, result, definitions, buffers)
             if result is None:
                 break
         return result
@@ -46,11 +47,11 @@ def predicate_bounds(condition, truth, bounds, definitions):
         return bounds.copy()
     difference = Expr("-", condition.args)
     try:
-        operand_bounds = [interval(arg, bounds, definitions) for arg in condition.args]
-        dtype = resolved_dtype(difference, bounds, definitions, {}, ignore_predicates=True)
+        operand_bounds = [interval(arg, bounds, definitions, buffers) for arg in condition.args]
+        dtype = resolved_dtype(difference, bounds, definitions, buffers, ignore_predicates=True)
         if dtype.startswith("uint") and any(low < 0 for low, _ in operand_bounds):
             return bounds.copy()
-        constant, coefficients = affine(difference, definitions, bounds)
+        constant, coefficients = affine(difference, definitions, bounds, buffers)
     except CompileError:
         return bounds.copy()
     if not truth:
@@ -95,49 +96,55 @@ def predicate_bounds(condition, truth, bounds, definitions):
     return None if low > high else {**bounds, name: (low, high)}
 
 
-def interval(expr, bounds, definitions):
+def interval(expr, bounds, definitions, buffers=None):
     """Bound every intermediate operation in an integer index expression."""
+    buffers = {} if buffers is None else buffers
     if expr.op == "const" and type(expr.value) is int:
         result = (expr.value, expr.value)
     elif expr.op == "phi" or expr.op in CHOICE_OPS:
         alternatives = []
         for index, branch in enumerate(expr.args if expr.op == "phi" else expr.args[1:]):
             branch_bounds = (
-                predicate_bounds(expr.args[0], index == 0, bounds, definitions)
+                predicate_bounds(expr.args[0], index == 0, bounds, definitions, buffers)
                 if expr.op == "if_then_else"
                 else bounds
             )
             if branch_bounds is not None:
-                alternatives.append(interval(branch, branch_bounds, definitions))
+                alternatives.append(interval(branch, branch_bounds, definitions, buffers))
         result = (min(x[0] for x in alternatives), max(x[1] for x in alternatives))
-        dtype = resolved_dtype(expr, bounds, definitions, {}, ignore_predicates=True)
+        dtype = resolved_dtype(expr, bounds, definitions, buffers, ignore_predicates=True)
         low, high = integer_limits(dtype)
         if result[0] < low or result[1] > high:
             raise CompileError("A conditional index conversion can change the represented value")
     elif expr.op == "var":
         if expr.value in definitions:
-            return interval(definitions[expr.value], bounds, definitions)
+            return interval(definitions[expr.value], bounds, definitions, buffers)
         if expr.value not in bounds:
             raise CompileError("Indices must use integer block/loop variables and static constants")
         result = bounds[expr.value]
-    elif expr.op == "mutable":
-        raise CompileError("Mutable scalar indices require additional loop-state range analysis")
+    elif expr.op in ("mutable", "load"):
+        if expr.op == "load" and expr.value not in buffers:
+            raise CompileError("Integer data bounds require buffer dtype information")
+        dtype = expr.value if expr.op == "mutable" else buffers[expr.value].type.dtype
+        if not dtype.startswith(("int", "uint")):
+            raise CompileError("Data-dependent indices require an integer dtype")
+        result = integer_limits(dtype)
     elif expr.op == "cast" and (expr.value.startswith(("int", "uint")) or expr.value == "bool"):
-        result = interval(expr.args[0], bounds, definitions)
+        result = interval(expr.args[0], bounds, definitions, buffers)
         low, high = integer_limits(expr.value)
         if result[0] < low or result[1] > high:
             raise CompileError("An integer index cast can change the represented value")
     elif expr.op in ("neg", "pos", "invert"):
-        low, high = interval(expr.args[0], bounds, definitions)
+        low, high = interval(expr.args[0], bounds, definitions, buffers)
         result = (-high, -low) if expr.op == "neg" else (~high, ~low) if expr.op == "invert" else (low, high)
         if expr.op == "invert":
-            dtype = resolved_dtype(expr, bounds, definitions, {}, ignore_predicates=True)
+            dtype = resolved_dtype(expr, bounds, definitions, buffers, ignore_predicates=True)
             if dtype.startswith("uint"):
                 mask = integer_limits(dtype)[1]
                 result = (mask - high, mask - low)
     elif expr.op in ("&", "|", "^", "<<", ">>"):
-        a, b = (interval(x, bounds, definitions) for x in expr.args)
-        dtype = resolved_dtype(expr, bounds, definitions, {}, ignore_predicates=True)
+        a, b = (interval(x, bounds, definitions, buffers) for x in expr.args)
+        dtype = resolved_dtype(expr, bounds, definitions, buffers, ignore_predicates=True)
         type_low, type_high = integer_limits(dtype)
         if dtype.startswith("uint"):
 
@@ -163,8 +170,8 @@ def interval(expr, bounds, definitions):
         else:
             result = (INT_MIN, INT_MAX)
     elif expr.op in INTEGER_DIVISION_OPS:
-        a, b = (interval(x, bounds, definitions) for x in expr.args)
-        dtype = resolved_dtype(expr, bounds, definitions, {}, ignore_predicates=True)
+        a, b = (interval(x, bounds, definitions, buffers) for x in expr.args)
+        dtype = resolved_dtype(expr, bounds, definitions, buffers, ignore_predicates=True)
         type_low, type_high = integer_limits(dtype)
         if dtype.startswith("uint") and (a[0] < 0 or b[0] < 0):
             raise CompileError("An unsigned index operand conversion can change the represented value")
@@ -197,8 +204,15 @@ def interval(expr, bounds, definitions):
         else:
             magnitude = max(abs(b[0]), abs(b[1])) - 1
             result = (max(a[0], -magnitude) if a[0] < 0 else 0, min(a[1], magnitude) if a[1] > 0 else 0)
+    elif expr.op in ("min", "max", "minimum", "maximum"):
+        a, b = (interval(x, bounds, definitions, buffers) for x in expr.args)
+        dtype = resolved_dtype(expr, bounds, definitions, buffers, ignore_predicates=True)
+        if dtype.startswith("uint") and (a[0] < 0 or b[0] < 0):
+            raise CompileError("An unsigned index operand conversion can change the represented value")
+        operation = min if expr.op in ("min", "minimum") else max
+        result = tuple(operation(left, right) for left, right in zip(a, b))
     elif expr.op in ("+", "-", "*"):
-        a, b = (interval(x, bounds, definitions) for x in expr.args)
+        a, b = (interval(x, bounds, definitions, buffers) for x in expr.args)
         if expr.op == "+":
             result = (a[0] + b[0], a[1] + b[1])
         elif expr.op == "-":
@@ -211,52 +225,55 @@ def interval(expr, bounds, definitions):
     if result[0] < INT_MIN or result[1] > INT_MAX:
         raise CompileError("An index expression can overflow signed 32-bit arithmetic")
     if expr.op in INTEGER_DIVISION_OPS | {"+", "-", "*", "neg", "pos"}:
-        dtype = resolved_dtype(expr, bounds, definitions, {}, ignore_predicates=True)
+        dtype = resolved_dtype(expr, bounds, definitions, buffers, ignore_predicates=True)
         low, high = integer_limits(dtype)
         if result[0] < low or result[1] > high:
             raise CompileError("An index expression can overflow its integer dtype")
     return result
 
 
-def affine(expr, definitions, bounds=None):
+def affine(expr, definitions, bounds=None, buffers=None):
     """Return constant and integer coefficients, or reject a non-affine expression."""
     if expr.op == "const" and type(expr.value) is int:
         return expr.value, {}
     if expr.op == "phi" or expr.op in CHOICE_OPS:
         alternatives = [
-            affine(x, definitions, bounds) for x in (expr.args if expr.op == "phi" else expr.args[1:])
+            affine(x, definitions, bounds, buffers)
+            for x in (expr.args if expr.op == "phi" else expr.args[1:])
         ]
         if all(x == alternatives[0] for x in alternatives):
             return alternatives[0]
         raise CompileError("Global writes require branch-independent affine ownership")
     if expr.op == "var":
         if expr.value in definitions:
-            return affine(definitions[expr.value], definitions, bounds)
+            return affine(definitions[expr.value], definitions, bounds, buffers)
         return 0, {expr.value: 1}
     if expr.op == "cast" and (expr.value.startswith(("int", "uint")) or expr.value == "bool"):
-        interval(expr, {} if bounds is None else bounds, definitions)
-        return affine(expr.args[0], definitions, bounds)
+        interval(expr, {} if bounds is None else bounds, definitions, buffers)
+        return affine(expr.args[0], definitions, bounds, buffers)
     if expr.op in ("neg", "pos"):
-        const, coeff = affine(expr.args[0], definitions, bounds)
+        const, coeff = affine(expr.args[0], definitions, bounds, buffers)
         sign = -1 if expr.op == "neg" else 1
         return sign * const, {n: sign * v for n, v in coeff.items()}
     if expr.op == "<<":
-        shift, coefficients = affine(expr.args[1], definitions, bounds)
+        shift, coefficients = affine(expr.args[1], definitions, bounds, buffers)
         if not coefficients and 0 <= shift < 32:
-            interval(expr, {} if bounds is None else bounds, definitions)
-            return affine(Expr("*", (expr.args[0], Expr("const", value=1 << shift))), definitions, bounds)
+            interval(expr, {} if bounds is None else bounds, definitions, buffers)
+            return affine(
+                Expr("*", (expr.args[0], Expr("const", value=1 << shift))), definitions, bounds, buffers
+            )
     if expr.op in ("//", "truncdiv", "ceildiv"):
-        divisor, variables = affine(expr.args[1], definitions, bounds)
-        constant, coefficients = affine(expr.args[0], definitions, bounds)
+        divisor, variables = affine(expr.args[1], definitions, bounds, buffers)
+        constant, coefficients = affine(expr.args[0], definitions, bounds, buffers)
         if not variables and divisor and all(value % divisor == 0 for value in coefficients.values()):
             if expr.op == "truncdiv" and constant % divisor:
                 raise CompileError("Truncating division needs an exactly divisible affine numerator")
-            interval(expr, {} if bounds is None else bounds, definitions)
+            interval(expr, {} if bounds is None else bounds, definitions, buffers)
             if expr.op == "ceildiv":
                 constant += divisor - 1
             return constant // divisor, {name: value // divisor for name, value in coefficients.items()}
     if expr.op in ("+", "-", "*"):
-        (ac, av), (bc, bv) = (affine(x, definitions, bounds) for x in expr.args)
+        (ac, av), (bc, bv) = (affine(x, definitions, bounds, buffers) for x in expr.args)
         if expr.op in ("+", "-"):
             sign = -1 if expr.op == "-" else 1
             out = av.copy()
@@ -270,7 +287,7 @@ def affine(expr, definitions, bounds=None):
     raise CompileError("Global writes require affine indices whose ownership can be checked")
 
 
-def check_ownership(indices, bounds, definitions):
+def check_ownership(indices, bounds, definitions, buffers=None):
     """Prove injectivity with separated integer strides in each coordinate.
 
     For sorted nonzero coefficients, each larger coefficient must exceed the
@@ -282,8 +299,8 @@ def check_ownership(indices, bounds, definitions):
     active = {name for name, (low, high) in bounds.items() if high > low}
     recovered = set()
     for index in indices:
-        interval(index, bounds, definitions)
-        _, coefficients = affine(index, definitions, bounds)
+        interval(index, bounds, definitions, buffers)
+        _, coefficients = affine(index, definitions, bounds, buffers)
         ordered = sorted((abs(c), n) for n, c in coefficients.items() if c and n in active)
         span = 0
         for coefficient, name in ordered:
@@ -306,24 +323,33 @@ def validate(kernel: Kernel):
     reads, writes = set(), {}
     initial_bounds = {name: (0, size - 1) for name, size in zip(kernel.block_vars, kernel.grid)}
 
+    def runtime_value(expr, definitions):
+        if expr.op in ("load", "mutable"):
+            return True
+        if expr.op == "var" and expr.value in definitions:
+            return runtime_value(definitions[expr.value], definitions)
+        return any(runtime_value(arg, definitions) for arg in expr.args)
+
     def expression(expr, bounds, definitions):
         if expr.op in BITWISE_OPS | BINARY_NUMERIC_OPS | CHOICE_OPS | {"and", "or", "not"}:
             dtype = resolved_dtype(expr, bounds, definitions, buffers)
             if expr.op in ("<<", ">>"):
                 try:
-                    low, high = interval(expr.args[1], bounds, definitions)
+                    low, high = interval(expr.args[1], bounds, definitions, buffers)
                 except CompileError:
                     # Data-dependent counts retain the upstream valid-count precondition.
                     pass
                 else:
-                    if low < 0 or high >= DTYPES[dtype] * 8:
+                    if (low < 0 or high >= DTYPES[dtype] * 8) and (
+                        not runtime_value(expr.args[1], definitions) or high < 0 or low >= DTYPES[dtype] * 8
+                    ):
                         raise CompileError(
                             "Shift count must be nonnegative and smaller than the promoted integer width"
                         )
         if expr.op == "if_then_else":
             expression(expr.args[0], bounds, definitions)
             for truth, branch in zip((True, False), expr.args[1:]):
-                branch_bounds = predicate_bounds(expr.args[0], truth, bounds, definitions)
+                branch_bounds = predicate_bounds(expr.args[0], truth, bounds, definitions, buffers)
                 if branch_bounds is not None:
                     expression(branch, branch_bounds, definitions)
             return
@@ -331,14 +357,19 @@ def validate(kernel: Kernel):
             operands = []
             for arg in expr.args:
                 try:
-                    operands.append(interval(arg, bounds, definitions))
+                    operands.append(interval(arg, bounds, definitions, buffers))
                 except CompileError:
                     operands.append(None)
             left, right = operands
             if right == (0, 0):
                 raise CompileError("Integer division requires a nonzero divisor")
-            if expr.op == "ceildiv" and left is not None and right is not None:
-                interval(expr, bounds, definitions)
+            if (
+                expr.op == "ceildiv"
+                and left is not None
+                and right is not None
+                and not runtime_value(expr, definitions)
+            ):
+                interval(expr, bounds, definitions, buffers)
             elif left is not None and right == (-1, -1):
                 low = integer_limits(dtype)[0]
                 if dtype.startswith("int") and left == (low, low):
@@ -347,19 +378,19 @@ def validate(kernel: Kernel):
             if buffers[expr.value].space == "global":
                 reads.add(expr.value)
             for index in expr.args:
-                interval(index, bounds, definitions)
+                interval(index, bounds, definitions, buffers)
         for arg in expr.args:
             expression(arg, bounds, definitions)
 
     def record_write(name, indices, bounds, definitions, in_serial, path):
         if in_serial:
             raise CompileError("Write global outputs after serial tile accumulation loops")
-        check_ownership(indices, bounds, definitions)
-        mapping = (tuple(affine(x, definitions, bounds) for x in indices), bounds)
+        check_ownership(indices, bounds, definitions, buffers)
+        mapping = (tuple(affine(x, definitions, bounds, buffers) for x in indices), bounds)
         footprint = tuple(
             (max(0, low), min(size - 1, high))
             for (low, high), size in zip(
-                (interval(x, bounds, definitions) for x in indices), buffers[name].type.shape
+                (interval(x, bounds, definitions, buffers) for x in indices), buffers[name].type.shape
             )
         )
         for previous_path, previous_mapping, previous_footprint in writes.get(name, []):
@@ -420,7 +451,7 @@ def validate(kernel: Kernel):
                     expression(value, bounds, definitions)
                     for index in indices:
                         expression(index, bounds, definitions)
-                        interval(index, bounds, definitions)
+                        interval(index, bounds, definitions, buffers)
                     if buffers[name].space == "global":
                         record_write(name, indices, bounds, definitions, in_serial, path)
                 elif op == "copy":
@@ -444,7 +475,7 @@ def validate(kernel: Kernel):
                         )
                         for index in indices:
                             expression(index, tile_bounds, definitions)
-                            interval(index, tile_bounds, definitions)
+                            interval(index, tile_bounds, definitions, buffers)
                         if region is dst and buffers[dst.buffer].space == "global":
                             record_write(dst.buffer, indices, tile_bounds, definitions, in_serial, path)
                 elif op == "fill":
@@ -454,11 +485,31 @@ def validate(kernel: Kernel):
                     inner_bounds = bounds.copy()
                     if op == "parallel":
                         inner_bounds.update({n: (0, s - 1) for n, s in zip(names, extent)})
-                    else:
+                    elif all(type(value) is int for value in extent):
                         domain = range(*extent)
                         if not domain:
                             continue
                         inner_bounds[names[0]] = (min(domain[0], domain[-1]), max(domain[0], domain[-1]))
+                    else:
+                        domains = []
+                        for value in extent[:2]:
+                            value = Expr("const", value=value) if type(value) is int else value
+                            expression(value, bounds, definitions)
+                            dtype = resolved_dtype(value, bounds, definitions, buffers)
+                            if not dtype.startswith(("int", "uint")):
+                                raise CompileError("Dynamic loop bounds require integer expressions")
+                            domains.append(interval(value, bounds, definitions, buffers))
+                        start, stop = domains
+                        step = extent[2]
+                        low, high = (start[0], stop[1] - 1) if step > 0 else (stop[0] + 1, start[1])
+                        if low > high:
+                            continue
+                        maximum_trips = (high - low) // abs(step) + 1
+                        if maximum_trips > INT_MAX:
+                            raise CompileError(
+                                "Dynamic loop iteration count can exceed signed 32-bit indexing"
+                            )
+                        inner_bounds[names[0]] = (low, high)
                     statements(inner, inner_bounds, definitions.copy(), in_serial or op != "parallel", path)
             except CompileError as exc:
                 if exc.location is not None:

@@ -709,10 +709,23 @@ class Emitter:
             self.depth -= 1
         elif op in ("serial", "unroll"):
             names, extents, inner = args
-            trip_count = len(range(*extents))
-            if not trip_count:
-                self.emit("pass  # empty static iteration domain")
-                return
+            if all(type(value) is int for value in extents):
+                trip_count = len(range(*extents))
+                if not trip_count:
+                    self.emit("pass  # empty static iteration domain")
+                    return
+                start = str(extents[0])
+            else:
+                captured = []
+                for bound in extents[:2]:
+                    value = self.expression(bound) if isinstance(bound, Expr) else str(bound)
+                    captured.append(self.unique("loop_bound"))
+                    self.emit(f"{captured[-1]} = cutlass.Int64({value})")
+                start, stop = captured
+                difference = f"({stop} - {start})" if extents[2] > 0 else f"({start} - {stop})"
+                count = f"(({difference} + {abs(extents[2]) - 1}) // {abs(extents[2])})"
+                trip_count = self.unique("trip_count")
+                self.emit(f"{trip_count} = cutlass.Int32(cute.math.max(cutlass.Int64(0), {count}))")
             ordinal = self.unique("iteration")
             control = self.loop_control(inner)
             annotations = dict(stmt.annotations)
@@ -728,7 +741,7 @@ class Emitter:
             self.emit(f"for {ordinal} in {loop}:")
             self.depth += 1
             self.emit(
-                f"{self.var(names[0])} = cutlass.Int32(cutlass.Int64({extents[0]}) + cutlass.Int64({ordinal}) * {extents[2]})"
+                f"{self.var(names[0])} = cutlass.Int32(cutlass.Int64({start}) + cutlass.Int64({ordinal}) * {extents[2]})"
             )
             old_types = self.scalar_types.copy()
             self.scalar_types[names[0]] = "int32"

@@ -10,7 +10,7 @@ import itertools
 import operator
 
 from .compiler import CompiledKernel
-from .ir import integer_limits
+from .ir import Expr, integer_limits
 from .scalar import CHOICE_OPS, INTEGER_DIVISION_OPS, body_types, expression_dtype, operand_dtype
 
 
@@ -232,7 +232,8 @@ def reference(kernel: CompiledKernel, *arrays):
             elif op in ("serial", "unroll"):
                 names, extent, inner = args
                 before_types = variable_types.copy()
-                for value in range(*extent):
+                domain = tuple(expr(value) if isinstance(value, Expr) else value for value in extent)
+                for value in range(*domain):
                     variable_types = {**before_types, names[0]: "int32"}
                     variables[names[0]] = value
                     try:

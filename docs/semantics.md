@@ -40,7 +40,10 @@ a layout conversion and produce a compilation error.
 
 `T.serial(stop)`, `T.serial(start, stop)`, and `T.serial(start, stop, step)` follow
 Python's static integer range semantics, including negative steps and empty
-domains. A zero step is rejected. Induction arithmetic is formed in 64 bits
+domains. Start and stop may also be integer expressions with proven 32-bit
+ranges; the step remains static. Runtime bounds are captured once on loop entry.
+Trip-count arithmetic is formed in 64 bits, clamped at zero for empty domains,
+and checked against the 32-bit loop-count limit. A zero step is rejected. Induction arithmetic is formed in 64 bits
 before conversion to its checked 32-bit range. `T.unroll` has the same iteration
 domain. `explicit=True` uses CuTe compile-time iteration; the default emits a
 full-unroll compiler hint. `unroll_factor` emits a factor hint, with 0 and 1
@@ -50,6 +53,9 @@ the final loop according to its backend rules. `pragma_unroll_explicit` and
 `pragma_unroll_factor` annotations follow the upstream precedence: a true
 `explicit` argument and a non-None factor override their annotation values.
 Explicit expansion and a factor are mutually exclusive. Other annotations remain open
+compatibility work. Explicit expansion additionally requires static bounds;
+dynamic loops retain compiler unroll hints. Dynamic loops do not establish new
+buffer initialization after the loop. Other scheduling options remain open
 compatibility work. Global outputs are currently written after serial
 accumulation loops. `T.Pipelined(..., num_stages=0 or 1)` is synchronous.
 
@@ -148,8 +154,9 @@ updates. Scalars declared inside a parallel loop are initialized separately for
 each logical element. Scalars declared outside parallel loops can be updated
 by uniform statements and read inside parallel loops. Updating them inside a
 parallel loop requires additional per-thread state mapping and is currently
-diagnosed. Mutable index expressions also require further loop-state range
-analysis; their initializer is never substituted as a bound for later reads.
+diagnosed. Mutable integer reads use their dtype range in index analysis;
+their initializer is never substituted as a bound for later reads. Proving
+more precise mutable ranges and ownership still requires loop-state analysis.
 
 `while` evaluates a Boolean condition before the first iteration and again
 after every body execution. Condition-local tensor loads and conditional
@@ -185,7 +192,10 @@ read tracking, even when both selected address expressions are identical.
 
 Scalar arithmetic lowers to CuTe's numeric operations with explicit casts on
 operands, stores, and copies. `T.cast(value, dtype)` requests a conversion.
-Data-dependent indexing is outside the supported subset.
+Integer data-dependent reads use the same masked loads as other indices.
+Type ranges, integer min/max, and bit masks can bound their addresses. All index
+intermediates must still fit the checked 32-bit domain and their own dtypes.
+Data-dependent scatter writes require additional ownership analysis.
 
 Integer expressions support `&`, `|`, `^`, `~`, `<<`, and `>>`, together with
 `T.bitwise_and`, `T.bitwise_or`, `T.bitwise_xor`, `T.bitwise_not`, `T.shift_left`,

@@ -113,7 +113,7 @@ def test_cross_parallel_scope_updates_require_state_mapping():
         ntilang.compile(bad)
 
 
-def test_mutable_index_does_not_reuse_stale_initializer_bounds():
+def test_mutable_output_ownership_is_not_inferred_from_initializer():
     @T.prim_func
     def bad(A: T.Tensor((32,), "int32"), B: T.Tensor((32,), "int32")):
         with T.Kernel(1, threads=32) as _bx:
@@ -121,9 +121,9 @@ def test_mutable_index_does_not_reuse_stale_initializer_bounds():
                 index = T.alloc_var("int32", 0)
                 for k in T.serial(4):
                     index += k
-                B[i] = A[index]
+                B[index] = A[i]
 
-    with pytest.raises(ntilang.CompileError, match="loop-state range analysis"):
+    with pytest.raises(ntilang.CompileError, match="affine indices"):
         ntilang.compile(bad)
 
 

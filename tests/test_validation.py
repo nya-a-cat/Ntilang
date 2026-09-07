@@ -41,14 +41,14 @@ def test_index_overflow_is_rejected():
         ntilang.compile(bad)
 
 
-def test_data_dependent_index_is_rejected():
+def test_data_dependent_output_ownership_is_rejected():
     @T.prim_func
     def bad(A: T.Tensor((32,), "int32"), B: T.Tensor((32,), "int32")):
         with T.Kernel(1, threads=32) as _bx:
             for i in T.Parallel(32):
-                B[i] = A[A[i]]
+                B[A[i]] = i
 
-    with pytest.raises(ntilang.CompileError, match="Data-dependent"):
+    with pytest.raises(ntilang.CompileError, match="affine indices"):
         ntilang.compile(bad)
 
 

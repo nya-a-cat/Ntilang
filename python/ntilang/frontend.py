@@ -183,8 +183,8 @@ class Parser:
                 arguments[name] = ast.Constant(value=defaults[name])
         return arguments
 
-    def static_loop(self, call, name):
-        """Bind the upstream static serial/unroll signatures and scheduling hints."""
+    def loop_signature(self, call, name):
+        """Bind serial/unroll bounds, a static step, and scheduling hints."""
         unrolled = name in ("unroll", "Unroll")
         parameters = ["start", "stop", "step", "annotations"]
         defaults = {"stop": None, "step": None, "annotations": None}
@@ -193,9 +193,19 @@ class Parser:
             defaults.update(explicit=False, unroll_factor=None)
         if len(call.args) > 3:
             self.fail(call, "Loop scheduling arguments must be keyword-only")
-        values = {
-            key: self.static(value) for key, value in self.bind_call(call, parameters, defaults).items()
-        }
+        arguments = self.bind_call(call, parameters, defaults)
+        values = {}
+        for key, value in arguments.items():
+            if key in ("start", "stop"):
+                if any(isinstance(node, ast.Name) and node.id in self.variables for node in ast.walk(value)):
+                    values[key] = self.expr(value)
+                    continue
+                try:
+                    values[key] = self.static(value)
+                except CompileError:
+                    values[key] = self.expr(value)
+            else:
+                values[key] = self.static(value)
         start, stop, step = (values[key] for key in ("start", "stop", "step"))
         if stop is None:
             start, stop = 0, start
@@ -685,7 +695,7 @@ class Parser:
                 self.fail(node, "Nested T.Parallel loops are not supported; use T.Parallel(M, N)")
             annotations = ()
             if name in ("serial", "Serial", "unroll", "Unroll"):
-                extents, annotations = self.static_loop(node.iter, name)
+                extents, annotations = self.loop_signature(node.iter, name)
             else:
                 kw = self.keywords(node.iter, {"num_stages"} if name == "Pipelined" else set())
                 if kw.get("num_stages", 1) not in (0, 1):
@@ -705,10 +715,10 @@ class Parser:
                 if (
                     len(names) != 1
                     or len(extents) not in (1, 2, 3)
-                    or any(type(x) is not int for x in extents)
+                    or any(type(x) is not int and not isinstance(x, Expr) for x in extents)
                 ):
                     self.fail(
-                        node, "Serial/unroll loops accept static stop, (start, stop), or (start, stop, step)"
+                        node, "Serial/unroll loops accept integer stop, (start, stop), or (start, stop, step)"
                     )
                 extents = (
                     (0, extents[0], 1)
@@ -717,12 +727,17 @@ class Parser:
                     if len(extents) == 2
                     else extents
                 )
+                if type(extents[2]) is not int:
+                    self.fail(node, "Loop step must be a static integer")
                 if extents[2] == 0:
                     self.fail(node, "Loop step must be nonzero")
-                if any(x < -(2**31) or x > 2**31 - 1 for x in extents):
+                if any(type(x) is int and (x < -(2**31) or x > 2**31 - 1) for x in extents):
                     self.fail(node, "Loop bounds must fit signed 32-bit integers")
-                if len(range(*extents)) > 2**31 - 1:
+                static_domain = all(type(value) is int for value in extents)
+                if static_domain and len(range(*extents)) > 2**31 - 1:
                     self.fail(node, "Loop iteration count exceeds signed 32-bit indexing")
+                if not static_domain and dict(annotations).get("pragma_unroll_explicit"):
+                    self.fail(node, "Explicit unroll requires static loop bounds")
             if node.orelse:
                 self.fail(node, "Loop else clauses are not supported")
             old_vars = self.variables.copy()
@@ -739,7 +754,7 @@ class Parser:
             self.parallel_context = old_parallel
             self.mutable = old_mutable
             controls = loop_controls(body)
-            if name != "Parallel" and (not range(*extents) or controls):
+            if name != "Parallel" and (not static_domain or not range(*extents) or controls):
                 self.initialized = old_initialized
             kind = (
                 "parallel" if name == "Parallel" else "unroll" if name in ("unroll", "Unroll") else "serial"
