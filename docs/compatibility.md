@@ -22,6 +22,11 @@ and warp MMA GEMM. Fragment element assignment and augmented assignment use the
 same per-thread ownership as the enclosing parallel tile. CPU semantic tests and
 real CuTe compilation tests are kept separately from GPU execution tests.
 
+Conditional statements support branch-defined scalar joins, conditional fragment
+updates, and uniform collective branches. Initialization is intersected across
+paths. Multiple global stores are accepted in exclusive branches when they share
+the same ownership mapping; general path-dependent write analysis remains open.
+
 MMA coordinate partitions propagate through pointwise operations and whole-tile
 fragment copies. Accumulators support elementwise epilogues, initialization from
 global/shared/fragment copies, and copies through shared output tiles. Connections
@@ -33,7 +38,7 @@ dynamic bounds, and vectorized loop lowering require further implementation.
 
 ## Remaining language families
 
-- Python/TIR syntax: branches, while, break, continue, scalar mutation, macros,
+- Python/TIR syntax: general branch write analysis, while, break, continue, scalar mutation, macros,
   function attributes, assertions, lets, eager definitions, and scalar arguments.
 - Tensor declarations: symbolic/dynamic dimensions, strides, local/global
   allocations, scalar variables, buffer regions, slices, views, reshape,

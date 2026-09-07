@@ -8,13 +8,24 @@ from math import prod
 
 from .ir import CompileError, Expr, Kernel, Partition
 
-CUTLASS_TYPES = {"float16": "Float16", "bfloat16": "BFloat16", "float32": "Float32", "int32": "Int32"}
+CUTLASS_TYPES = {
+    "float16": "Float16",
+    "bfloat16": "BFloat16",
+    "float32": "Float32",
+    "int32": "Int32",
+    "int64": "Int64",
+    "float64": "Float64",
+    "bool": "Boolean",
+}
 
 
 def walk(body):
     for stmt in body:
         yield stmt
         if stmt.op in ("serial", "parallel", "unroll"):
+            yield from walk(stmt.args[2])
+        elif stmt.op == "if":
+            yield from walk(stmt.args[1])
             yield from walk(stmt.args[2])
 
 
@@ -36,6 +47,7 @@ class Emitter:
         self.counter = 0
         self.mmas = {}
         self.parallel = None
+        self.scalar_types = {name: "int32" for name in kernel.block_vars}
         for stmt in walk(kernel.body):
             if stmt.op == "gemm":
                 a, b, c, ta, tb = stmt.args
@@ -151,6 +163,52 @@ class Emitter:
 
     def emit(self, line=""):
         self.lines.append("    " * self.depth + line if line else "")
+
+    @staticmethod
+    def common_type(left, right):
+        if left == right:
+            return left
+        if left == "bool":
+            return right
+        if right == "bool":
+            return left
+        widths = {"int32": 32, "int64": 64, "float16": 16, "bfloat16": 16, "float32": 32, "float64": 64}
+        width = max(widths[left], widths[right])
+        if left.startswith("int") and right.startswith("int"):
+            return f"int{width}"
+        return f"float{width}"
+
+    def expression_type(self, expr, types):
+        if expr.op == "const":
+            if type(expr.value) is int and not -(2**31) <= expr.value < 2**31:
+                if not -(2**63) <= expr.value < 2**63:
+                    raise CompileError("Scalar integer constants must fit signed 64-bit arithmetic")
+                return "int64"
+            return {bool: "bool", int: "int32", float: "float32"}[type(expr.value)]
+        if expr.op == "var":
+            return types[expr.value]
+        if expr.op == "load":
+            return self.buffers[expr.value].type.dtype
+        if expr.op == "cast":
+            return expr.value
+        if expr.op in ("<", "<=", ">", ">=", "==", "!=", "and", "or", "not"):
+            return "bool"
+        result = self.expression_type(expr.args[0], types)
+        for arg in expr.args[1:]:
+            result = self.common_type(result, self.expression_type(arg, types))
+        return "float32" if expr.op == "/" and result in ("int32", "int64", "bool") else result
+
+    def body_types(self, body, types):
+        types = types.copy()
+        for stmt in body:
+            if stmt.op == "let":
+                types[stmt.args[0]] = self.expression_type(stmt.args[1], types)
+            elif stmt.op == "if":
+                then_types = self.body_types(stmt.args[1], types)
+                else_types = self.body_types(stmt.args[2], types)
+                for name in then_types.keys() & else_types.keys():
+                    types[name] = self.common_type(then_types[name], else_types[name])
+        return types
 
     def unique(self, label):
         self.counter += 1
@@ -297,7 +355,27 @@ class Emitter:
             self.emit(f"# {self.kernel.name}:{stmt.location.line} {op}")
             if op == "alloc":
                 continue
-            if op == "fill":
+            if op == "pass":
+                self.emit("pass")
+            elif op == "if":
+                condition, then_body, else_body = args
+                value = self.expression(condition)
+                merged_types = self.body_types((stmt,), self.scalar_types)
+                for name in sorted(merged_types.keys() - self.scalar_types.keys()):
+                    self.emit(f"{self.var(name)} = cutlass.{CUTLASS_TYPES[merged_types[name]]}(0)")
+                self.scalar_types = merged_types.copy()
+                self.emit(f"if {value}:")
+                self.depth += 1
+                self.statements(then_body)
+                self.depth -= 1
+                self.scalar_types = merged_types.copy()
+                if else_body:
+                    self.emit("else:")
+                    self.depth += 1
+                    self.statements(else_body)
+                    self.depth -= 1
+                self.scalar_types = merged_types
+            elif op == "fill":
                 name, value = args
                 text = self.expression(value)
                 if self.buffers[name].space == "fragment":
@@ -314,7 +392,9 @@ class Emitter:
                 self.gemm(*args)
             elif op == "let":
                 value = self.expression(args[1])
-                self.emit(f"{self.var(args[0])} = {value}")
+                dtype = self.scalar_types.get(args[0]) or self.expression_type(args[1], self.scalar_types)
+                self.scalar_types[args[0]] = dtype
+                self.emit(f"{self.var(args[0])} = cutlass.{CUTLASS_TYPES[dtype]}({value})")
             elif op == "store":
                 name, indices, value = args
                 coords = [self.expression(x) for x in indices]
@@ -340,7 +420,10 @@ class Emitter:
                 self.emit(
                     f"{self.var(names[0])} = cutlass.Int32(cutlass.Int64({extents[0]}) + cutlass.Int64({ordinal}) * {extents[2]})"
                 )
+                old_types = self.scalar_types.copy()
+                self.scalar_types[names[0]] = "int32"
                 self.statements(inner)
+                self.scalar_types = old_types
                 self.depth -= 1
             elif op == "parallel":
                 names, shape, inner = args
@@ -356,8 +439,11 @@ class Emitter:
                     depth = 2
                 for name, coord in zip(names, coords):
                     self.emit(f"{self.var(name)} = {coord}")
+                old_types = self.scalar_types.copy()
+                self.scalar_types.update({name: "int32" for name in names})
                 self.parallel = (shape, names, slot)
                 self.statements(inner)
+                self.scalar_types = old_types
                 self.parallel = None
                 self.depth -= depth
             else:

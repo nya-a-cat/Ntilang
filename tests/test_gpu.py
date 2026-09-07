@@ -5,6 +5,7 @@ import pytest
 from examples.fragment_affine import fragment_affine
 from examples.matmul import matmul
 from examples.matmul_relu import matmul_relu
+from examples.piecewise import piecewise
 from examples.vector_add import vector_add
 
 pytestmark = pytest.mark.gpu
@@ -57,6 +58,15 @@ def test_gemm_relu_on_gpu(torch_cuda):
     c = torch.empty_like(bias)
     matmul_relu(target=target_for(torch))(a, b, bias, c)
     torch.testing.assert_close(c, torch.relu((a.float() @ b.float()) * 0.5 + bias), rtol=1e-4, atol=1e-4)
+
+
+def test_piecewise_on_gpu(torch_cuda):
+    torch = torch_cuda
+    a = torch.linspace(-2, 2, 93, device="cuda")
+    b = torch.empty_like(a)
+    piecewise(target=target_for(torch))(a, b)
+    expected = torch.where(a < 0, -a, torch.where(a < 1, a * a, a + 2))
+    torch.testing.assert_close(b, expected, rtol=0, atol=0)
 
 
 def test_nondefault_stream_on_gpu(torch_cuda):

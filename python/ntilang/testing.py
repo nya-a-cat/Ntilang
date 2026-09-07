@@ -80,6 +80,11 @@ def reference(kernel: CompiledKernel, *arrays):
             if op == "alloc":
                 b = kernel.ir.buffer_map[args[0]]
                 buffers[b.name] = np.empty(b.type.shape, dtype=b.type.dtype)
+            elif op == "pass":
+                continue
+            elif op == "if":
+                condition, then_body, else_body = args
+                statements(then_body if expr(condition) else else_body)
             elif op == "fill":
                 buffers[args[0]].fill(expr(args[1]))
             elif op == "let":

@@ -82,6 +82,7 @@ Choose a target matching the GPU that will execute the kernel. The default
 - [Fragment affine transform](examples/fragment_affine.py): global-to-register tile copy and elementwise use.
 - [Tiled matrix multiplication](examples/matmul.py): shared tiles, FP16 inputs, FP32 accumulation, and CuTe's `MmaF16BF16Op`.
 - [Matrix multiplication with ReLU](examples/matmul_relu.py): scale, tensor bias, and activation in the accumulator's register layout.
+- [Piecewise transform](examples/piecewise.py): data-dependent `if`/`elif`/`else` with guarded output writes.
 
 Example factories accept `target=`. A shape-specialized factory can also be
 decorated with `@ntilang.jit(target="sm_80")` and return a `@T.prim_func`.
@@ -112,6 +113,7 @@ the same argument contract.
 - `T.gemm(A, B, accumulator, transpose_A=False, transpose_B=False)`.
 - Arithmetic, comparisons, `T.cast`, `T.exp`, `T.exp2`, `T.sqrt`, `T.maximum`, and `T.minimum`.
 - Static shapes; `float16`, `bfloat16`, `float32`, and `int32` buffers.
+- Conditional statements, branch-defined scalar values, and branch-aware fragment initialization.
 
 Fragments support element assignment and augmented assignment inside a
 matching parallel tile. MMA layouts propagate through pointwise operations and
@@ -122,7 +124,8 @@ their operation identity.
 
 Global tile loads outside the tensor return zero; global stores outside the
 tensor are masked. The initial write checker accepts disjoint affine tile
-indices. A parameter has one global write site and cannot also be read. Buffers
+indices. Multiple writes to a parameter require mutually exclusive branches
+with identical ownership. Output parameters cannot also be read. Buffers
 are allocated at kernel scope, and collective operations execute outside
 parallel element loops.
 

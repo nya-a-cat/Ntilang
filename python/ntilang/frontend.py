@@ -194,6 +194,20 @@ class Parser:
 
     def statement(self, node, *, parallel=False, nested=False):
         loc = self.location(node)
+        if isinstance(node, ast.If):
+            condition = self.expr(node.test)
+            before_vars = self.variables.copy()
+            before_initialized = self.initialized.copy()
+            then_body = tuple(self.statement(n, parallel=parallel, nested=True) for n in node.body)
+            then_vars, then_initialized = self.variables.copy(), self.initialized.copy()
+            self.variables = before_vars
+            self.initialized = before_initialized
+            else_body = tuple(self.statement(n, parallel=parallel, nested=True) for n in node.orelse)
+            self.variables.intersection_update(then_vars)
+            self.initialized.intersection_update(then_initialized)
+            return Statement("if", (condition, then_body, else_body), loc)
+        if isinstance(node, ast.Pass):
+            return Statement("pass", (), loc)
         if isinstance(node, ast.AugAssign):
             if not isinstance(node.target, ast.Subscript) or type(node.op) not in BINOPS:
                 self.fail(node, "Augmented assignment currently requires a tensor element")

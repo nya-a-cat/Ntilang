@@ -63,10 +63,27 @@ Shared copies, shared fills, and GEMM include synchronization around shared
 accesses and reuse. Collectives inside `T.Parallel` are rejected.
 
 Global write indices must satisfy the compiler's conservative affine ownership
-rule. Every global output has a single write site and is not read by the kernel.
+rule. Multiple write sites to an output require mutually exclusive branches with
+the same affine ownership mapping. This restriction prevents branches taken by
+different lanes from writing the same location. Outputs are not read by the kernel.
 Aliasing between parameters is rejected at launch. Input tensors may be read
 by multiple threads. Grid coverage remains part of the source program: positions
 that the source does not write retain their prior contents.
+
+## Conditional statements
+
+`if`, `elif`, `else`, and `pass` preserve conditional execution. A scalar first
+defined in a branch is available after the conditional only when both paths
+define it. Joined scalars receive a common numeric type and a declaration before
+the generated CuTe branch. Fragment initialization must hold on both paths;
+conditionally updating an already initialized fragment is allowed.
+
+Branches inside `T.Parallel` can depend on element values. Collective operations
+remain outside parallel loops. At block scope, predicates use block-uniform
+indices and values, so every thread participates in any selected shared-memory
+barriers. Branch-dependent global write mappings remain outside the currently
+implemented ownership proof. `while`, scalar mutation, and loop exits still need
+implementation.
 
 ## Arithmetic and GEMM
 
