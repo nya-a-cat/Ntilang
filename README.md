@@ -122,6 +122,10 @@ other tiles. Serial and unrolled loops accept static start/stop/step,
 including reverse and empty ranges. Imported language-operation aliases retain
 their operation identity.
 
+Fragment broadcasts, transposes expressed as element reads, and other bounded
+cross-element reads use synchronized shared-memory communication. Their source
+fragment must remain unchanged within the parallel loop.
+
 Global tile loads outside the tensor return zero; global stores outside the
 tensor are masked. The initial write checker accepts disjoint affine tile
 indices. Multiple writes to a parameter require mutually exclusive branches

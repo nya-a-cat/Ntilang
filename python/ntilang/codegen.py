@@ -6,7 +6,7 @@ import ast
 import re
 from math import prod
 
-from .ir import CompileError, Expr, Kernel, Partition
+from .ir import DTYPES, CompileError, Expr, Kernel, Partition
 
 CUTLASS_TYPES = {
     "float16": "Float16",
@@ -48,6 +48,7 @@ class Emitter:
         self.mmas = {}
         self.parallel = None
         self.scalar_types = {name: "int32" for name in kernel.block_vars}
+        self.active_snapshots = set()
         for stmt in walk(kernel.body):
             if stmt.op == "gemm":
                 a, b, c, ta, tb = stmt.args
@@ -89,27 +90,47 @@ class Emitter:
                     )
                 self.mmas[c] = plan
         self.fragment_layouts = self.infer_fragment_layouts()
+        self.snapshots = set()
+        for stmt in walk(kernel.body):
+            if stmt.op == "parallel":
+                _, snapshots = self.parallel_accesses(stmt)
+                self.snapshots.update(snapshots)
+        shared_bytes = 0
+        for buffer in kernel.buffers:
+            if buffer.space == "shared" or buffer.name in self.snapshots:
+                shared_bytes = (shared_bytes + 15) // 16 * 16
+                shared_bytes += prod(buffer.type.shape) * DTYPES[buffer.type.dtype]
+        if shared_bytes > 48 * 1024:
+            raise CompileError("Shared buffers and fragment communication exceed 48 KiB per block")
 
-    def fragment_references(self, value):
-        if isinstance(value, Expr):
-            names = {value.value} if value.op == "load" else set()
-            for arg in value.args:
-                names.update(self.fragment_references(arg))
-            return {n for n in names if self.buffers[n].space == "fragment"}
-        if isinstance(value, (tuple, list)):
-            names = set()
-            for arg in value:
-                names.update(self.fragment_references(arg))
-            return names
-        return set()
+    def parallel_accesses(self, stmt):
+        names, shape, body = stmt.args
+        expected = tuple(Expr("var", value=n) for n in names)
+        pointwise, snapshots, written = set(), set(), set()
 
-    def parallel_fragments(self, body):
-        names = set()
-        for stmt in walk(body):
-            names.update(self.fragment_references(stmt.args))
-            if stmt.op == "store" and self.buffers[stmt.args[0]].space == "fragment":
-                names.add(stmt.args[0])
-        return names
+        def loads(value):
+            if isinstance(value, Expr):
+                if value.op == "load" and self.buffers[value.value].space == "fragment":
+                    if self.buffers[value.value].type.shape == shape and value.args == expected:
+                        pointwise.add(value.value)
+                    else:
+                        snapshots.add(value.value)
+                for arg in value.args:
+                    loads(arg)
+            elif isinstance(value, (tuple, list)):
+                for arg in value:
+                    loads(arg)
+
+        for inner in walk(body):
+            loads(inner.args)
+            if inner.op == "store" and self.buffers[inner.args[0]].space == "fragment":
+                written.add(inner.args[0])
+        if snapshots & written:
+            raise CompileError(
+                "Cross-element fragment reads require a separate source fragment from parallel writes",
+                stmt.location,
+            )
+        return pointwise | written, snapshots
 
     def infer_fragment_layouts(self):
         # Connected pointwise operations and whole-tile copies share ownership.
@@ -125,7 +146,7 @@ class Emitter:
         for stmt in walk(self.kernel.body):
             names = set()
             if stmt.op == "parallel":
-                names = self.parallel_fragments(stmt.args[2])
+                names, _ = self.parallel_accesses(stmt)
             elif stmt.op == "copy":
                 names = {r.buffer for r in stmt.args if self.buffers[r.buffer].space == "fragment"}
             names = sorted(names)
@@ -160,6 +181,13 @@ class Emitter:
         self.emit(f"for {slot} in cutlass.range_constexpr(cute.size({self.buf(name)})):")
         self.depth += 1
         return slot, [f"_nt_coords_{layout}[{slot}][{i}]" for i in range(2)], 1
+
+    def materialize_fragment(self, name):
+        self.emit("cute.arch.sync_threads()")
+        slot, coords, depth = self.loop_fragment(name)
+        self.emit(f"_nt_snapshot_{name}[{', '.join(coords)}] = {self.buf(name)}[{slot}]")
+        self.depth -= depth
+        self.emit("cute.arch.sync_threads()")
 
     def emit(self, line=""):
         self.lines.append("    " * self.depth + line if line else "")
@@ -250,7 +278,19 @@ class Emitter:
             indices = [self.expression(x) for x in expr.args]
             temp = self.unique("load")
             if buf.space == "fragment":
-                return self.fragment_slot(name, expr.args)
+                expected = (
+                    () if self.parallel is None else tuple(Expr("var", value=n) for n in self.parallel[1])
+                )
+                if self.parallel is not None and self.parallel[0] == buf.type.shape and expr.args == expected:
+                    return self.fragment_slot(name, expr.args)
+                if name not in self.active_snapshots:
+                    raise CompileError("Fragment access requires a parallel coordinate mapping")
+                self.emit(f"{temp} = {self.dtype(name)}(0)")
+                self.emit(f"if {self.predicate(name, indices)}:")
+                self.depth += 1
+                self.emit(f"{temp} = _nt_snapshot_{name}[{', '.join(indices)}]")
+                self.depth -= 1
+                return temp
             self.emit(f"{temp} = {self.dtype(name)}(0)")
             self.emit(f"if {self.predicate(name, indices)}:")
             self.depth += 1
@@ -427,7 +467,11 @@ class Emitter:
                 self.depth -= 1
             elif op == "parallel":
                 names, shape, inner = args
-                fragments = sorted(self.parallel_fragments(inner))
+                fragments, snapshots = self.parallel_accesses(stmt)
+                for name in sorted(snapshots):
+                    self.materialize_fragment(name)
+                self.active_snapshots = snapshots
+                fragments = sorted(fragments)
                 if fragments:
                     if any(self.buffers[n].type.shape != shape for n in fragments):
                         raise CompileError(
@@ -445,6 +489,7 @@ class Emitter:
                 self.statements(inner)
                 self.scalar_types = old_types
                 self.parallel = None
+                self.active_snapshots = set()
                 self.depth -= depth
             else:
                 raise CompileError(f"Unsupported IR operation {op}", stmt.location)
@@ -462,7 +507,7 @@ class Emitter:
         self.emit("_nt_tid, _, _ = cute.arch.thread_idx()")
         block = [self.var(v) for v in self.kernel.block_vars] + ["_"] * (3 - len(self.kernel.block_vars))
         self.emit(f"{', '.join(block)} = cute.arch.block_idx()")
-        if any(b.space == "shared" for b in self.kernel.buffers):
+        if self.snapshots or any(b.space == "shared" for b in self.kernel.buffers):
             self.emit("_nt_smem = utils.SmemAllocator()")
         for name, (m, n, _, wm, wn, dtype) in self.mmas.items():
             self.emit(
@@ -473,6 +518,11 @@ class Emitter:
                 f"_nt_coords_{name} = _nt_thr_{name}.partition_C(cute.make_identity_tensor(({m}, {n})))"
             )
         for b in self.kernel.buffers:
+            if b.name in self.snapshots:
+                strides = tuple(prod(b.type.shape[i + 1 :]) for i in range(len(b.type.shape)))
+                self.emit(
+                    f"_nt_snapshot_{b.name} = _nt_smem.allocate_tensor({self.dtype(b.name)}, cute.make_layout({b.type.shape}, stride={strides}), byte_alignment=16)"
+                )
             if b.space == "shared":
                 strides = tuple(prod(b.type.shape[i + 1 :]) for i in range(len(b.type.shape)))
                 self.emit(

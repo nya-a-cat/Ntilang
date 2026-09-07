@@ -31,6 +31,10 @@ MMA coordinate partitions propagate through pointwise operations and whole-tile
 fragment copies. Accumulators support elementwise epilogues, initialization from
 global/shared/fragment copies, and copies through shared output tiles. Connections
 between incompatible register partitions still need explicit layout conversion.
+Broadcasts and other cross-element fragment reads use synchronized shared views.
+The additional storage participates in the block's shared-memory limit. Direct
+shuffle-based communication and in-place cross-element transformations need
+further lowering and dependency analysis.
 
 Loop steps and empty iteration domains are preserved. The supported `unroll`
 form emits CuTe compile-time iteration. Loop annotations, partial unroll factors,

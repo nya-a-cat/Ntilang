@@ -20,8 +20,11 @@ scalar local assignments use fresh names. Names beginning with `_nt_` are reserv
 `T.Parallel(d0, ..., dn)` defines a logical tile. Without an MMA layout constraint,
 its elements are distributed as `flat = thread + slot * threads` in row-major
 order; excess slots do not execute the body.
-Fragment indexing uses the exact variables of a parallel loop with the same
-shape. Parallel operations connected to an MMA accumulator use its CuTe-defined
+Pointwise fragment indexing uses the exact variables of a parallel loop with the
+same shape. Broadcasts and other cross-element reads materialize a synchronized
+shared-memory view before the parallel loop. Those source fragments cannot also
+be written in that loop. Out-of-bounds cross-element reads return zero.
+Parallel operations connected to an MMA accumulator use its CuTe-defined
 coordinate partition. Whole-fragment copies and pointwise operations propagate
 that partition through connected fragments, including earlier initialization
 and copies. Connections between incompatible MMA partitions currently require
@@ -44,7 +47,7 @@ with the same logical shape, including fragments with a different storage dtype.
 Shared and fragment buffers are allocated directly inside the kernel block.
 Initialization is required before reads. `T.clear(tile)` and `T.fill(tile, value)`
 initialize the complete logical tile. Shared allocation is limited to 48 KiB per
-block in this version.
+block in this version, including storage introduced for fragment communication.
 
 ## Memory and copies
 
