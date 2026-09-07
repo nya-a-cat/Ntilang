@@ -149,13 +149,15 @@ def test_typed_reduction_cute_compilation(dtype, kind):
 
 @pytest.mark.cuda
 @pytest.mark.skipif(importlib.util.find_spec("cutlass") is None, reason="CuTe DSL compiler is not installed")
-def test_scalar_promotion_against_nvidia_types():
+def test_explicit_promotion_produces_the_selected_nvidia_type():
     import cutlass
 
     for left in DTYPES:
         for right in DTYPES:
-            actual = getattr(cutlass, CUTLASS_TYPES[left])(1) + getattr(cutlass, CUTLASS_TYPES[right])(1)
             expected = getattr(cutlass, CUTLASS_TYPES[promote(left, right)])
+            actual = expected(getattr(cutlass, CUTLASS_TYPES[left])(1)) + expected(
+                getattr(cutlass, CUTLASS_TYPES[right])(1)
+            )
             assert type(actual) is expected, (left, right, type(actual), expected)
 
 

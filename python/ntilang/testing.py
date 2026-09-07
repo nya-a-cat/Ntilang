@@ -11,7 +11,7 @@ import operator
 
 from .compiler import CompiledKernel
 from .ir import integer_limits
-from .scalar import body_types, expression_dtype, promote
+from .scalar import body_types, expression_dtype, operand_dtype
 
 
 def reference(kernel: CompiledKernel, *arrays):
@@ -88,10 +88,8 @@ def reference(kernel: CompiledKernel, *arrays):
         if e.op == "or":
             return any(args)
         dtype = expression_dtype(e, buffer_types, variable_types)
-        operand_dtype = expression_dtype(e.args[0], buffer_types, variable_types)
-        for arg in e.args[1:]:
-            operand_dtype = promote(operand_dtype, expression_dtype(arg, buffer_types, variable_types))
-        args = [cast(value, operand_dtype) for value in args]
+        arg_dtype = operand_dtype(e, buffer_types, variable_types)
+        args = [cast(value, arg_dtype) for value in args]
         return cast(ops[e.op](*args), dtype)
 
     def statements(body):

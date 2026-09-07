@@ -257,7 +257,10 @@ class Parser:
             return Expr(BINOPS[type(node.op)], (self.expr(node.left), self.expr(node.right)))
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Not, ast.Invert)):
             op = {ast.USub: "neg", ast.UAdd: "pos", ast.Not: "not", ast.Invert: "invert"}[type(node.op)]
-            return Expr(op, (self.expr(node.operand),))
+            operand = self.expr(node.operand)
+            if op in ("neg", "pos") and operand.op == "const" and type(operand.value) in (int, float):
+                return Expr("const", value=-operand.value if op == "neg" else operand.value)
+            return Expr(op, (operand,))
         if isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]) in COMPARISONS:
             return Expr(
                 COMPARISONS[type(node.ops[0])], (self.expr(node.left), self.expr(node.comparators[0]))

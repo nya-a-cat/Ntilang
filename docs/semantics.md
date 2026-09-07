@@ -117,7 +117,7 @@ implementation.
 ## Arithmetic and GEMM
 
 Scalar arithmetic lowers to CuTe's numeric operations with explicit casts on
-stores and copies. `T.cast(value, dtype)` requests a conversion. Division and
+operands, stores, and copies. `T.cast(value, dtype)` requests a conversion. Division and
 remainder used with `//` and `%` are restricted to statically bounded nonnegative
 integer expressions and positive constant divisors. Data-dependent indexing is
 outside the supported subset.
@@ -125,8 +125,9 @@ outside the supported subset.
 Integer expressions support `&`, `|`, `^`, `~`, `<<`, and `>>`, together with
 `T.bitwise_and`, `T.bitwise_or`, `T.bitwise_xor`, `T.bitwise_not`, `T.shift_left`,
 and `T.shift_right`. Function spellings accept their upstream operand keyword
-names and the default `span=None`. Binary operands are explicitly converted to
-their common integer type before lowering. Boolean bitwise operations preserve
+names and the default `span=None`. A bare integer operand in a bitwise operation
+adopts the other operand's integer dtype and must fit its range. Binary operands
+are explicitly converted to their common integer type before lowering. Boolean bitwise operations preserve
 one-bit semantics; shifts require integer operands excluding Boolean. Right
 shift is arithmetic for signed types and logical for unsigned types.
 
@@ -144,10 +145,19 @@ follow the target compiler's CUDA semantics; bitwise identity with NumPy is not
 specified.
 
 The upstream `T.max` and `T.min` spellings prefer a non-NaN operand. The two
-longer spellings are Ntilang extensions. Scalar promotion follows the checked
-CuTe numeric rules, including integer signedness and width, promotion of narrow
-integers with default `int32` constants, and floating/integer width conversion.
-The reference evaluator applies these rules explicitly before arithmetic.
+longer spellings are Ntilang extensions. Scalar promotion follows the pinned
+TIR numeric matching rules. Mixed floating/integer operands use the floating
+dtype; mixed floating types use the wider floating dtype. Integer pairs use the
+wider type, with unsigned winning at equal width. Boolean converts to the other
+numeric operand's type. Bare arithmetic constants default to `int32`/`int64`
+or `float32`. Bitwise integer literals use the contextual rule above.
+
+These conversions apply before arithmetic and comparisons and when joining
+branch-defined scalars. For example, FP16 plus INT64 first converts the integer
+to FP16, so rounding can occur before addition. Both generated source and the
+reference evaluator apply the same conversion. Integer `/` requires an explicit
+division choice or a floating cast, following the source language's ambiguity
+check. Logical operations require Boolean operands.
 
 `T.gemm(A, B, C)` means `C += A @ B`, after optional transposition of A and/or B.
 A and B are complete shared tiles with matching FP16 or BF16 dtype. C is an FP32

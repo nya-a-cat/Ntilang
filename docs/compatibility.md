@@ -65,8 +65,8 @@ Batch scheduling, packed reduction annotations, local scopes, regions, and
 reducer epoch APIs remain open compatibility work.
 
 Basic Boolean/integer/floating dtypes and scalar cast constructors are implemented.
-The 169 pairwise basic-type addition promotions are checked against NVIDIA's
-numeric implementation. Vector and sub-byte dtype variants, external constructor
+The 169 pairwise basic-type additions use explicit operand conversions before
+NVIDIA's numeric operators. Vector and sub-byte dtype variants, external constructor
 behavior, and the remaining dtype utility APIs still need implementation.
 
 Bitwise operators and their six upstream function spellings are implemented for
@@ -75,11 +75,12 @@ uses explicit common-type conversions. Static shift counts, unsigned index
 inversion, and narrow index overflow have dedicated checks. General bitwise
 output permutations and non-default source span objects remain open.
 
-The pinned upstream numeric matching source also reveals a remaining difference:
-floating/integer scalar promotion currently follows CuTe's width rules, while
-TileLang's TIR generally converts the integer to the floating operand type.
-Aligning those conversions across arithmetic, comparisons, and scalar joins is
-required compatibility work.
+Numeric promotion follows the pinned TIR matching source across arithmetic,
+comparisons, and scalar joins. Floating/integer pairs preserve the floating
+operand's dtype. Bitwise integer literals adopt the other operand's integer
+type. Integer `/` and non-Boolean logical operands are rejected according to
+the source contract. General constant folding, non-default constructor forms,
+and remaining division signatures still need implementation.
 
 Loop steps and empty iteration domains are preserved. The supported `unroll`
 form emits CuTe compile-time iteration. Loop annotations, partial unroll factors,

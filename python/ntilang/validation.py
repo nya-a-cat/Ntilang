@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 from .ir import DTYPES, CompileError, Expr, Kernel, integer_limits
-from .scalar import BITWISE_OPS, expression_dtype
+from .scalar import BINARY_NUMERIC_OPS, BITWISE_OPS, expression_dtype
 
 INT_MIN, INT_MAX = -(2**31), 2**31 - 1
 
 
 def resolved_dtype(expr, bounds, definitions, buffers):
-    def resolve(value):
-        if value.op == "var" and value.value in definitions:
-            return resolve(definitions[value.value])
-        return Expr(value.op, tuple(resolve(arg) for arg in value.args), value.value)
+    class VariableTypes(dict):
+        def __missing__(self, name):
+            if name not in definitions:
+                raise CompileError(f"Scalar {name} is not defined in this scope")
+            self[name] = expression_dtype(definitions[name], buffers, self)
+            return self[name]
 
-    return expression_dtype(resolve(expr), buffers, {name: "int32" for name in bounds})
+    return expression_dtype(expr, buffers, VariableTypes({name: "int32" for name in bounds}))
 
 
 def interval(expr, bounds, definitions):
@@ -174,7 +176,7 @@ def validate(kernel: Kernel):
     initial_bounds = {name: (0, size - 1) for name, size in zip(kernel.block_vars, kernel.grid)}
 
     def expression(expr, bounds, definitions):
-        if expr.op in BITWISE_OPS:
+        if expr.op in BITWISE_OPS | BINARY_NUMERIC_OPS | {"and", "or", "not"}:
             dtype = resolved_dtype(expr, bounds, definitions, buffers)
             if expr.op in ("<<", ">>"):
                 try:

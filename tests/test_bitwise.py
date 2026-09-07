@@ -143,8 +143,8 @@ def test_unsigned_inversion_index_cannot_hide_overflow():
 
 
 def test_unsigned_shift_uses_logical_right_shift_for_bounds():
-    value = Expr(">>", (Expr("const", value=-1), Expr("cast", (Expr("const", value=1),), "uint32")))
-    assert interval(value, {}, {}) == (2**31 - 1, 2**31 - 1)
+    value = Expr(">>", (Expr("var", value="i"), Expr("cast", (Expr("const", value=1),), "uint32")))
+    assert interval(value, {"i": (-1, -1)}, {}) == (2**31 - 1, 2**31 - 1)
 
 
 def test_narrow_index_shift_cannot_wrap():

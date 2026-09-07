@@ -1,8 +1,11 @@
 """Scalar type inference shared by source generation and IR evaluation."""
 
-from .ir import DTYPES, CompileError
+from .ir import DTYPES, CompileError, integer_limits
 
 BITWISE_OPS = frozenset(("&", "|", "^", "invert", "<<", ">>"))
+BINARY_NUMERIC_OPS = frozenset(
+    ("+", "-", "*", "/", "//", "%", "<", "<=", ">", ">=", "==", "!=", "maximum", "minimum", "max", "min")
+)
 
 
 def promote(left, right):
@@ -18,12 +21,32 @@ def promote(left, right):
     if left_float and right_float:
         return f"float{max(lw, rw)}"
     if left_float or right_float:
-        float_type, fw, iw = (left, lw, rw) if left_float else (right, rw, lw)
-        return float_type if fw > iw else f"float{iw}"
+        return left if left_float else right
     if left.startswith("uint") != right.startswith("uint"):
         unsigned, signed = (left, right) if left.startswith("uint") else (right, left)
         return unsigned if DTYPES[unsigned] >= DTYPES[signed] else signed
     return left if lw >= rw else right
+
+
+def operand_dtype(expr, buffers, variables):
+    """Match TIR numeric operands, including context-typed bitwise literals."""
+    types = [expression_dtype(arg, buffers, variables) for arg in expr.args]
+    if expr.op in BITWISE_OPS and len(types) == 2:
+        # The upstream bit-operation FFI creates a Python integer literal in
+        # the other operand's dtype before BinaryOpMatchTypes runs.
+        literals = [arg.op == "const" and type(arg.value) is int for arg in expr.args]
+        if literals[0] != literals[1]:
+            index = 0 if literals[0] else 1
+            target = types[1 - index]
+            if target.startswith(("int", "uint")) or target == "bool":
+                low, high = integer_limits(target)
+                if not low <= expr.args[index].value <= high:
+                    raise CompileError(f"Bitwise integer literal must fit the other operand's {target} dtype")
+                types[index] = target
+    result = types[0]
+    for dtype in types[1:]:
+        result = promote(result, dtype)
+    return result
 
 
 def expression_dtype(expr, buffers, variables):
@@ -39,7 +62,9 @@ def expression_dtype(expr, buffers, variables):
         return buffers[expr.value].type.dtype
     if expr.op == "cast":
         return expr.value
-    if expr.op in ("<", "<=", ">", ">=", "==", "!=", "and", "or", "not"):
+    if expr.op in ("and", "or", "not"):
+        if any(expression_dtype(arg, buffers, variables) != "bool" for arg in expr.args):
+            raise CompileError("Logical operations require Boolean operands")
         return "bool"
     if expr.op in BITWISE_OPS:
         types = [expression_dtype(arg, buffers, variables) for arg in expr.args]
@@ -47,12 +72,14 @@ def expression_dtype(expr, buffers, variables):
             raise CompileError("Bitwise operations require integer or Boolean operands")
         if expr.op in ("<<", ">>") and "bool" in types:
             raise CompileError("Shift operations require integer operands, excluding Boolean")
-    result = expression_dtype(expr.args[0], buffers, variables)
-    for arg in expr.args[1:]:
-        result = promote(result, expression_dtype(arg, buffers, variables))
-    return (
-        "float32" if expr.op == "/" and (result.startswith(("int", "uint")) or result == "bool") else result
-    )
+    result = operand_dtype(expr, buffers, variables)
+    if expr.op in ("<", "<=", ">", ">=", "==", "!="):
+        return "bool"
+    if expr.op == "/" and (result.startswith(("int", "uint")) or result == "bool"):
+        raise CompileError(
+            "Integer '/' is ambiguous; use explicit integer division or cast to a floating dtype"
+        )
+    return result
 
 
 def body_types(body, types, buffers):
