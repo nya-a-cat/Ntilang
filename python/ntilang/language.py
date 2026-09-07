@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import builtins
 import inspect
+import textwrap
 from dataclasses import dataclass
 from functools import wraps
 from typing import Callable
@@ -76,6 +77,13 @@ def prim_func(function: Callable) -> PrimFunc:
             names.update(
                 n.id for n in ast.walk(ast.parse(annotation, mode="eval")) if isinstance(n, ast.Name)
             )
+    try:
+        source = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        for node in ast.walk(source):
+            if isinstance(node, ast.AnnAssign):
+                names.update(n.id for n in ast.walk(node.annotation) if isinstance(n, ast.Name))
+    except (OSError, TypeError):
+        pass  # The frontend reports source availability when compilation is requested.
     frame = inspect.currentframe()
     try:
         caller = frame.f_back.f_locals if frame is not None and frame.f_back is not None else {}

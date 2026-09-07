@@ -88,6 +88,11 @@ type. Integer `/` and non-Boolean logical operands are rejected according to
 the source contract. General constant folding, non-default constructor forms,
 and remaining scalar signatures still need implementation.
 
+Local scalar annotations preserve the expression dtype according to the default
+eager frontend, including branch joins and captured specialization dtype names.
+Legacy TIR annotation semantics, mutable scalar storage, and buffer annotations
+remain open.
+
 Floor and truncating integer division/remainder support signed and unsigned
 data operands. The index analysis handles either divisor sign and bounded
 nonzero variable divisors. Expression `ceildiv`, `cdiv`, and `align_up` preserve

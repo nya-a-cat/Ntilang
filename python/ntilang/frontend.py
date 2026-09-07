@@ -494,6 +494,24 @@ class Parser:
 
     def statement(self, node, *, parallel=False, nested=False):
         loc = self.location(node)
+        if isinstance(node, ast.AnnAssign):
+            if not isinstance(node.target, ast.Name):
+                self.fail(node, "Local scalar annotations require a name target")
+            dtype = self.static(node.annotation)
+            if not isinstance(dtype, str) or dtype not in DTYPES:
+                self.fail(node, "Local scalar annotations require a supported scalar dtype")
+            if node.value is None:
+                if node.target.id not in self.variables:
+                    self.fail(node, "An annotation alone does not initialize a scalar value")
+                return Statement("pass", (), loc)
+            # The default upstream eager Builder.bind uses the value dtype;
+            # its annotation argument does not insert a numeric conversion.
+            assignment = ast.Assign(targets=[node.target], value=node.value)
+            ast.copy_location(assignment, node)
+            statement = self.statement(assignment, parallel=parallel, nested=nested)
+            if statement.op != "let":
+                self.fail(node, "Scalar annotations require scalar value bindings")
+            return Statement(statement.op, statement.args, loc, (("scalar_annotation", dtype),))
         if isinstance(node, ast.If):
             condition = self.expr(node.test)
             before_vars = self.variables.copy()

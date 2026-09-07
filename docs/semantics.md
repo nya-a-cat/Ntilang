@@ -129,6 +129,13 @@ and matches the two branch dtypes using the scalar promotion rules. Generated
 code places branch-local loads and arithmetic inside the corresponding branch.
 Both forms compose with fragment communication and MMA epilogues.
 
+Local `name: T.dtype = expression` bindings follow the default upstream eager
+frontend: the expression determines the value dtype. The annotation is retained
+as source metadata and does not insert a conversion. Use an explicit dtype
+constructor or `T.cast` for conversion. An annotation without a value can refer
+to an existing scalar; it does not initialize a new variable. Legacy TIR parser
+annotation behavior and non-scalar type annotations require separate support.
+
 For lazy branches, the index checker refines single-variable affine integer
 comparisons, their negation, true conjunctions, and false disjunctions. This
 allows guards such as `i != 0` to establish a nonzero divisor when zero is an
