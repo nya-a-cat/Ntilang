@@ -119,6 +119,7 @@ the same argument contract.
 - Floor/truncating integer division and remainder, expression `T.ceildiv` / `T.cdiv`, and `T.align_up`.
 - Static shapes; Boolean, signed/unsigned 8/16/32/64-bit integers, FP16, BF16, FP32, and FP64.
 - Conditional statements, branch-defined scalar values, and branch-aware fragment initialization.
+- `T.Select` and lazy `T.if_then_else`, including guarded division and bounded conditional indices.
 
 Fragments support element assignment and augmented assignment inside a
 matching parallel tile. MMA layouts propagate through pointwise operations and
@@ -159,6 +160,11 @@ The [TileLang compatibility work](docs/compatibility.md) tracks the full languag
 objective and the remaining implementation and validation requirements.
 
 ## Testing
+
+GitHub Actions runs the test suite on standard Windows and Linux runners.
+The Linux job includes the pinned CuTe compiler and checks generated CUDA
+binaries without executing them. Both jobs explicitly exclude GPU tests.
+See [CI runs](https://github.com/nya-a-cat/Ntilang/actions/workflows/ci.yml).
 
 ```sh
 uv run pytest

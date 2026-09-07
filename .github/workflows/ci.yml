@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Windows Python checks
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: "0.9.6"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run --frozen ruff check python examples tests
+      - run: uv run --frozen ruff format --check python examples tests
+      - run: uv run --frozen pytest -q -m "not gpu"
+
+  cute:
+    name: Linux CuTe compilation checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: "0.9.6"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --frozen --extra cuda
+      - name: Require the pinned compiler
+        run: uv run --frozen --extra cuda python -c "import cutlass; from importlib.metadata import version; assert version('nvidia-cutlass-dsl') == '4.7.1'; assert version('apache-tvm-ffi') == '0.1.4'"
+      - run: uv run --frozen --extra cuda pytest -q -m "not gpu"
+      - run: uv build
