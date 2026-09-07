@@ -81,9 +81,11 @@ def test_runtime_bounds_are_captured_before_iteration():
     np.testing.assert_array_equal(b, n * (n - 1) // 2)
 
 
-def masked_gather():
+def masked_gather(index_dtype="int32"):
     @T.prim_func
-    def kernel(A: T.Tensor((32,), "float32"), Index: T.Tensor((39,), "int32"), B: T.Tensor((39,), "float32")):
+    def kernel(
+        A: T.Tensor((32,), "float32"), Index: T.Tensor((39,), index_dtype), B: T.Tensor((39,), "float32")
+    ):
         with T.Kernel(1, threads=32) as _bx:
             for i in T.Parallel(64):
                 B[i] = A[Index[i]]
@@ -98,6 +100,22 @@ def test_integer_gather_is_guarded_at_both_load_levels():
     b = np.empty(39, dtype=np.float32)
     reference(masked_gather(), a, index, b)
     np.testing.assert_array_equal(b, [a[k] if 0 <= k < 32 else 0 for k in index])
+
+
+@pytest.mark.parametrize("dtype", ["int8", "uint8", "int16", "uint16"])
+def test_narrow_integer_gather(dtype):
+    a = np.arange(32, dtype=np.float32) + 0.5
+    index = (np.arange(39, dtype=np.int32) - 3).astype(dtype)
+    b = np.empty(39, dtype=np.float32)
+    reference(masked_gather(dtype), a, index, b)
+    np.testing.assert_array_equal(b, [a[int(k)] if 0 <= int(k) < 32 else 0 for k in index])
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(importlib.util.find_spec("cutlass") is None, reason="CuTe DSL compiler is not installed")
+@pytest.mark.parametrize("dtype", ["int8", "uint8", "int16", "uint16"])
+def test_narrow_integer_gather_compilation(dtype):
+    assert masked_gather(dtype).build().has_gpu_module
 
 
 def mutable_gather():
