@@ -280,6 +280,17 @@ class Parser:
             )
         if isinstance(node, ast.Call):
             name = self.call_name(node)
+            if name in ("Select", "if_then_else"):
+                parameters = (
+                    ["condition", "true_value", "false_value"] if name == "Select" else ["cond", "t", "f"]
+                )
+                args = self.bind_call(node, [*parameters, "span"], {"span": None})
+                if self.static(args["span"]) is not None:
+                    self.fail(node, "Explicit source span objects require further parser integration")
+                return Expr(
+                    "select" if name == "Select" else "if_then_else",
+                    tuple(self.expr(args[key]) for key in parameters),
+                )
             if name in DIVISION_CALLS:
                 parameters = ["lhs", "rhs"] if name in ("ceildiv", "cdiv") else ["a", "b"]
                 args = self.bind_call(node, [*parameters, "span"], {"span": None})

@@ -135,6 +135,8 @@ for _name in (
     "floormod",
     "truncdiv",
     "truncmod",
+    "Select",
+    "if_then_else",
 ):
     _marker = _syntax_operation(_name)
     globals()[_name] = _marker

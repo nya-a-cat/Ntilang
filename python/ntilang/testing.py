@@ -11,7 +11,7 @@ import operator
 
 from .compiler import CompiledKernel
 from .ir import integer_limits
-from .scalar import INTEGER_DIVISION_OPS, body_types, expression_dtype, operand_dtype
+from .scalar import CHOICE_OPS, INTEGER_DIVISION_OPS, body_types, expression_dtype, operand_dtype
 
 
 def reference(kernel: CompiledKernel, *arrays):
@@ -80,6 +80,13 @@ def reference(kernel: CompiledKernel, *arrays):
             return variables[e.value]
         if e.op == "load":
             return read(e.value, tuple(expr(x) for x in e.args))
+        if e.op in CHOICE_OPS:
+            dtype = expression_dtype(e, buffer_types, variable_types)
+            condition = expr(e.args[0])
+            if e.op == "if_then_else":
+                return cast(expr(e.args[1] if condition else e.args[2]), dtype)
+            when_true, when_false = expr(e.args[1]), expr(e.args[2])
+            return cast(when_true if condition else when_false, dtype)
         args = [expr(x) for x in e.args]
         if e.op == "cast":
             return cast(args[0], e.value)

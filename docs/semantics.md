@@ -114,6 +114,21 @@ barriers. Branch-dependent global write mappings remain outside the currently
 implemented ownership proof. `while`, scalar mutation, and loop exits still need
 implementation.
 
+`T.Select(condition, true_value, false_value, span=None)` selects between values
+with identical dtypes and a Boolean condition. Its value expressions can both
+be evaluated; it does not provide a guard for division or memory operations.
+`T.if_then_else(cond, t, f, span=None)` evaluates the selected value expression
+and matches the two branch dtypes using the scalar promotion rules. Generated
+code places branch-local loads and arithmetic inside the corresponding branch.
+Both forms compose with fragment communication and MMA epilogues.
+
+For lazy branches, the index checker refines single-variable affine integer
+comparisons, their negation, true conjunctions, and false disjunctions. This
+allows guards such as `i != 0` to establish a nonzero divisor when zero is an
+interval endpoint. Conditions requiring disjoint ranges or general relational
+constraints still need broader analysis. Index predicates participate in global
+read tracking, even when both selected address expressions are identical.
+
 ## Scalar arithmetic
 
 Scalar arithmetic lowers to CuTe's numeric operations with explicit casts on

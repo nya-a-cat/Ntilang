@@ -41,6 +41,12 @@ paths. Multiple global stores are accepted for proven disjoint ranges or in
 exclusive branches with the same ownership mapping; general path-dependent
 write analysis remains open.
 
+Conditional expressions implement eager `Select` and lazy `if_then_else`,
+including their differing type rules. Lazy branch checks refine simple affine
+integer predicates. Tensor predicates may select bounded index values; index
+predicate reads are included in alias/read-write checks. General disjunctive
+range reasoning and source span objects remain open.
+
 Copy regions support static positive unit-stride slices, fixed dimensions,
 global-to-global transfers, partial temporary regions, and scalar element copies.
 Overlapping temporary copies capture the source before destination writes.

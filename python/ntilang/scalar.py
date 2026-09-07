@@ -4,6 +4,7 @@ from .ir import DTYPES, CompileError, integer_limits
 
 BITWISE_OPS = frozenset(("&", "|", "^", "invert", "<<", ">>"))
 INTEGER_DIVISION_OPS = frozenset(("//", "%", "truncdiv", "truncmod", "ceildiv"))
+CHOICE_OPS = frozenset(("select", "if_then_else"))
 BINARY_NUMERIC_OPS = (
     frozenset(("+", "-", "*", "/", "<", "<=", ">", ">=", "==", "!=", "maximum", "minimum", "max", "min"))
     | INTEGER_DIVISION_OPS
@@ -64,6 +65,15 @@ def expression_dtype(expr, buffers, variables):
         return buffers[expr.value].type.dtype
     if expr.op == "cast":
         return expr.value
+    if expr.op in CHOICE_OPS:
+        condition, true_value, false_value = expr.args
+        if expression_dtype(condition, buffers, variables) != "bool":
+            raise CompileError("Conditional expressions require a Boolean condition")
+        left = expression_dtype(true_value, buffers, variables)
+        right = expression_dtype(false_value, buffers, variables)
+        if expr.op == "select" and left != right:
+            raise CompileError("T.Select requires identical true and false value dtypes")
+        return promote(left, right)
     if expr.op in ("and", "or", "not"):
         if any(expression_dtype(arg, buffers, variables) != "bool" for arg in expr.args):
             raise CompileError("Logical operations require Boolean operands")

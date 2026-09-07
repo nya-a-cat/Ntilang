@@ -10,6 +10,7 @@ from .ir import DTYPES, CompileError, Expr, Kernel, Partition, integer_limits
 from .scalar import (
     BINARY_NUMERIC_OPS,
     BITWISE_OPS,
+    CHOICE_OPS,
     INTEGER_DIVISION_OPS,
     body_types,
     expression_dtype,
@@ -269,6 +270,8 @@ class Emitter:
 
     def expression(self, expr: Expr):
         op = expr.op
+        if op in CHOICE_OPS:
+            return self.conditional_expression(expr)
         if op == "const":
             if type(expr.value) not in (int, float, bool):
                 raise CompileError("Only numeric and boolean values can appear in scalar expressions")
@@ -325,6 +328,33 @@ class Emitter:
             function = "max" if op in ("maximum", "max") else "min"
             return f"cute.math.{function}({', '.join(values)}, propagate_nan={op in ('maximum', 'minimum')})"
         return "(" + f" {op} ".join(values) + ")"
+
+    def conditional_expression(self, expr):
+        condition, when_true, when_false = expr.args
+        dtype = expression_dtype(expr, self.buffers, self.scalar_types)
+        type_name = f"cutlass.{CUTLASS_TYPES[dtype]}"
+        predicate = self.expression(condition)
+        eager = None
+        if expr.op == "select":
+            eager = []
+            for branch in (when_true, when_false):
+                value = self.expression(branch)
+                name = self.unique("select_value")
+                self.emit(f"{name} = {type_name}({value})")
+                eager.append(name)
+        result = self.unique("choice")
+        self.emit(f"{result} = {type_name}(0)")
+        self.emit(f"if {predicate}:")
+        self.depth += 1
+        value = eager[0] if eager is not None else self.expression(when_true)
+        self.emit(f"{result} = {type_name}({value})")
+        self.depth -= 1
+        self.emit("else:")
+        self.depth += 1
+        value = eager[1] if eager is not None else self.expression(when_false)
+        self.emit(f"{result} = {type_name}({value})")
+        self.depth -= 1
+        return result
 
     def integer_division(self, op, values, dtype):
         # Materialize MLIR values so `%` always has CuTe's runtime remainder
