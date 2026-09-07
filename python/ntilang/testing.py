@@ -61,6 +61,12 @@ def reference(kernel: CompiledKernel, *arrays):
         "min": np.fmin,
     }
 
+    class LoopBreak(Exception):
+        pass
+
+    class LoopContinue(Exception):
+        pass
+
     def read(name, indices):
         data = buffers[name]
         return data[indices] if all(0 <= i < s for i, s in zip(indices, data.shape)) else data.dtype.type(0)
@@ -126,6 +132,10 @@ def reference(kernel: CompiledKernel, *arrays):
                 buffers[b.name] = np.empty(b.type.shape, dtype=b.type.dtype)
             elif op == "pass":
                 continue
+            elif op == "break":
+                raise LoopBreak
+            elif op == "continue":
+                raise LoopContinue
             elif op == "if":
                 condition, then_body, else_body = args
                 merged = body_types((stmt,), variable_types, buffer_types)
@@ -149,8 +159,14 @@ def reference(kernel: CompiledKernel, *arrays):
                 condition, inner = args
                 before_types = variable_types.copy()
                 while expr(condition):
-                    statements(inner)
-                    variable_types = before_types.copy()
+                    try:
+                        statements(inner)
+                    except LoopContinue:
+                        continue
+                    except LoopBreak:
+                        break
+                    finally:
+                        variable_types = before_types.copy()
             elif op == "store":
                 write(args[0], tuple(expr(x) for x in args[1]), expr(args[2]))
             elif op == "copy":
@@ -219,7 +235,12 @@ def reference(kernel: CompiledKernel, *arrays):
                 for value in range(*extent):
                     variable_types = {**before_types, names[0]: "int32"}
                     variables[names[0]] = value
-                    statements(inner)
+                    try:
+                        statements(inner)
+                    except LoopContinue:
+                        continue
+                    except LoopBreak:
+                        break
                 variable_types = before_types
             else:
                 raise ValueError(f"Unknown IR operation {op}")

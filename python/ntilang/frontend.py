@@ -21,6 +21,7 @@ from .ir import (
     SourceLocation,
     Statement,
     TensorType,
+    loop_controls,
 )
 from .validation import affine
 
@@ -87,6 +88,7 @@ class Parser:
         self.threads = 0
         self.parallel_context = None
         self.mutable = {}
+        self.loops = []
 
     def location(self, node):
         return SourceLocation(self.filename, self.first_line + node.lineno - 1, node.col_offset)
@@ -544,6 +546,15 @@ class Parser:
             self.fail(call, "Partial temporary copies require an initialized destination")
         return Statement("copy", (src, dst), self.location(node))
 
+    def statements(self, nodes, *, parallel=False, nested=False):
+        body = []
+        for node in nodes:
+            statement = self.statement(node, parallel=parallel, nested=nested)
+            body.append(statement)
+            if statement.op in ("break", "continue"):
+                break
+        return tuple(body)
+
     def statement(self, node, *, parallel=False, nested=False):
         loc = self.location(node)
         if isinstance(node, ast.AnnAssign):
@@ -569,13 +580,13 @@ class Parser:
             before_vars = self.variables.copy()
             before_initialized = self.initialized.copy()
             before_mutable = self.mutable.copy()
-            then_body = tuple(self.statement(n, parallel=parallel, nested=True) for n in node.body)
+            then_body = self.statements(node.body, parallel=parallel, nested=True)
             then_vars, then_initialized = self.variables.copy(), self.initialized.copy()
             then_mutable = self.mutable.copy()
             self.variables = before_vars
             self.initialized = before_initialized
             self.mutable = before_mutable
-            else_body = tuple(self.statement(n, parallel=parallel, nested=True) for n in node.orelse)
+            else_body = self.statements(node.orelse, parallel=parallel, nested=True)
             self.variables.intersection_update(then_vars)
             self.initialized.intersection_update(then_initialized)
             for name in self.variables:
@@ -585,6 +596,10 @@ class Parser:
             return Statement("if", (condition, then_body, else_body), loc)
         if isinstance(node, ast.Pass):
             return Statement("pass", (), loc)
+        if isinstance(node, (ast.Break, ast.Continue)):
+            if not self.loops or self.loops[-1] == "Parallel":
+                self.fail(node, "Early exits require an enclosing serial, unroll, or while loop")
+            return Statement("break" if isinstance(node, ast.Break) else "continue", (), loc)
         if isinstance(node, ast.While):
             if node.orelse:
                 self.fail(node, "Loop else clauses are not supported")
@@ -596,7 +611,9 @@ class Parser:
             before_vars = self.variables.copy()
             before_initialized = self.initialized.copy()
             before_mutable = self.mutable.copy()
-            body = tuple(self.statement(n, parallel=parallel, nested=True) for n in node.body)
+            self.loops.append("while")
+            body = self.statements(node.body, parallel=parallel, nested=True)
+            self.loops.pop()
             self.variables = before_vars
             self.initialized = before_initialized
             self.mutable = before_mutable
@@ -715,21 +732,32 @@ class Parser:
             self.variables.update(names)
             if name == "Parallel":
                 self.parallel_context = (extents, names)
-            body = tuple(
-                self.statement(n, parallel=parallel or name == "Parallel", nested=True) for n in node.body
-            )
+            self.loops.append(name)
+            body = self.statements(node.body, parallel=parallel or name == "Parallel", nested=True)
+            self.loops.pop()
             self.variables = old_vars
             self.parallel_context = old_parallel
             self.mutable = old_mutable
-            if name != "Parallel" and not range(*extents):
+            controls = loop_controls(body)
+            if name != "Parallel" and (not range(*extents) or controls):
                 self.initialized = old_initialized
             kind = (
                 "parallel" if name == "Parallel" else "unroll" if name in ("unroll", "Unroll") else "serial"
             )
+            if kind == "unroll" and dict(annotations).get("pragma_unroll_explicit") and "break" in controls:
+                self.fail(node, "A loop with a targeted break cannot be explicitly expanded")
             return Statement(kind, (names, extents, body), loc, annotations)
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
             call = node.value
             name = self.call_name(call)
+            if name in ("loop_break", "break_loop", "continue_loop"):
+                parameters = [] if name == "loop_break" else ["span"]
+                arguments = self.bind_call(call, parameters, {} if not parameters else {"span": None})
+                if arguments and self.static(arguments["span"]) is not None:
+                    self.fail(call, "Explicit source span objects require further parser integration")
+                control = ast.Continue() if name == "continue_loop" else ast.Break()
+                ast.copy_location(control, node)
+                return self.statement(control, parallel=parallel, nested=nested)
             if name == "copy":
                 return self.copy_statement(call, node, parallel, nested)
             if parallel:
@@ -816,7 +844,7 @@ class Parser:
         ):
             self.fail(launch, "Duplicate or reserved block variable")
         self.variables.update(block_vars)
-        statements = tuple(self.statement(n) for n in launch.body)
+        statements = self.statements(launch.body)
         if not statements or not parameters:
             self.fail(fn, "A kernel requires tensor parameters and statements")
         shared_bytes = 0

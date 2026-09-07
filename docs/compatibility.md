@@ -101,7 +101,10 @@ remain open.
 Boolean while loops support mutable loop-carried values, nested loops,
 per-element iteration counts, and uniform collective bodies. Conditions reload
 their inputs each iteration; zero-iteration initialization is preserved.
-General termination proofs and early exits remain open.
+Break/continue and their exported statement spellings use independent nested
+loop state, including condition evaluation after early exits and the upstream
+restriction on explicitly expanded break targets. General termination proofs,
+parallel-loop exits, and more precise initialization joins remain open.
 
 Floor and truncating integer division/remainder support signed and unsigned
 data operands. The index analysis handles either divisor sign and bounded
@@ -118,7 +121,7 @@ further implementation.
 
 ## Remaining language families
 
-- Python/TIR syntax: general branch write analysis, break, continue, broader scalar mutation, macros,
+- Python/TIR syntax: general branch write analysis, broader early exits and scalar mutation, macros,
   function attributes, assertions, lets, eager definitions, and scalar arguments.
 - Tensor declarations: symbolic/dynamic dimensions, strides, local/global
   allocations, scalar variables, general buffer regions and slicing, views, reshape,

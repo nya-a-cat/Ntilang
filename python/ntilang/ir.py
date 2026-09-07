@@ -112,6 +112,18 @@ class Statement:
     annotations: tuple[tuple[str, object], ...] = ()
 
 
+def loop_controls(body):
+    """Find early exits targeting this loop, excluding nested loop bodies."""
+    controls = set()
+    for stmt in body:
+        if stmt.op in ("break", "continue"):
+            controls.add(stmt.op)
+        elif stmt.op == "if":
+            controls.update(loop_controls(stmt.args[1]))
+            controls.update(loop_controls(stmt.args[2]))
+    return controls
+
+
 @dataclass(frozen=True)
 class Kernel:
     name: str

@@ -160,7 +160,19 @@ Uniform while loops may contain collective tile operations. Per-element loops
 inside `T.Parallel` retain the restriction against collective operations.
 Termination and absence of arithmetic overflow are caller preconditions for
 data-dependent loops. Statically true conditions receive the upstream eager
-infinite-loop diagnostic. Loop `else`, `break`, and `continue` remain open.
+infinite-loop diagnostic. Loop `else` remains open.
+
+`break` and `continue` target the nearest serial, unroll, or while loop. The
+statement forms `T.loop_break()`, `T.break_loop(span=None)`, and
+`T.continue_loop(span=None)` have the same control effect. Direct unconditional
+exits discard the following statements in that block. Nested loops carry
+independent control flags. A while-loop break skips the next condition
+evaluation; continue reevaluates it normally. For loops predicate the remaining
+iterations after break, preserving the iteration bound and requested unroll hint.
+Explicit expansion rejects a break targeting that loop, following the upstream
+unroll pass; breaks targeting a nested loop remain valid. Direct exits from
+`T.Parallel` and source span objects require further lowering. A loop with early
+exits does not establish new buffer initialization after the loop.
 
 For lazy branches, the index checker refines single-variable affine integer
 comparisons, their negation, true conjunctions, and false disjunctions. This

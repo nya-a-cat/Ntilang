@@ -6,7 +6,7 @@ import ast
 import re
 from math import isfinite, isnan, prod
 
-from .ir import DTYPES, CompileError, Expr, Kernel, Partition, integer_limits
+from .ir import DTYPES, CompileError, Expr, Kernel, Partition, integer_limits, loop_controls
 from .scalar import (
     BINARY_NUMERIC_OPS,
     BITWISE_OPS,
@@ -64,6 +64,7 @@ class Emitter:
         self.counter = 0
         self.mmas = {}
         self.parallel = None
+        self.control = None
         self.scalar_types = {name: "int32" for name in kernel.block_vars}
         self.active_snapshots = set()
         for stmt in walk(kernel.body):
@@ -581,147 +582,194 @@ class Emitter:
         self.depth -= depth
         self.emit("cute.arch.sync_threads()")
 
+    def loop_control(self, body):
+        if not loop_controls(body):
+            return None
+        control = self.unique("loop_alive"), self.unique("loop_skip")
+        self.emit(f"{control[0]} = cutlass.Boolean(True)")
+        return control
+
+    def loop_body(self, body, control):
+        previous = self.control
+        if control is not None:
+            self.emit(f"{control[1]} = cutlass.Boolean(False)")
+            types = body_types(body, self.scalar_types, self.buffers)
+            for name in sorted(types.keys() - self.scalar_types.keys()):
+                self.emit(f"{self.var(name)} = cutlass.{CUTLASS_TYPES[types[name]]}(0)")
+            self.scalar_types = types
+        self.control = control
+        self.statements(body)
+        self.control = previous
+
     def statements(self, body):
         for stmt in body:
-            op, args = stmt.op, stmt.args
-            self.emit(f"# {self.kernel.name}:{stmt.location.line} {op}")
-            if op == "alloc":
-                continue
-            if op == "pass":
-                self.emit("pass")
-            elif op == "if":
-                condition, then_body, else_body = args
-                value = self.expression(condition)
-                merged_types = body_types((stmt,), self.scalar_types, self.buffers)
-                for name in sorted(merged_types.keys() - self.scalar_types.keys()):
-                    self.emit(f"{self.var(name)} = cutlass.{CUTLASS_TYPES[merged_types[name]]}(0)")
-                self.scalar_types = merged_types.copy()
-                self.emit(f"if {value}:")
+            depth = self.depth
+            if self.control is not None:
+                alive, skip = self.control
+                self.emit(f"if {alive} & ~{skip}:")
                 self.depth += 1
-                self.statements(then_body)
-                self.depth -= 1
-                self.scalar_types = merged_types.copy()
-                if else_body:
-                    self.emit("else:")
-                    self.depth += 1
-                    self.statements(else_body)
-                    self.depth -= 1
-                self.scalar_types = merged_types
-            elif op == "fill":
-                name, value = args
-                text = self.expression(value)
-                if self.buffers[name].space == "fragment":
-                    self.emit(f"{self.buf(name)}.fill({self.dtype(name)}({text}))")
-                else:
-                    self.emit("cute.arch.sync_threads()")
-                    _, coords = self.loop_tile(self.buffers[name].type.shape)
-                    self.emit(f"{self.access(name, coords)} = {self.dtype(name)}({text})")
-                    self.depth -= 2
-                    self.emit("cute.arch.sync_threads()")
-            elif op == "while":
-                condition, inner = args
-                if expression_dtype(condition, self.buffers, self.scalar_types) != "bool":
-                    raise CompileError("While conditions require Boolean expressions", stmt.location)
-                predicate = self.unique("while_condition")
-                self.emit(f"{predicate} = cutlass.Boolean({self.expression(condition)})")
-                self.emit(f"while {predicate}:")
+            self.statement(stmt)
+            self.depth = depth
+
+    def statement(self, stmt):
+        op, args = stmt.op, stmt.args
+        self.emit(f"# {self.kernel.name}:{stmt.location.line} {op}")
+        if op == "alloc":
+            return
+        if op == "pass":
+            self.emit("pass")
+        elif op in ("break", "continue"):
+            alive, skip = self.control
+            self.emit(f"{skip} = cutlass.Boolean(True)")
+            if op == "break":
+                self.emit(f"{alive} = cutlass.Boolean(False)")
+        elif op == "if":
+            condition, then_body, else_body = args
+            value = self.expression(condition)
+            merged_types = body_types((stmt,), self.scalar_types, self.buffers)
+            for name in sorted(merged_types.keys() - self.scalar_types.keys()):
+                self.emit(f"{self.var(name)} = cutlass.{CUTLASS_TYPES[merged_types[name]]}(0)")
+            self.scalar_types = merged_types.copy()
+            self.emit(f"if {value}:")
+            self.depth += 1
+            self.statements(then_body)
+            self.depth -= 1
+            self.scalar_types = merged_types.copy()
+            if else_body:
+                self.emit("else:")
                 self.depth += 1
-                old_types = self.scalar_types.copy()
-                self.statements(inner)
-                self.scalar_types = old_types
-                self.emit(f"{predicate} = cutlass.Boolean({self.expression(condition)})")
+                self.statements(else_body)
                 self.depth -= 1
-            elif op == "copy":
-                self.copy(*args)
-            elif op == "gemm":
-                self.gemm(*args)
-            elif op == "reduce":
-                self.reduction(*args)
-            elif op == "let":
-                value = self.expression(args[1])
-                dtype = self.scalar_types.get(args[0]) or expression_dtype(
-                    args[1], self.buffers, self.scalar_types
-                )
-                self.scalar_types[args[0]] = dtype
-                self.emit(f"{self.var(args[0])} = cutlass.{CUTLASS_TYPES[dtype]}({value})")
-            elif op == "declare":
-                name, dtype, initializer = args
-                value = self.expression(initializer)
-                self.scalar_types[name] = dtype
-                self.emit(f"{self.var(name)} = {value}")
-            elif op == "assign":
-                self.emit(f"{self.var(args[0])} = {self.expression(args[1])}")
-            elif op == "store":
-                name, indices, value = args
-                coords = [self.expression(x) for x in indices]
-                value = self.expression(value)
-                if self.buffers[name].space == "fragment":
-                    slot = self.fragment_slot(name, indices)
-                    self.emit(f"{slot} = {self.dtype(name)}({value})")
-                    continue
-                self.emit(f"if {self.predicate(name, coords)}:")
-                self.depth += 1
-                self.emit(f"{self.access(name, coords)} = {self.dtype(name)}({value})")
-                self.depth -= 1
-            elif op in ("serial", "unroll"):
-                names, extents, inner = args
-                trip_count = len(range(*extents))
-                if not trip_count:
-                    self.emit("pass  # empty static iteration domain")
-                    continue
-                ordinal = self.unique("iteration")
-                annotations = dict(stmt.annotations)
-                loop = f"range({trip_count})"
-                if op == "unroll":
-                    if annotations.get("pragma_unroll_explicit", False):
-                        loop = f"cutlass.range_constexpr({trip_count})"
-                    elif "pragma_unroll_factor" in annotations:
-                        factor = annotations["pragma_unroll_factor"]
-                        loop = f"cutlass.range({trip_count}, unroll={max(1, factor)})"
-                    else:
-                        loop = f"cutlass.range({trip_count}, unroll_full=True)"
-                self.emit(f"for {ordinal} in {loop}:")
-                self.depth += 1
-                self.emit(
-                    f"{self.var(names[0])} = cutlass.Int32(cutlass.Int64({extents[0]}) + cutlass.Int64({ordinal}) * {extents[2]})"
-                )
-                old_types = self.scalar_types.copy()
-                self.scalar_types[names[0]] = "int32"
-                self.statements(inner)
-                self.scalar_types = old_types
-                self.depth -= 1
-            elif op == "parallel":
-                names, shape, inner = args
-                fragments, snapshots, shared = self.parallel_accesses(stmt)
-                if shared:
-                    self.emit("cute.arch.sync_threads()")
-                for name in sorted(snapshots):
-                    self.materialize_fragment(name)
-                self.active_snapshots = snapshots
-                fragments = sorted(fragments)
-                if fragments:
-                    if any(self.buffers[n].type.shape != shape for n in fragments):
-                        raise CompileError(
-                            "Fragment indexing requires a matching T.Parallel shape", stmt.location
-                        )
-                    slot, coords, depth = self.loop_fragment(fragments[0])
-                else:
-                    slot, coords = self.loop_tile(shape)
-                    depth = 2
-                for name, coord in zip(names, coords):
-                    self.emit(f"{self.var(name)} = {coord}")
-                old_types = self.scalar_types.copy()
-                self.scalar_types.update({name: "int32" for name in names})
-                self.parallel = (shape, names, slot)
-                self.statements(inner)
-                self.scalar_types = old_types
-                self.parallel = None
-                self.active_snapshots = set()
-                self.depth -= depth
-                if shared:
-                    self.emit("cute.arch.sync_threads()")
+            self.scalar_types = merged_types
+        elif op == "fill":
+            name, value = args
+            text = self.expression(value)
+            if self.buffers[name].space == "fragment":
+                self.emit(f"{self.buf(name)}.fill({self.dtype(name)}({text}))")
             else:
-                raise CompileError(f"Unsupported IR operation {op}", stmt.location)
+                self.emit("cute.arch.sync_threads()")
+                _, coords = self.loop_tile(self.buffers[name].type.shape)
+                self.emit(f"{self.access(name, coords)} = {self.dtype(name)}({text})")
+                self.depth -= 2
+                self.emit("cute.arch.sync_threads()")
+        elif op == "while":
+            condition, inner = args
+            if expression_dtype(condition, self.buffers, self.scalar_types) != "bool":
+                raise CompileError("While conditions require Boolean expressions", stmt.location)
+            predicate = self.unique("while_condition")
+            control = self.loop_control(inner)
+            self.emit(f"{predicate} = cutlass.Boolean({self.expression(condition)})")
+            self.emit(f"while {predicate}:")
+            self.depth += 1
+            old_types = self.scalar_types.copy()
+            self.loop_body(inner, control)
+            self.scalar_types = old_types
+            if control is not None:
+                self.emit(f"if {control[0]}:")
+                self.depth += 1
+            self.emit(f"{predicate} = cutlass.Boolean({self.expression(condition)})")
+            if control is not None:
+                self.depth -= 1
+                self.emit("else:")
+                self.depth += 1
+                self.emit(f"{predicate} = cutlass.Boolean(False)")
+                self.depth -= 1
+            self.depth -= 1
+        elif op == "copy":
+            self.copy(*args)
+        elif op == "gemm":
+            self.gemm(*args)
+        elif op == "reduce":
+            self.reduction(*args)
+        elif op == "let":
+            value = self.expression(args[1])
+            dtype = self.scalar_types.get(args[0]) or expression_dtype(
+                args[1], self.buffers, self.scalar_types
+            )
+            self.scalar_types[args[0]] = dtype
+            self.emit(f"{self.var(args[0])} = cutlass.{CUTLASS_TYPES[dtype]}({value})")
+        elif op == "declare":
+            name, dtype, initializer = args
+            value = self.expression(initializer)
+            self.scalar_types[name] = dtype
+            self.emit(f"{self.var(name)} = {value}")
+        elif op == "assign":
+            self.emit(f"{self.var(args[0])} = {self.expression(args[1])}")
+        elif op == "store":
+            name, indices, value = args
+            coords = [self.expression(x) for x in indices]
+            value = self.expression(value)
+            if self.buffers[name].space == "fragment":
+                slot = self.fragment_slot(name, indices)
+                self.emit(f"{slot} = {self.dtype(name)}({value})")
+                return
+            self.emit(f"if {self.predicate(name, coords)}:")
+            self.depth += 1
+            self.emit(f"{self.access(name, coords)} = {self.dtype(name)}({value})")
+            self.depth -= 1
+        elif op in ("serial", "unroll"):
+            names, extents, inner = args
+            trip_count = len(range(*extents))
+            if not trip_count:
+                self.emit("pass  # empty static iteration domain")
+                return
+            ordinal = self.unique("iteration")
+            control = self.loop_control(inner)
+            annotations = dict(stmt.annotations)
+            loop = f"range({trip_count})"
+            if op == "unroll":
+                if annotations.get("pragma_unroll_explicit", False):
+                    loop = f"cutlass.range_constexpr({trip_count})"
+                elif "pragma_unroll_factor" in annotations:
+                    factor = annotations["pragma_unroll_factor"]
+                    loop = f"cutlass.range({trip_count}, unroll={max(1, factor)})"
+                else:
+                    loop = f"cutlass.range({trip_count}, unroll_full=True)"
+            self.emit(f"for {ordinal} in {loop}:")
+            self.depth += 1
+            self.emit(
+                f"{self.var(names[0])} = cutlass.Int32(cutlass.Int64({extents[0]}) + cutlass.Int64({ordinal}) * {extents[2]})"
+            )
+            old_types = self.scalar_types.copy()
+            self.scalar_types[names[0]] = "int32"
+            self.loop_body(inner, control)
+            self.scalar_types = old_types
+            self.depth -= 1
+        elif op == "parallel":
+            names, shape, inner = args
+            fragments, snapshots, shared = self.parallel_accesses(stmt)
+            if shared:
+                self.emit("cute.arch.sync_threads()")
+            for name in sorted(snapshots):
+                self.materialize_fragment(name)
+            self.active_snapshots = snapshots
+            fragments = sorted(fragments)
+            if fragments:
+                if any(self.buffers[n].type.shape != shape for n in fragments):
+                    raise CompileError(
+                        "Fragment indexing requires a matching T.Parallel shape", stmt.location
+                    )
+                slot, coords, depth = self.loop_fragment(fragments[0])
+            else:
+                slot, coords = self.loop_tile(shape)
+                depth = 2
+            for name, coord in zip(names, coords):
+                self.emit(f"{self.var(name)} = {coord}")
+            old_types = self.scalar_types.copy()
+            self.scalar_types.update({name: "int32" for name in names})
+            self.parallel = (shape, names, slot)
+            previous_control = self.control
+            self.control = None
+            self.statements(inner)
+            self.control = previous_control
+            self.scalar_types = old_types
+            self.parallel = None
+            self.active_snapshots = set()
+            self.depth -= depth
+            if shared:
+                self.emit("cute.arch.sync_threads()")
+        else:
+            raise CompileError(f"Unsupported IR operation {op}", stmt.location)
 
     def generate(self):
         self.emit(f'"""Generated by Ntilang 0.1.0: {self.kernel.name}; target {self.target}."""')
