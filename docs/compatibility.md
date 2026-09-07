@@ -94,6 +94,15 @@ type. Integer `/` and non-Boolean logical operands are rejected according to
 the source contract. General constant folding, non-default constructor forms,
 and remaining scalar signatures still need implementation.
 
+Scalar `abs`, `floor`, `ceil`, `trunc`, `round`, `nearbyint`, `isnan`, `isinf`,
+and `isfinite` preserve the pinned type rules, including integer identities,
+signed-minimum absolute values, and Boolean classification results. Round's
+ties-to-even and ties-away-from-zero modes lower to separate math operations.
+Half-precision rounding widens before the operation and converts back. Tests
+cover halfway neighbors, signed zero, NaN, infinity, and integer extrema.
+The pinned classification operators reject bfloat16 inputs; other math families
+and explicit source span objects remain open.
+
 Local scalar annotations preserve the expression dtype according to the default
 eager frontend, including branch joins and captured specialization dtype names.
 Legacy TIR annotation semantics and buffer annotations remain open.

@@ -5,6 +5,9 @@ from .ir import DTYPES, CompileError, integer_limits
 BITWISE_OPS = frozenset(("&", "|", "^", "invert", "<<", ">>"))
 INTEGER_DIVISION_OPS = frozenset(("//", "%", "truncdiv", "truncmod", "ceildiv"))
 CHOICE_OPS = frozenset(("select", "if_then_else"))
+ROUNDING_OPS = frozenset(("floor", "ceil", "trunc", "round", "round_away", "nearbyint"))
+CLASSIFICATION_OPS = frozenset(("isnan", "isinf", "isfinite"))
+UNARY_MATH_OPS = ROUNDING_OPS | CLASSIFICATION_OPS | {"abs"}
 BINARY_NUMERIC_OPS = (
     frozenset(("+", "-", "*", "/", "<", "<=", ">", ">=", "==", "!=", "maximum", "minimum", "max", "min"))
     | INTEGER_DIVISION_OPS
@@ -65,6 +68,13 @@ def expression_dtype(expr, buffers, variables):
         return buffers[expr.value].type.dtype
     if expr.op in ("cast", "mutable"):
         return expr.value
+    if expr.op in UNARY_MATH_OPS:
+        dtype = expression_dtype(expr.args[0], buffers, variables)
+        if expr.op in CLASSIFICATION_OPS:
+            if dtype == "bfloat16":
+                raise CompileError("The pinned TIR classification operators do not accept bfloat16")
+            return "bool"
+        return dtype
     if expr.op in CHOICE_OPS:
         condition, true_value, false_value = expr.args
         if expression_dtype(condition, buffers, variables) != "bool":

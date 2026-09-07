@@ -11,7 +11,14 @@ import operator
 
 from .compiler import CompiledKernel
 from .ir import Expr, integer_limits
-from .scalar import CHOICE_OPS, INTEGER_DIVISION_OPS, body_types, expression_dtype, operand_dtype
+from .scalar import (
+    CHOICE_OPS,
+    INTEGER_DIVISION_OPS,
+    ROUNDING_OPS,
+    body_types,
+    expression_dtype,
+    operand_dtype,
+)
 
 
 def reference(kernel: CompiledKernel, *arrays):
@@ -55,6 +62,15 @@ def reference(kernel: CompiledKernel, *arrays):
         "exp": np.exp,
         "exp2": np.exp2,
         "sqrt": np.sqrt,
+        "abs": np.abs,
+        "floor": np.floor,
+        "ceil": np.ceil,
+        "trunc": np.trunc,
+        "round": np.rint,
+        "nearbyint": np.rint,
+        "isnan": np.isnan,
+        "isinf": np.isinf,
+        "isfinite": np.isfinite,
         "maximum": np.maximum,
         "minimum": np.minimum,
         "max": np.fmax,
@@ -103,6 +119,16 @@ def reference(kernel: CompiledKernel, *arrays):
         dtype = expression_dtype(e, buffer_types, variable_types)
         arg_dtype = operand_dtype(e, buffer_types, variable_types)
         args = [cast(value, arg_dtype) for value in args]
+        if e.op in ROUNDING_OPS:
+            if arg_dtype.startswith(("int", "uint")) or arg_dtype == "bool":
+                return args[0]
+            if e.op == "round_away":
+                value = args[0]
+                magnitude = np.abs(value)
+                integral = np.floor(magnitude)
+                if np.isfinite(magnitude) and magnitude - integral >= 0.5:
+                    integral += 1
+                return cast(np.copysign(integral, value), dtype)
         if e.op in INTEGER_DIVISION_OPS:
             a, b = map(int, args)
             if b == 0:

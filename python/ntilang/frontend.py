@@ -23,6 +23,7 @@ from .ir import (
     TensorType,
     loop_controls,
 )
+from .scalar import UNARY_MATH_OPS
 from .validation import affine
 
 BINOPS = {
@@ -390,6 +391,19 @@ class Parser:
             )
         if isinstance(node, ast.Call):
             name = self.call_name(node)
+            if name in UNARY_MATH_OPS and name != "round_away":
+                defaults = {"span": None}
+                if name == "round":
+                    defaults = {"rounding_mode": "ties-to-even", **defaults}
+                args = self.bind_call(node, ["x", *defaults], defaults)
+                if self.static(args["span"]) is not None:
+                    self.fail(node, "Explicit source span objects require further parser integration")
+                if name == "round":
+                    mode = self.static(args["rounding_mode"])
+                    if mode not in (None, "ties-to-even", "ties-away-from-zero"):
+                        self.fail(node, "Round rounding_mode must be ties-to-even or ties-away-from-zero")
+                    name = "round_away" if mode == "ties-away-from-zero" else "round"
+                return Expr(name, (self.expr(args["x"]),))
             if name in ("Select", "if_then_else"):
                 parameters = (
                     ["condition", "true_value", "false_value"] if name == "Select" else ["cond", "t", "f"]

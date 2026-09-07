@@ -11,7 +11,9 @@ from .scalar import (
     BINARY_NUMERIC_OPS,
     BITWISE_OPS,
     CHOICE_OPS,
+    CLASSIFICATION_OPS,
     INTEGER_DIVISION_OPS,
+    UNARY_MATH_OPS,
     body_types,
     expression_dtype,
     operand_dtype,
@@ -319,6 +321,28 @@ class Emitter:
             self.depth -= 1
             return temp
         values = [self.expression(x) for x in expr.args]
+        if op in UNARY_MATH_OPS:
+            expression_dtype(expr, self.buffers, self.scalar_types)
+            dtype = expression_dtype(expr.args[0], self.buffers, self.scalar_types)
+            type_name = f"cutlass.{CUTLASS_TYPES[dtype]}"
+            value = f"{type_name}({values[0]})"
+            if dtype.startswith(("int", "uint")) or dtype == "bool":
+                if op in CLASSIFICATION_OPS:
+                    return f"cutlass.Boolean({op == 'isfinite'})"
+                if op == "abs" and dtype.startswith("int"):
+                    result = self.unique("abs")
+                    self.emit(f"{result} = {type_name}({value}.ir_value())")
+                    self.emit(f"if {result} < {type_name}(0):")
+                    self.depth += 1
+                    self.emit(f"{result} = -{result}")
+                    self.depth -= 1
+                    return result
+                return value
+            if dtype in ("float16", "bfloat16"):
+                value = f"cutlass.Float32({value})"
+            function = {"round": "roundeven", "nearbyint": "roundeven", "round_away": "round"}.get(op, op)
+            result_type = "cutlass.Boolean" if op in CLASSIFICATION_OPS else type_name
+            return f"{result_type}(cute.math.{function}({value}))"
         if op in BITWISE_OPS | BINARY_NUMERIC_OPS:
             expression_dtype(expr, self.buffers, self.scalar_types)
             dtype = operand_dtype(expr, self.buffers, self.scalar_types)

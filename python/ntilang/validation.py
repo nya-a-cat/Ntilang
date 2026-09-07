@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 from .ir import DTYPES, CompileError, Expr, Kernel, integer_limits
-from .scalar import BINARY_NUMERIC_OPS, BITWISE_OPS, CHOICE_OPS, INTEGER_DIVISION_OPS, expression_dtype
+from .scalar import (
+    BINARY_NUMERIC_OPS,
+    BITWISE_OPS,
+    CHOICE_OPS,
+    INTEGER_DIVISION_OPS,
+    ROUNDING_OPS,
+    UNARY_MATH_OPS,
+    expression_dtype,
+)
 
 INT_MIN, INT_MAX = -(2**31), 2**31 - 1
 
@@ -134,6 +142,17 @@ def interval(expr, bounds, definitions, buffers=None):
         low, high = integer_limits(expr.value)
         if result[0] < low or result[1] > high:
             raise CompileError("An integer index cast can change the represented value")
+    elif expr.op in ROUNDING_OPS:
+        result = interval(expr.args[0], bounds, definitions, buffers)
+    elif expr.op == "abs":
+        low, high = interval(expr.args[0], bounds, definitions, buffers)
+        dtype = resolved_dtype(expr, bounds, definitions, buffers, ignore_predicates=True)
+        type_low, type_high = integer_limits(dtype)
+        if dtype.startswith("int") and low == type_low:
+            # TIR's integer Select preserves the signed-minimum bit pattern.
+            result = (type_low, type_low) if high == low else (type_low, type_high)
+        else:
+            result = (0 if low <= 0 <= high else min(abs(low), abs(high)), max(abs(low), abs(high)))
     elif expr.op in ("neg", "pos", "invert"):
         low, high = interval(expr.args[0], bounds, definitions, buffers)
         result = (-high, -low) if expr.op == "neg" else (~high, ~low) if expr.op == "invert" else (low, high)
@@ -331,7 +350,7 @@ def validate(kernel: Kernel):
         return any(runtime_value(arg, definitions) for arg in expr.args)
 
     def expression(expr, bounds, definitions):
-        if expr.op in BITWISE_OPS | BINARY_NUMERIC_OPS | CHOICE_OPS | {"and", "or", "not"}:
+        if expr.op in BITWISE_OPS | BINARY_NUMERIC_OPS | CHOICE_OPS | UNARY_MATH_OPS | {"and", "or", "not"}:
             dtype = resolved_dtype(expr, bounds, definitions, buffers)
             if expr.op in ("<<", ">>"):
                 try:
