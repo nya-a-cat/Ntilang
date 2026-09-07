@@ -648,8 +648,17 @@ class Emitter:
                     self.emit("pass  # empty static iteration domain")
                     continue
                 ordinal = self.unique("iteration")
-                loop = "cutlass.range_constexpr" if op == "unroll" else "range"
-                self.emit(f"for {ordinal} in {loop}({trip_count}):")
+                annotations = dict(stmt.annotations)
+                loop = f"range({trip_count})"
+                if op == "unroll":
+                    if annotations.get("pragma_unroll_explicit", False):
+                        loop = f"cutlass.range_constexpr({trip_count})"
+                    elif "pragma_unroll_factor" in annotations:
+                        factor = annotations["pragma_unroll_factor"]
+                        loop = f"cutlass.range({trip_count}, unroll={max(1, factor)})"
+                    else:
+                        loop = f"cutlass.range({trip_count}, unroll_full=True)"
+                self.emit(f"for {ordinal} in {loop}:")
                 self.depth += 1
                 self.emit(
                     f"{self.var(names[0])} = cutlass.Int32(cutlass.Int64({extents[0]}) + cutlass.Int64({ordinal}) * {extents[2]})"

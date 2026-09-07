@@ -42,7 +42,14 @@ a layout conversion and produce a compilation error.
 Python's static integer range semantics, including negative steps and empty
 domains. A zero step is rejected. Induction arithmetic is formed in 64 bits
 before conversion to its checked 32-bit range. `T.unroll` has the same iteration
-domain and uses CuTe compile-time iteration. Its tuning annotations remain open
+domain. `explicit=True` uses CuTe compile-time iteration; the default emits a
+full-unroll compiler hint. `unroll_factor` emits a factor hint, with 0 and 1
+disabling unrolling. These hints preserve the iteration domain, including tails
+when the trip count is not divisible by the factor. The compiler may optimize
+the final loop according to its backend rules. `pragma_unroll_explicit` and
+`pragma_unroll_factor` annotations follow the upstream precedence: a true
+`explicit` argument and a non-None factor override their annotation values.
+Explicit expansion and a factor are mutually exclusive. Other annotations remain open
 compatibility work. Global outputs are currently written after serial
 accumulation loops. `T.Pipelined(..., num_stages=0 or 1)` is synchronous.
 

@@ -180,6 +180,51 @@ class Parser:
                 arguments[name] = ast.Constant(value=defaults[name])
         return arguments
 
+    def static_loop(self, call, name):
+        """Bind the upstream static serial/unroll signatures and scheduling hints."""
+        unrolled = name in ("unroll", "Unroll")
+        parameters = ["start", "stop", "step", "annotations"]
+        defaults = {"stop": None, "step": None, "annotations": None}
+        if unrolled:
+            parameters += ["explicit", "unroll_factor"]
+            defaults.update(explicit=False, unroll_factor=None)
+        if len(call.args) > 3:
+            self.fail(call, "Loop scheduling arguments must be keyword-only")
+        values = {
+            key: self.static(value) for key, value in self.bind_call(call, parameters, defaults).items()
+        }
+        start, stop, step = (values[key] for key in ("start", "stop", "step"))
+        if stop is None:
+            start, stop = 0, start
+        step = 1 if step is None else step
+        annotations = values["annotations"]
+        if annotations is None:
+            annotations = {}
+        if type(annotations) is not dict:
+            self.fail(call, "Loop annotations must be a static dictionary")
+        annotations = annotations.copy()
+        allowed = {"pragma_unroll_explicit", "pragma_unroll_factor"} if unrolled else set()
+        if annotations.keys() - allowed:
+            self.fail(
+                call,
+                "Unsupported loop annotations: " + ", ".join(sorted(map(str, annotations.keys() - allowed))),
+            )
+        if unrolled:
+            explicit = values["explicit"] or annotations.get("pragma_unroll_explicit", False)
+            factor = values["unroll_factor"]
+            if factor is None:
+                factor = annotations.get("pragma_unroll_factor")
+            if type(values["explicit"]) is not bool or type(explicit) is not bool:
+                self.fail(call, "Unroll explicit must be Boolean")
+            if factor is not None and (type(factor) is not int or not 0 <= factor <= 2**31 - 1):
+                self.fail(call, "Unroll factor must be a nonnegative signed 32-bit integer")
+            if explicit and factor is not None:
+                self.fail(call, "Unroll explicit and unroll_factor are mutually exclusive")
+            annotations = {"pragma_unroll_explicit": explicit}
+            if factor is not None:
+                annotations["pragma_unroll_factor"] = factor
+        return (start, stop, step), tuple(sorted(annotations.items()))
+
     def reduction(self, call, name, loc):
         kinds = {"sum", "abssum", "max", "absmax", "min", "bitand", "bitor", "bitxor"}
         parameters = ["buffer", "out"]
@@ -520,10 +565,14 @@ class Parser:
                 self.fail(node, f"Unsupported loop {name}")
             if parallel and name == "Parallel":
                 self.fail(node, "Nested T.Parallel loops are not supported; use T.Parallel(M, N)")
-            kw = self.keywords(node.iter, {"num_stages"} if name == "Pipelined" else set())
-            if kw.get("num_stages", 1) not in (0, 1):
-                self.fail(node, "Asynchronous multi-stage pipelines are not implemented; use T.serial")
-            extents = tuple(self.static(a) for a in node.iter.args)
+            annotations = ()
+            if name in ("serial", "Serial", "unroll", "Unroll"):
+                extents, annotations = self.static_loop(node.iter, name)
+            else:
+                kw = self.keywords(node.iter, {"num_stages"} if name == "Pipelined" else set())
+                if kw.get("num_stages", 1) not in (0, 1):
+                    self.fail(node, "Asynchronous multi-stage pipelines are not implemented; use T.serial")
+                extents = tuple(self.static(a) for a in node.iter.args)
             targets = node.target.elts if isinstance(node.target, (ast.Tuple, ast.List)) else [node.target]
             if not targets or any(not isinstance(t, ast.Name) for t in targets):
                 self.fail(node, "Loop targets must be names")
@@ -574,7 +623,7 @@ class Parser:
             kind = (
                 "parallel" if name == "Parallel" else "unroll" if name in ("unroll", "Unroll") else "serial"
             )
-            return Statement(kind, (names, extents, body), loc)
+            return Statement(kind, (names, extents, body), loc, annotations)
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
             call = node.value
             name = self.call_name(call)

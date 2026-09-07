@@ -95,9 +95,11 @@ the pinned upstream formula and participate in static shape specialization.
 Zero-divisor and signed-overflow preconditions remain explicit. Floating
 remainder intrinsics and broader path-sensitive arithmetic analysis remain open.
 
-Loop steps and empty iteration domains are preserved. The supported `unroll`
-form emits CuTe compile-time iteration. Loop annotations, partial unroll factors,
-dynamic bounds, and vectorized loop lowering require further implementation.
+Loop steps and empty iteration domains are preserved. Serial/unroll loops accept
+keyword start/stop/step arguments. Unroll's explicit expansion, full-unroll hint,
+factor hint, and corresponding annotation precedence are implemented separately.
+Other loop annotations, dynamic bounds, and vectorized loop lowering require
+further implementation.
 
 ## Remaining language families
 

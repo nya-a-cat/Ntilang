@@ -109,6 +109,7 @@ class Statement:
     op: str
     args: tuple
     location: SourceLocation
+    annotations: tuple[tuple[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
