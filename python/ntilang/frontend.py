@@ -585,6 +585,22 @@ class Parser:
             return Statement("if", (condition, then_body, else_body), loc)
         if isinstance(node, ast.Pass):
             return Statement("pass", (), loc)
+        if isinstance(node, ast.While):
+            if node.orelse:
+                self.fail(node, "Loop else clauses are not supported")
+            condition = self.expr(node.test)
+            if condition.op == "const":
+                if condition.value:
+                    self.fail(node, "A statically true while condition is an infinite loop")
+                condition = Expr("const", value=False)
+            before_vars = self.variables.copy()
+            before_initialized = self.initialized.copy()
+            before_mutable = self.mutable.copy()
+            body = tuple(self.statement(n, parallel=parallel, nested=True) for n in node.body)
+            self.variables = before_vars
+            self.initialized = before_initialized
+            self.mutable = before_mutable
+            return Statement("while", (condition, body), loc)
         if isinstance(node, ast.AugAssign):
             mutable_target = isinstance(node.target, ast.Name) and node.target.id in self.mutable
             if not (isinstance(node.target, ast.Subscript) or mutable_target) or type(node.op) not in BINOPS:

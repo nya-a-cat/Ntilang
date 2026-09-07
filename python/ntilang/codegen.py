@@ -42,6 +42,8 @@ def walk(body):
         elif stmt.op == "if":
             yield from walk(stmt.args[1])
             yield from walk(stmt.args[2])
+        elif stmt.op == "while":
+            yield from walk(stmt.args[1])
 
 
 def check_target(target):
@@ -616,6 +618,19 @@ class Emitter:
                     self.emit(f"{self.access(name, coords)} = {self.dtype(name)}({text})")
                     self.depth -= 2
                     self.emit("cute.arch.sync_threads()")
+            elif op == "while":
+                condition, inner = args
+                if expression_dtype(condition, self.buffers, self.scalar_types) != "bool":
+                    raise CompileError("While conditions require Boolean expressions", stmt.location)
+                predicate = self.unique("while_condition")
+                self.emit(f"{predicate} = cutlass.Boolean({self.expression(condition)})")
+                self.emit(f"while {predicate}:")
+                self.depth += 1
+                old_types = self.scalar_types.copy()
+                self.statements(inner)
+                self.scalar_types = old_types
+                self.emit(f"{predicate} = cutlass.Boolean({self.expression(condition)})")
+                self.depth -= 1
             elif op == "copy":
                 self.copy(*args)
             elif op == "gemm":

@@ -145,6 +145,12 @@ def reference(kernel: CompiledKernel, *arrays):
                 variable_types[args[0]] = args[1]
             elif op == "assign":
                 variables[args[0]] = expr(args[1])
+            elif op == "while":
+                condition, inner = args
+                before_types = variable_types.copy()
+                while expr(condition):
+                    statements(inner)
+                    variable_types = before_types.copy()
             elif op == "store":
                 write(args[0], tuple(expr(x) for x in args[1]), expr(args[2]))
             elif op == "copy":

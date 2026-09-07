@@ -408,6 +408,13 @@ def validate(kernel: Kernel):
                     definitions[args[0]] = Expr("mutable", value=args[1])
                 elif op == "assign":
                     expression(args[1], bounds, definitions)
+                elif op == "while":
+                    expression(args[0], bounds, definitions)
+                    if resolved_dtype(args[0], bounds, definitions, buffers) != "bool":
+                        raise CompileError("While conditions require Boolean expressions")
+                    if args[0] == Expr("const", value=False):
+                        continue
+                    statements(args[1], bounds, definitions.copy(), True, path)
                 elif op == "store":
                     name, indices, value = args
                     expression(value, bounds, definitions)

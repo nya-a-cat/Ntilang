@@ -98,6 +98,11 @@ conditional updates. Cross-parallel persistent scalar state, mutable index
 range analysis, alternative allocation scopes, and buffer-style scalar access
 remain open.
 
+Boolean while loops support mutable loop-carried values, nested loops,
+per-element iteration counts, and uniform collective bodies. Conditions reload
+their inputs each iteration; zero-iteration initialization is preserved.
+General termination proofs and early exits remain open.
+
 Floor and truncating integer division/remainder support signed and unsigned
 data operands. The index analysis handles either divisor sign and bounded
 nonzero variable divisors. Expression `ceildiv`, `cdiv`, and `align_up` preserve
@@ -113,7 +118,7 @@ further implementation.
 
 ## Remaining language families
 
-- Python/TIR syntax: general branch write analysis, while, break, continue, scalar mutation, macros,
+- Python/TIR syntax: general branch write analysis, break, continue, broader scalar mutation, macros,
   function attributes, assertions, lets, eager definitions, and scalar arguments.
 - Tensor declarations: symbolic/dynamic dimensions, strides, local/global
   allocations, scalar variables, general buffer regions and slicing, views, reshape,

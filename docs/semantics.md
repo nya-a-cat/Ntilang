@@ -151,6 +151,17 @@ parallel loop requires additional per-thread state mapping and is currently
 diagnosed. Mutable index expressions also require further loop-state range
 analysis; their initializer is never substituted as a bound for later reads.
 
+`while` evaluates a Boolean condition before the first iteration and again
+after every body execution. Condition-local tensor loads and conditional
+expressions are regenerated at both evaluation sites, so updates remain visible.
+Mutable scalars retain their values through nested loops. The body may run zero
+times; its new bindings and buffer initialization do not escape the loop.
+Uniform while loops may contain collective tile operations. Per-element loops
+inside `T.Parallel` retain the restriction against collective operations.
+Termination and absence of arithmetic overflow are caller preconditions for
+data-dependent loops. Statically true conditions receive the upstream eager
+infinite-loop diagnostic. Loop `else`, `break`, and `continue` remain open.
+
 For lazy branches, the index checker refines single-variable affine integer
 comparisons, their negation, true conjunctions, and false disjunctions. This
 allows guards such as `i != 0` to establish a nonzero divisor when zero is an
