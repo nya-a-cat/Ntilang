@@ -39,12 +39,13 @@ and copies. Connections between incompatible MMA partitions currently require
 a layout conversion and produce a compilation error.
 
 `T.serial(stop)`, `T.serial(start, stop)`, and `T.serial(start, stop, step)` follow
-Python's static integer range semantics, including negative steps and empty
+Python's integer range semantics, including negative steps and empty
 domains. Start and stop may also be integer expressions with proven 32-bit
 ranges; the step remains static. Runtime bounds are captured once on loop entry.
 Trip-count arithmetic is formed in 64 bits, clamped at zero for empty domains,
-and checked against the 32-bit loop-count limit. A zero step is rejected. Induction arithmetic is formed in 64 bits
-before conversion to its checked 32-bit range. `T.unroll` has the same iteration
+and checked against the 32-bit loop-count limit. A zero step is rejected.
+Induction arithmetic also uses 64 bits before conversion to its checked 32-bit
+range. `T.unroll` has the same iteration
 domain. `explicit=True` uses CuTe compile-time iteration; the default emits a
 full-unroll compiler hint. `unroll_factor` emits a factor hint, with 0 and 1
 disabling unrolling. These hints preserve the iteration domain, including tails
@@ -52,8 +53,7 @@ when the trip count is not divisible by the factor. The compiler may optimize
 the final loop according to its backend rules. `pragma_unroll_explicit` and
 `pragma_unroll_factor` annotations follow the upstream precedence: a true
 `explicit` argument and a non-None factor override their annotation values.
-Explicit expansion and a factor are mutually exclusive. Other annotations remain open
-compatibility work. Explicit expansion additionally requires static bounds;
+Explicit expansion and a factor are mutually exclusive. Expansion requires static bounds;
 dynamic loops retain compiler unroll hints. Dynamic loops do not establish new
 buffer initialization after the loop. Other scheduling options remain open
 compatibility work. Global outputs are currently written after serial

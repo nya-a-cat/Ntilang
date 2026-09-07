@@ -59,6 +59,7 @@ STATIC_OPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
+    ast.Pow: operator.pow,
     ast.FloorDiv: operator.floordiv,
     ast.Mod: operator.mod,
     ast.BitAnd: operator.and_,
