@@ -57,13 +57,40 @@ def prim_func(function: Callable) -> PrimFunc:
     return PrimFunc(function, bindings)
 
 
-def _syntax_only(*args, **kwargs):
-    raise RuntimeError("This operation is syntax inside a @T.prim_func body")
+def _syntax_operation(name):
+    def operation(*args, **kwargs):
+        raise RuntimeError(f"T.{name} is syntax inside a @T.prim_func body")
+
+    operation.__name__ = name
+    return operation
 
 
-Kernel = Parallel = serial = Serial = Pipelined = _syntax_only
-alloc_shared = alloc_fragment = copy = clear = fill = gemm = _syntax_only
-exp = exp2 = sqrt = maximum = minimum = cast = _syntax_only
+_MARKER_NAMES = {}
+for _name in (
+    "Kernel",
+    "Parallel",
+    "serial",
+    "Serial",
+    "Pipelined",
+    "unroll",
+    "Unroll",
+    "alloc_shared",
+    "alloc_fragment",
+    "copy",
+    "clear",
+    "fill",
+    "gemm",
+    "exp",
+    "exp2",
+    "sqrt",
+    "maximum",
+    "minimum",
+    "cast",
+):
+    _marker = _syntax_operation(_name)
+    globals()[_name] = _marker
+    _MARKER_NAMES[_marker] = _name
+del _name, _marker
 
 
 def jit(function=None, *, target="sm_80"):

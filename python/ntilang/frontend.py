@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import inspect
 import operator
 import textwrap
@@ -46,6 +47,7 @@ class Parser:
         self.initialized: set[str] = set()
         self.allocated: list[Buffer] = []
         self.threads = 0
+        self.parallel_context = None
 
     def location(self, node):
         return SourceLocation(self.filename, self.first_line + node.lineno - 1, node.col_offset)
@@ -60,8 +62,16 @@ class Parser:
         if isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name):
             if self.constants.get(fn.value.id) is language:
                 return fn.attr
-        if isinstance(fn, ast.Name) and fn.id == "range":
-            return "serial"
+        if isinstance(fn, ast.Name):
+            value = self.constants.get(fn.id, getattr(builtins, fn.id, None))
+            if value is builtins.range:
+                return "serial"
+            if callable(value) and value in language._MARKER_NAMES:
+                return language._MARKER_NAMES[value]
+            if value is language.ceildiv:
+                return "ceildiv"
+            if value is language.Tensor:
+                return "Tensor"
         self.fail(node, "Only ntilang.language operations are supported in kernels")
 
     def static(self, node):
@@ -184,6 +194,15 @@ class Parser:
 
     def statement(self, node, *, parallel=False, nested=False):
         loc = self.location(node)
+        if isinstance(node, ast.AugAssign):
+            if not isinstance(node.target, ast.Subscript) or type(node.op) not in BINOPS:
+                self.fail(node, "Augmented assignment currently requires a tensor element")
+            assignment = ast.Assign(
+                targets=[node.target], value=ast.BinOp(left=node.target, op=node.op, right=node.value)
+            )
+            ast.copy_location(assignment, node)
+            ast.fix_missing_locations(assignment)
+            return self.statement(assignment, parallel=parallel, nested=nested)
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
             target = node.targets[0]
             if isinstance(target, ast.Name) and isinstance(node.value, ast.Call):
@@ -217,12 +236,18 @@ class Parser:
                 idx = self.indices(target.slice)
                 if len(idx) != len(self.buffers[name].type.shape):
                     self.fail(node, "Store rank mismatch")
-                if self.buffers[name].space != "global":
-                    self.fail(node, "Use collective T.copy/T.fill for temporary buffers in this version")
+                if self.buffers[name].space == "fragment":
+                    shape, names = self.parallel_context
+                    expected = tuple(Expr("var", value=n) for n in names)
+                    if self.buffers[name].type.shape != shape or idx != expected:
+                        self.fail(node, "Fragment stores require the matching T.Parallel shape and indices")
+                    self.initialized.add(name)
+                elif self.buffers[name].space != "global":
+                    self.fail(node, "Shared element stores require a thread-ownership analysis")
                 return Statement("store", (name, idx, value), loc)
         if isinstance(node, ast.For):
             name = self.call_name(node.iter)
-            if name not in ("Parallel", "serial", "Serial", "Pipelined"):
+            if name not in ("Parallel", "serial", "Serial", "Pipelined", "unroll", "Unroll"):
                 self.fail(node, f"Unsupported loop {name}")
             if parallel and name == "Parallel":
                 self.fail(node, "Nested T.Parallel loops are not supported; use T.Parallel(M, N)")
@@ -241,20 +266,46 @@ class Parser:
                 if len(names) != len(extents):
                     self.fail(node, "T.Parallel needs one variable per extent")
             else:
-                if len(names) != 1 or len(extents) not in (1, 2) or any(type(x) is not int for x in extents):
-                    self.fail(node, "Serial loops accept static stop or (start, stop)")
-                extents = (0, extents[0]) if len(extents) == 1 else extents
-                if extents[0] < 0 or extents[1] <= extents[0]:
-                    self.fail(node, "Serial loops require 0 <= start < stop")
+                if (
+                    len(names) != 1
+                    or len(extents) not in (1, 2, 3)
+                    or any(type(x) is not int for x in extents)
+                ):
+                    self.fail(
+                        node, "Serial/unroll loops accept static stop, (start, stop), or (start, stop, step)"
+                    )
+                extents = (
+                    (0, extents[0], 1)
+                    if len(extents) == 1
+                    else (*extents, 1)
+                    if len(extents) == 2
+                    else extents
+                )
+                if extents[2] == 0:
+                    self.fail(node, "Loop step must be nonzero")
+                if any(x < -(2**31) or x > 2**31 - 1 for x in extents):
+                    self.fail(node, "Loop bounds must fit signed 32-bit integers")
+                if len(range(*extents)) > 2**31 - 1:
+                    self.fail(node, "Loop iteration count exceeds signed 32-bit indexing")
             if node.orelse:
                 self.fail(node, "Loop else clauses are not supported")
             old_vars = self.variables.copy()
+            old_initialized = self.initialized.copy()
+            old_parallel = self.parallel_context
             self.variables.update(names)
+            if name == "Parallel":
+                self.parallel_context = (extents, names)
             body = tuple(
                 self.statement(n, parallel=parallel or name == "Parallel", nested=True) for n in node.body
             )
             self.variables = old_vars
-            return Statement("parallel" if name == "Parallel" else "serial", (names, extents, body), loc)
+            self.parallel_context = old_parallel
+            if name != "Parallel" and not range(*extents):
+                self.initialized = old_initialized
+            kind = (
+                "parallel" if name == "Parallel" else "unroll" if name in ("unroll", "Unroll") else "serial"
+            )
+            return Statement(kind, (names, extents, body), loc)
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
             call = node.value
             name = self.call_name(call)

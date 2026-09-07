@@ -106,9 +106,9 @@ def reference(kernel: CompiledKernel, *arrays):
                 for coord in np.ndindex(shape):
                     variables.update(zip(names, coord))
                     statements(inner)
-            elif op == "serial":
-                names, (start, stop), inner = args
-                for value in range(start, stop):
+            elif op in ("serial", "unroll"):
+                names, extent, inner = args
+                for value in range(*extent):
                     variables[names[0]] = value
                     statements(inner)
             else:

@@ -23,9 +23,19 @@ do not execute the body. This ownership is shared by linear register fragments.
 Fragment indexing uses the exact variables of a parallel loop with the same
 shape. MMA fragments have their own CuTe-defined distribution.
 
-`T.serial(stop)` and `T.serial(start, stop)` have nonnegative static bounds and a
-positive iteration count. Global outputs are written after serial accumulation
-loops. `T.Pipelined(..., num_stages=0 or 1)` has the same synchronous semantics.
+`T.serial(stop)`, `T.serial(start, stop)`, and `T.serial(start, stop, step)` follow
+Python's static integer range semantics, including negative steps and empty
+domains. A zero step is rejected. Induction arithmetic is formed in 64 bits
+before conversion to its checked 32-bit range. `T.unroll` has the same iteration
+domain and uses CuTe compile-time iteration. Its tuning annotations remain open
+compatibility work. Global outputs are currently written after serial
+accumulation loops. `T.Pipelined(..., num_stages=0 or 1)` is synchronous.
+
+Linear fragment elements can be assigned or updated with operators such as
+`+=` inside the matching parallel tile. An unconditional full parallel write
+initializes the fragment. Empty loops do not initialize their body allocations
+or buffers. MMA fragment layout propagation into elementwise epilogues remains
+open work.
 
 Shared and fragment buffers are allocated directly inside the kernel block.
 Initialization is required before reads. `T.clear(tile)` and `T.fill(tile, value)`

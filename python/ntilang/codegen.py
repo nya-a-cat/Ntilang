@@ -14,7 +14,7 @@ CUTLASS_TYPES = {"float16": "Float16", "bfloat16": "BFloat16", "float32": "Float
 def walk(body):
     for stmt in body:
         yield stmt
-        if stmt.op in ("serial", "parallel"):
+        if stmt.op in ("serial", "parallel", "unroll"):
             yield from walk(stmt.args[2])
 
 
@@ -275,14 +275,31 @@ class Emitter:
                 name, indices, value = args
                 coords = [self.expression(x) for x in indices]
                 value = self.expression(value)
+                if self.buffers[name].space == "fragment":
+                    if name in self.mmas:
+                        raise CompileError(
+                            "MMA fragment element stores require its inferred coordinate layout",
+                            stmt.location,
+                        )
+                    self.emit(f"{self.buf(name)}[{self.parallel[2]}] = {self.dtype(name)}({value})")
+                    continue
                 self.emit(f"if {self.predicate(name, coords)}:")
                 self.depth += 1
                 self.emit(f"{self.access(name, coords)} = {self.dtype(name)}({value})")
                 self.depth -= 1
-            elif op == "serial":
+            elif op in ("serial", "unroll"):
                 names, extents, inner = args
-                self.emit(f"for {self.var(names[0])} in range({extents[0]}, {extents[1]}):")
+                trip_count = len(range(*extents))
+                if not trip_count:
+                    self.emit("pass  # empty static iteration domain")
+                    continue
+                ordinal = self.unique("iteration")
+                loop = "cutlass.range_constexpr" if op == "unroll" else "range"
+                self.emit(f"for {ordinal} in {loop}({trip_count}):")
                 self.depth += 1
+                self.emit(
+                    f"{self.var(names[0])} = cutlass.Int32(cutlass.Int64({extents[0]}) + cutlass.Int64({ordinal}) * {extents[2]})"
+                )
                 self.statements(inner)
                 self.depth -= 1
             elif op == "parallel":

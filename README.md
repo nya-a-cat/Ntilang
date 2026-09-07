@@ -106,11 +106,16 @@ the same argument contract.
 
 ## Language support
 
-- `T.Tensor`, `T.Kernel`, `T.Parallel`, `T.serial`, and `T.ceildiv`.
+- `T.Tensor`, `T.Kernel`, `T.Parallel`, `T.serial`/`T.Serial`, `T.unroll`/`T.Unroll`, and `T.ceildiv`.
 - `T.alloc_shared`, `T.alloc_fragment`, `T.copy`, `T.clear`, and `T.fill`.
 - `T.gemm(A, B, accumulator, transpose_A=False, transpose_B=False)`.
 - Arithmetic, comparisons, `T.cast`, `T.exp`, `T.exp2`, `T.sqrt`, `T.maximum`, and `T.minimum`.
 - Static shapes; `float16`, `bfloat16`, `float32`, and `int32` buffers.
+
+Linear fragments support element assignment and augmented assignment inside a
+matching parallel tile. Serial and unrolled loops accept static start/stop/step,
+including reverse and empty ranges. Imported language-operation aliases retain
+their operation identity.
 
 Global tile loads outside the tensor return zero; global stores outside the
 tensor are masked. The initial write checker accepts disjoint affine tile
@@ -127,6 +132,8 @@ Unsupported constructs produce compilation errors.
 
 See [the language semantics](docs/semantics.md) for the precise restrictions and
 [the compiler architecture](docs/architecture.md) for the implementation.
+The [TileLang compatibility work](docs/compatibility.md) tracks the full language
+objective and the remaining implementation and validation requirements.
 
 ## Testing
 

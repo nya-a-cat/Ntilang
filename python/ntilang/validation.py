@@ -143,7 +143,8 @@ def validate(kernel: Kernel):
                     expression(value, bounds, definitions)
                     for index in indices:
                         interval(index, bounds, definitions)
-                    record_write(name, indices, bounds, definitions, in_serial)
+                    if buffers[name].space == "global":
+                        record_write(name, indices, bounds, definitions, in_serial)
                 elif op == "copy":
                     src, dst = args
                     if buffers[src.buffer].space == "global":
@@ -161,14 +162,17 @@ def validate(kernel: Kernel):
                             record_write(dst.buffer, indices, tile_bounds, definitions, in_serial)
                 elif op == "fill":
                     expression(args[1], bounds, definitions)
-                elif op in ("parallel", "serial"):
+                elif op in ("parallel", "serial", "unroll"):
                     names, extent, inner = args
                     inner_bounds = bounds.copy()
                     if op == "parallel":
                         inner_bounds.update({n: (0, s - 1) for n, s in zip(names, extent)})
                     else:
-                        inner_bounds[names[0]] = (extent[0], extent[1] - 1)
-                    statements(inner, inner_bounds, definitions.copy(), in_serial or op == "serial")
+                        domain = range(*extent)
+                        if not domain:
+                            continue
+                        inner_bounds[names[0]] = (min(domain[0], domain[-1]), max(domain[0], domain[-1]))
+                    statements(inner, inner_bounds, definitions.copy(), in_serial or op != "parallel")
             except CompileError as exc:
                 if exc.location is not None:
                     raise
