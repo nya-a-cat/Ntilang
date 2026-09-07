@@ -103,6 +103,15 @@ cover halfway neighbors, signed zero, NaN, infinity, and integer extrema.
 The pinned classification operators reject bfloat16 inputs; other math families
 and explicit source span objects remain open.
 
+The floating scalar family includes exponential, logarithmic, trigonometric,
+inverse trigonometric, hyperbolic, inverse hyperbolic, square-root, reciprocal
+square-root, error-function, and sigmoid operations. Integer `exp` inputs convert
+to float32 before evaluation. Half/bfloat inputs use widened math with a typed
+result; sigmoid additionally preserves the source formula's intermediate result
+types. `exp10` currently uses CuTe's power operation with base ten. Mathematical
+reference comparisons and native compilation cover these paths; hardware ULP
+accuracy and equivalence to upstream CUDA library implementations remain unverified.
+
 Local scalar annotations preserve the expression dtype according to the default
 eager frontend, including branch joins and captured specialization dtype names.
 Legacy TIR annotation semantics and buffer annotations remain open.

@@ -23,7 +23,7 @@ from .ir import (
     TensorType,
     loop_controls,
 )
-from .scalar import UNARY_MATH_OPS
+from .scalar import TRANSCENDENTAL_OPS, UNARY_MATH_OPS
 from .validation import affine
 
 BINOPS = {
@@ -391,6 +391,9 @@ class Parser:
             )
         if isinstance(node, ast.Call):
             name = self.call_name(node)
+            if name in TRANSCENDENTAL_OPS:
+                args = self.bind_call(node, ["x"], {})
+                return Expr(name, (self.expr(args["x"]),))
             if name in UNARY_MATH_OPS and name != "round_away":
                 defaults = {"span": None}
                 if name == "round":
@@ -434,9 +437,6 @@ class Parser:
             if name in language.DTYPE_NAMES and len(node.args) == 1 and not node.keywords:
                 return Expr("cast", (self.expr(node.args[0]),), language.DTYPE_NAMES[name])
             arity = {
-                "exp": 1,
-                "exp2": 1,
-                "sqrt": 1,
                 "maximum": 2,
                 "minimum": 2,
                 "max": 2,

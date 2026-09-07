@@ -7,6 +7,7 @@ NumPy is an optional testing dependency and is imported only when reference runs
 from __future__ import annotations
 
 import itertools
+import math
 import operator
 
 from .compiler import CompiledKernel
@@ -15,6 +16,7 @@ from .scalar import (
     CHOICE_OPS,
     INTEGER_DIVISION_OPS,
     ROUNDING_OPS,
+    TRANSCENDENTAL_OPS,
     body_types,
     expression_dtype,
     operand_dtype,
@@ -62,6 +64,25 @@ def reference(kernel: CompiledKernel, *arrays):
         "exp": np.exp,
         "exp2": np.exp2,
         "sqrt": np.sqrt,
+        "exp10": lambda x: np.power(type(x)(10), x),
+        "log": np.log,
+        "log2": np.log2,
+        "log10": np.log10,
+        "log1p": np.log1p,
+        "rsqrt": lambda x: type(x)(1) / np.sqrt(x),
+        "erf": math.erf,
+        "sin": np.sin,
+        "cos": np.cos,
+        "tan": np.tan,
+        "asin": np.arcsin,
+        "acos": np.arccos,
+        "atan": np.arctan,
+        "sinh": np.sinh,
+        "cosh": np.cosh,
+        "tanh": np.tanh,
+        "asinh": np.arcsinh,
+        "acosh": np.arccosh,
+        "atanh": np.arctanh,
         "abs": np.abs,
         "floor": np.floor,
         "ceil": np.ceil,
@@ -119,6 +140,13 @@ def reference(kernel: CompiledKernel, *arrays):
         dtype = expression_dtype(e, buffer_types, variable_types)
         arg_dtype = operand_dtype(e, buffer_types, variable_types)
         args = [cast(value, arg_dtype) for value in args]
+        if e.op in TRANSCENDENTAL_OPS:
+            value = cast(args[0], "float32" if dtype in ("float16", "bfloat16") else dtype)
+            if e.op == "sigmoid":
+                exponential = cast(np.exp(-value), dtype)
+                denominator = cast(cast(1, dtype) + exponential, dtype)
+                return cast(cast(1, dtype) / denominator, dtype)
+            return cast(ops[e.op](value), dtype)
         if e.op in ROUNDING_OPS:
             if arg_dtype.startswith(("int", "uint")) or arg_dtype == "bool":
                 return args[0]

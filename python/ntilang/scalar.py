@@ -7,7 +7,34 @@ INTEGER_DIVISION_OPS = frozenset(("//", "%", "truncdiv", "truncmod", "ceildiv"))
 CHOICE_OPS = frozenset(("select", "if_then_else"))
 ROUNDING_OPS = frozenset(("floor", "ceil", "trunc", "round", "round_away", "nearbyint"))
 CLASSIFICATION_OPS = frozenset(("isnan", "isinf", "isfinite"))
-UNARY_MATH_OPS = ROUNDING_OPS | CLASSIFICATION_OPS | {"abs"}
+TRANSCENDENTAL_OPS = frozenset(
+    (
+        "exp",
+        "exp2",
+        "exp10",
+        "log",
+        "log2",
+        "log10",
+        "log1p",
+        "sqrt",
+        "rsqrt",
+        "erf",
+        "sigmoid",
+        "sin",
+        "cos",
+        "tan",
+        "asin",
+        "acos",
+        "atan",
+        "sinh",
+        "cosh",
+        "tanh",
+        "asinh",
+        "acosh",
+        "atanh",
+    )
+)
+UNARY_MATH_OPS = ROUNDING_OPS | CLASSIFICATION_OPS | TRANSCENDENTAL_OPS | {"abs"}
 BINARY_NUMERIC_OPS = (
     frozenset(("+", "-", "*", "/", "<", "<=", ">", ">=", "==", "!=", "maximum", "minimum", "max", "min"))
     | INTEGER_DIVISION_OPS
@@ -70,6 +97,12 @@ def expression_dtype(expr, buffers, variables):
         return expr.value
     if expr.op in UNARY_MATH_OPS:
         dtype = expression_dtype(expr.args[0], buffers, variables)
+        if expr.op in TRANSCENDENTAL_OPS:
+            if expr.op == "exp" and dtype.startswith(("int", "uint")):
+                return "float32"
+            if not dtype.startswith(("float", "bfloat")):
+                raise CompileError(f"T.{expr.op} requires floating inputs in the CUDA lowering")
+            return dtype
         if expr.op in CLASSIFICATION_OPS:
             if dtype == "bfloat16":
                 raise CompileError("The pinned TIR classification operators do not accept bfloat16")

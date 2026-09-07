@@ -13,6 +13,7 @@ from .scalar import (
     CHOICE_OPS,
     CLASSIFICATION_OPS,
     INTEGER_DIVISION_OPS,
+    TRANSCENDENTAL_OPS,
     UNARY_MATH_OPS,
     body_types,
     expression_dtype,
@@ -322,8 +323,12 @@ class Emitter:
             return temp
         values = [self.expression(x) for x in expr.args]
         if op in UNARY_MATH_OPS:
-            expression_dtype(expr, self.buffers, self.scalar_types)
-            dtype = expression_dtype(expr.args[0], self.buffers, self.scalar_types)
+            result_dtype = expression_dtype(expr, self.buffers, self.scalar_types)
+            dtype = (
+                result_dtype
+                if op in TRANSCENDENTAL_OPS
+                else expression_dtype(expr.args[0], self.buffers, self.scalar_types)
+            )
             type_name = f"cutlass.{CUTLASS_TYPES[dtype]}"
             value = f"{type_name}({values[0]})"
             if dtype.startswith(("int", "uint")) or dtype == "bool":
@@ -340,6 +345,15 @@ class Emitter:
                 return value
             if dtype in ("float16", "bfloat16"):
                 value = f"cutlass.Float32({value})"
+            if op == "exp10":
+                compute_type = "cutlass.Float32" if dtype in ("float16", "bfloat16") else type_name
+                return f"{type_name}(cute.math.pow({compute_type}(10.0), {value}))"
+            if op == "sigmoid":
+                exponential = self.unique("sigmoid_exp")
+                denominator = self.unique("sigmoid_denominator")
+                self.emit(f"{exponential} = {type_name}(cute.math.exp(-({value})))")
+                self.emit(f"{denominator} = {type_name}({type_name}(1) + {exponential})")
+                return f"{type_name}({type_name}(1) / {denominator})"
             function = {"round": "roundeven", "nearbyint": "roundeven", "round_away": "round"}.get(op, op)
             result_type = "cutlass.Boolean" if op in CLASSIFICATION_OPS else type_name
             return f"{result_type}(cute.math.{function}({value}))"
@@ -358,8 +372,6 @@ class Emitter:
             return f"({symbol}{values[0]})"
         if op == "cast":
             return f"cutlass.{CUTLASS_TYPES[expr.value]}({values[0]})"
-        if op in ("exp", "exp2", "sqrt"):
-            return f"cute.math.{op}({values[0]})"
         if op in ("maximum", "minimum", "max", "min"):
             function = "max" if op in ("maximum", "max") else "min"
             return f"cute.math.{function}({', '.join(values)}, propagate_nan={op in ('maximum', 'minimum')})"
