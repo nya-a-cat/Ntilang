@@ -90,6 +90,10 @@ Boolean parameters require Python `bool`. Full-width `uint64` inputs use a
 bit-preserving signed TVM FFI payload. Tensor dimensions and launch grids remain
 static. Scalar-index checks retain the current signed-32-bit intermediate limit;
 keyword/default arguments, symbolic shapes, and vector scalar ABIs remain open.
+CPU-only native FFI tests write comparison results into CPU output tensors for
+each basic scalar dtype. CuTe 4.7.1's callable wrapper requires the pinned TVM FFI
+0.1.11 interface; earlier source-compilation checks with 0.1.4 had not exercised
+live callable construction.
 
 Bitwise operators and their six upstream function spellings are implemented for
 basic integer types, with Boolean support for non-shift operations. Lowering

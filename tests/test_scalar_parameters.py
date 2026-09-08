@@ -260,7 +260,7 @@ def test_actual_scalar_ffi_with_cpu_only_function(dtype_name):
         output[0] = cutlass.Int32(value == dtype(expected))
 
     # This function contains only host scalar arithmetic and never launches a kernel.
-    # Compiled CuTe entrypoints expose results through arguments, not Python return values.
+    # Compiled CuTe entrypoints write observable results through output arguments.
     fake_output = make_fake_compact_tensor(
         cutlass.Int32, (1,), memspace=cute.AddressSpace.generic, assumed_align=4
     )

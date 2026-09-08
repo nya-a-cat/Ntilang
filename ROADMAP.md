@@ -20,19 +20,19 @@ implemented or validated compatibility.
 
 ## Current baseline
 
-Implementation revision: `b264587a801334813796cccdc030ffc50f23353d`.
-[GitHub Actions run 34186308771](https://github.com/nya-a-cat/Ntilang/actions/runs/34186308771)
-passed with NVIDIA CuTe DSL 4.7.1 and TVM FFI 0.1.4:
+Implementation revision: `806a3ab3af7980b6cf49cebe5295caaad56a34d5`.
+[GitHub Actions run 34187693666](https://github.com/nya-a-cat/Ntilang/actions/runs/34187693666)
+passed with NVIDIA CuTe DSL 4.7.1 and TVM FFI 0.1.11:
 
-- Linux: 1,312 semantic and native compilation checks passed.
-- Windows: 814 checks passed; 498 compiler-dependent checks were skipped.
+- Linux: 1,395 semantic, native compilation, and host FFI checks passed.
+- Windows: 863 checks passed; 532 compiler-dependent checks were skipped.
 - Both jobs deselected 29 GPU tests. No GPU execution was performed.
 - Source and wheel distributions built successfully.
 
 Implemented areas, within the restrictions in
 [compatibility.md](docs/compatibility.md):
 
-- Static tensor declarations, kernel launches, independent IR, source generation,
+- Static tensor declarations, basic runtime scalar parameters, kernel launches, independent IR, source generation,
   fake-tensor compilation, and standalone generated modules.
 - Shared/register fragments, guarded global accesses, sliced synchronous copies,
   temporary copy snapshots, and shared communication for cross-element reads.
@@ -41,7 +41,8 @@ Implemented areas, within the restrictions in
   scalar joins, and typed mutable local scalars.
 - Basic integer, Boolean, and floating types; numeric promotion, bitwise
   operations, integer division/remainder, conditional expressions, rounding,
-  absolute value, classification, and 23 transcendental operations.
+  absolute value, classification, 23 transcendental operations, power, floating
+  remainder, `atan2`, and `copysign`.
 - Eight basic reduction kinds, broadcast reads, warp MMA GEMM, accumulator
   epilogues, and propagation of compatible fragment ownership layouts.
 - Conservative ownership, initialization, alias, index-range, and shared-memory
@@ -49,7 +50,9 @@ Implemented areas, within the restrictions in
 
 The reference evaluator does not model device scheduling or Tensor Core
 rounding. Native compilation establishes compiler acceptance and binary
-generation. Hardware numerical accuracy, concurrency behavior, performance,
+generation. CPU-only native FFI checks observe scalar conversions through CPU
+output storage. They cover Boolean and all basic integer/floating argument types,
+including full-width unsigned inputs. Hardware numerical accuracy, concurrency behavior, performance,
 and full compilation-chain formal verification remain unverified.
 
 ## 1. Complete scalar semantics and the source frontend
@@ -85,7 +88,7 @@ separately. This source distinction remains relevant to further parser work.
 
 Depends on the scalar and binding contracts established in stage 1.
 
-- [ ] Add symbolic/dynamic dimensions, explicit strides, scalar parameter ABI,
+- [ ] Add symbolic/dynamic dimensions, explicit strides, broader scalar parameter ABI,
   and specialization rules.
 - [ ] Add local/global allocation forms and general buffer regions, slices,
   views, reshape, pointer access, and storage reinterpretation.
