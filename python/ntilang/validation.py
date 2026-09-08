@@ -8,6 +8,7 @@ from .scalar import (
     BINARY_NUMERIC_OPS,
     BITWISE_OPS,
     CHOICE_OPS,
+    FAST_MATH_OPS,
     IEEE_MATH_OPS,
     INTEGER_DIVISION_OPS,
     ROUNDING_OPS,
@@ -361,6 +362,7 @@ def validate(kernel: Kernel):
             | BINARY_MATH_OPS
             | CHOICE_OPS
             | UNARY_MATH_OPS
+            | FAST_MATH_OPS
             | IEEE_MATH_OPS.keys()
             | {
                 "and",

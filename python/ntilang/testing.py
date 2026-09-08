@@ -17,6 +17,7 @@ from .runtime import normalize_scalar
 from .scalar import (
     BINARY_MATH_OPS,
     CHOICE_OPS,
+    FAST_MATH_OPS,
     IEEE_MATH_OPS,
     INTEGER_DIVISION_OPS,
     ROUNDING_OPS,
@@ -159,6 +160,14 @@ def reference(kernel: CompiledKernel, *arrays):
         if e.op == "or":
             return any(args)
         dtype = expression_dtype(e, buffer_types, variable_types)
+        if e.op in FAST_MATH_OPS:
+            # Ideal mathematical values; SFU approximation and FTZ are device
+            # contracts and are not simulated by this reference evaluator.
+            value = cast(args[0], dtype)
+            if dtype in ("float16", "bfloat16"):
+                value = cast(value, "float32")
+            result = 1 / value if e.op == "fast_rcp" else ops[e.op[2:]](value)
+            return cast(result, dtype)
         if e.op in IEEE_MATH_OPS:
             return cast(
                 evaluate_floating(IEEE_MATH_OPS[e.op][0], [cast(arg, dtype) for arg in args], dtype, e.value),

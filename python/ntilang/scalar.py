@@ -36,6 +36,9 @@ TRANSCENDENTAL_OPS = frozenset(
 )
 UNARY_MATH_OPS = ROUNDING_OPS | CLASSIFICATION_OPS | TRANSCENDENTAL_OPS | {"abs"}
 BINARY_MATH_OPS = frozenset(("pow", "fmod", "atan2", "copysign", "hypot", "nextafter", "ldexp"))
+FAST_MATH_OPS = frozenset(
+    ("__exp", "__exp10", "__log", "__log2", "__log10", "__sin", "__cos", "__tan", "fast_rcp")
+)
 IEEE_MATH_OPS = {
     "ieee_add": ("add", 2),
     "ieee_sub": ("sub", 2),
@@ -112,6 +115,13 @@ def expression_dtype(expr, buffers, variables):
         return expr.value
     if expr.op == "pow_integer":
         return expression_dtype(expr.args[0], buffers, variables)
+    if expr.op in FAST_MATH_OPS:
+        dtype = expression_dtype(expr.args[0], buffers, variables)
+        if expr.op == "fast_rcp" and dtype != "float32":
+            raise CompileError("T.fast_rcp requires a scalar float32 input in the pinned CUDA lowering")
+        if dtype not in ("float16", "bfloat16", "float32", "float64"):
+            raise CompileError(f"T.{expr.op} requires floating inputs")
+        return dtype
     if expr.op in IEEE_MATH_OPS:
         types = [expression_dtype(arg, buffers, variables) for arg in expr.args]
         dtype = types[0]

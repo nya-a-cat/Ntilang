@@ -27,6 +27,7 @@ from .ir import (
 )
 from .scalar import (
     BINARY_MATH_OPS,
+    FAST_MATH_OPS,
     IEEE_MATH_OPS,
     TRANSCENDENTAL_OPS,
     UNARY_MATH_OPS,
@@ -1091,7 +1092,7 @@ class Parser:
                             )
                         return Expr("pow_integer", (values[0],), exponent)
                 return Expr(name, values)
-            if name in TRANSCENDENTAL_OPS:
+            if name in TRANSCENDENTAL_OPS | FAST_MATH_OPS:
                 args = self.bind_call(node, ["x"], {})
                 return Expr(name, (self.expr(args["x"]),))
             if name in UNARY_MATH_OPS and name != "round_away":
