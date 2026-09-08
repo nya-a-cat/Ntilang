@@ -103,10 +103,19 @@ c = torch.empty(65, 71, device="cuda", dtype=torch.float32)
 kernel(a, b, c)
 ```
 
-Arguments must have the declared shapes and dtypes, contiguous row-major layout,
+Tensor arguments must have the declared shapes and dtypes, contiguous row-major layout,
 16-byte-aligned data pointers, disjoint storage, and a common CUDA device.
 The wrapper checks this metadata before launch. The standalone CuTe module uses
 the same argument contract.
+
+Kernel parameters can also use basic scalar annotations such as `alpha: T.float32`,
+`count: T.int32`, or `enabled: T.bool`, interspersed with tensor parameters.
+Pass their values in declaration order; they remain runtime inputs. Integer
+values must fit the declared dtype, floating parameters accept real numbers,
+and Boolean parameters require Python `bool`. Shapes and launch grids stay static.
+For direct calls to a saved CuTe executable, `uint64` values above `2**63 - 1`
+use their signed 64-bit bit pattern (`value - 2**64`); the Ntilang wrapper performs
+this TVM FFI conversion automatically.
 
 ## Language support
 

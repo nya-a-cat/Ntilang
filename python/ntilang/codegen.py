@@ -6,7 +6,7 @@ import ast
 import re
 from math import isfinite, isnan, prod
 
-from .ir import DTYPES, CompileError, Expr, Kernel, Partition, integer_limits, loop_controls
+from .ir import DTYPES, CompileError, Expr, Kernel, Partition, ScalarParameter, integer_limits, loop_controls
 from .scalar import (
     BINARY_MATH_OPS,
     BINARY_NUMERIC_OPS,
@@ -70,6 +70,9 @@ class Emitter:
         self.parallel = None
         self.control = None
         self.scalar_types = {name: "int32" for name in kernel.block_vars}
+        self.scalar_types.update(
+            {p.name: p.dtype for p in kernel.parameters if isinstance(p, ScalarParameter)}
+        )
         self.active_snapshots = set()
         for stmt in walk(kernel.body):
             if stmt.op == "gemm":
@@ -859,7 +862,15 @@ class Emitter:
         self.emit("import cutlass.cute as cute")
         self.emit("import cutlass.utils as utils")
         self.emit()
-        params = ", ".join(f"{self.buf(p.name)}: cute.Tensor" for p in self.kernel.parameters)
+
+        def parameter_name(p):
+            return self.var(p.name) if isinstance(p, ScalarParameter) else self.buf(p.name)
+
+        params = ", ".join(
+            f"{parameter_name(p)}: "
+            + (f"cutlass.{CUTLASS_TYPES[p.dtype]}" if isinstance(p, ScalarParameter) else "cute.Tensor")
+            for p in self.kernel.parameters
+        )
         self.emit("@cute.kernel")
         self.emit(f"def _nt_kernel({params}):")
         self.depth = 1
@@ -916,7 +927,7 @@ class Emitter:
         self.emit("@cute.jit")
         self.emit(f"def run({params}):")
         self.depth = 1
-        actual = ", ".join(self.buf(p.name) for p in self.kernel.parameters)
+        actual = ", ".join(parameter_name(p) for p in self.kernel.parameters)
         self.emit(
             f"_nt_kernel({actual}).launch(grid={self.kernel.grid + (1,) * (3 - len(self.kernel.grid))}, block=({self.kernel.threads}, 1, 1))"
         )
@@ -927,8 +938,11 @@ class Emitter:
         self.emit("from cutlass.cute.runtime import make_fake_compact_tensor")
         names = []
         for p in self.kernel.parameters:
-            name = self.buf(p.name)
+            name = parameter_name(p)
             names.append(name)
+            if isinstance(p, ScalarParameter):
+                self.emit(f"{name} = cutlass.{CUTLASS_TYPES[p.dtype]}(0)")
+                continue
             order = tuple(reversed(range(len(p.type.shape))))
             self.emit(
                 f"{name} = make_fake_compact_tensor({self.dtype(p.name)}, {p.type.shape}, stride_order={order}, assumed_align=16)"

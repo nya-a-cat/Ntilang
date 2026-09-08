@@ -96,7 +96,7 @@ def expression_dtype(expr, buffers, variables):
         return variables[expr.value]
     if expr.op == "load":
         return buffers[expr.value].type.dtype
-    if expr.op in ("cast", "mutable"):
+    if expr.op in ("cast", "mutable", "parameter"):
         return expr.value
     if expr.op == "pow_integer":
         return expression_dtype(expr.args[0], buffers, variables)

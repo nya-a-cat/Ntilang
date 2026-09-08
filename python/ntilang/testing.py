@@ -11,7 +11,8 @@ import math
 import operator
 
 from .compiler import CompiledKernel
-from .ir import Expr, integer_limits
+from .ir import Expr, ScalarParameter, integer_limits
+from .runtime import normalize_scalar
 from .scalar import (
     BINARY_MATH_OPS,
     CHOICE_OPS,
@@ -29,11 +30,21 @@ def reference(kernel: CompiledKernel, *arrays):
     import numpy as np
 
     if len(arrays) != len(kernel.ir.parameters):
-        raise TypeError("Incorrect number of arrays")
-    if any(b.type.dtype == "bfloat16" for b in (*kernel.ir.parameters, *kernel.ir.buffers)):
+        raise TypeError("Incorrect number of arguments")
+    if any(
+        (b.dtype if isinstance(b, ScalarParameter) else b.type.dtype) == "bfloat16"
+        for b in (*kernel.ir.parameters, *kernel.ir.buffers)
+    ):
         raise TypeError("The NumPy evaluator does not support bfloat16")
     buffers = {}
+    scalar_values = {}
+    scalar_types = {}
     for param, array in zip(kernel.ir.parameters, arrays):
+        if isinstance(param, ScalarParameter):
+            value = normalize_scalar(array, param)
+            scalar_values[param.name] = np.asarray(value).astype(param.dtype, casting="unsafe")[()]
+            scalar_types[param.name] = param.dtype
+            continue
         if array.shape != param.type.shape or array.dtype != np.dtype(param.type.dtype):
             raise ValueError(f"{param.name} requires {param.type.shape} {param.type.dtype}")
         buffers[param.name] = array
@@ -315,6 +326,7 @@ def reference(kernel: CompiledKernel, *arrays):
 
     for block in itertools.product(*(range(n) for n in kernel.ir.grid)):
         variables.clear()
-        variable_types = {name: "int32" for name in kernel.ir.block_vars}
+        variables.update(scalar_values)
+        variable_types = {**scalar_types, **{name: "int32" for name in kernel.ir.block_vars}}
         variables.update(zip(kernel.ir.block_vars, block))
         statements(kernel.ir.body)

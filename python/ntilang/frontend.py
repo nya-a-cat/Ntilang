@@ -18,6 +18,7 @@ from .ir import (
     Kernel,
     Partition,
     Region,
+    ScalarParameter,
     SourceLocation,
     Statement,
     TensorType,
@@ -123,6 +124,8 @@ class Parser:
         self.fail(node, "Only ntilang.language operations are supported in kernels")
 
     def static(self, node):
+        if isinstance(node, ast.Name) and node.id in self.variables:
+            self.fail(node, "A runtime variable cannot be used as a static specialization constant")
         if isinstance(node, ast.Constant) and (
             type(node.value) in (int, float, str, bool) or node.value is None
         ):
@@ -885,23 +888,32 @@ class Parser:
     def parse(self):
         fn = self.node
         if fn.args.posonlyargs or fn.args.kwonlyargs or fn.args.vararg or fn.args.kwarg or fn.args.defaults:
-            self.fail(fn, "Kernel parameters must be positional tensors without defaults")
+            self.fail(fn, "Kernel parameters must be positional tensors or scalars without defaults")
+        parameters = []
         for param in fn.args.args:
             annotation = self.function.__annotations__.get(param.arg)
             if not isinstance(annotation, TensorType):
                 node = param.annotation
-                if (
-                    not isinstance(node, ast.Call)
-                    or self.call_name(node) != "Tensor"
-                    or len(node.args) != 2
-                    or node.keywords
-                ):
-                    self.fail(param, "Every parameter needs T.Tensor(shape, dtype)")
-                annotation = TensorType(tuple(self.static(node.args[0])), self.static(node.args[1]))
+                if isinstance(node, ast.Call) and self.call_name(node) == "Tensor":
+                    if len(node.args) != 2 or node.keywords:
+                        self.fail(param, "Tensor parameters need T.Tensor(shape, dtype)")
+                    annotation = TensorType(tuple(self.static(node.args[0])), self.static(node.args[1]))
+                else:
+                    if node is None:
+                        self.fail(param, "Every parameter needs T.Tensor(shape, dtype) or a scalar dtype")
+                    annotation = self.static(node)
+                    if not isinstance(annotation, str):
+                        self.fail(param, "Scalar parameters need a dtype such as T.int32 or T.float32")
             if param.arg.startswith("_nt_"):
                 self.fail(param, "Names starting with _nt_ are reserved")
-            self.buffers[param.arg] = Buffer(param.arg, annotation)
-        parameters = tuple(self.buffers.values())
+            if isinstance(annotation, TensorType):
+                parameter = Buffer(param.arg, annotation)
+                self.buffers[param.arg] = parameter
+            else:
+                parameter = ScalarParameter(param.arg, annotation)
+                self.variables.add(param.arg)
+            parameters.append(parameter)
+        parameters = tuple(parameters)
         body = fn.body
         if (
             body
@@ -933,12 +945,12 @@ class Parser:
             self.fail(launch, "T.Kernel needs one block variable per grid dimension")
         block_vars = tuple(t.id for t in targets)
         if len(set(block_vars)) != len(block_vars) or any(
-            v in self.buffers or v.startswith("_nt_") for v in block_vars
+            v in self.buffers or v in self.variables or v.startswith("_nt_") for v in block_vars
         ):
             self.fail(launch, "Duplicate or reserved block variable")
         self.variables.update(block_vars)
         statements = self.statements(launch.body)
-        if not statements or not parameters:
+        if not statements or not any(isinstance(p, Buffer) for p in parameters):
             self.fail(fn, "A kernel requires tensor parameters and statements")
         shared_bytes = 0
         for buffer in self.allocated:

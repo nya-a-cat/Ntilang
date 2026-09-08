@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .ir import DTYPES, CompileError, Expr, Kernel, integer_limits
+from .ir import DTYPES, CompileError, Expr, Kernel, ScalarParameter, integer_limits
 from .scalar import (
     BINARY_MATH_OPS,
     BINARY_NUMERIC_OPS,
@@ -131,10 +131,10 @@ def interval(expr, bounds, definitions, buffers=None):
         if expr.value not in bounds:
             raise CompileError("Indices must use integer block/loop variables and static constants")
         result = bounds[expr.value]
-    elif expr.op in ("mutable", "load"):
+    elif expr.op in ("mutable", "load", "parameter"):
         if expr.op == "load" and expr.value not in buffers:
             raise CompileError("Integer data bounds require buffer dtype information")
-        dtype = expr.value if expr.op == "mutable" else buffers[expr.value].type.dtype
+        dtype = buffers[expr.value].type.dtype if expr.op == "load" else expr.value
         if not dtype.startswith(("int", "uint")):
             raise CompileError("Data-dependent indices require an integer dtype")
         result = integer_limits(dtype)
@@ -344,7 +344,7 @@ def validate(kernel: Kernel):
     initial_bounds = {name: (0, size - 1) for name, size in zip(kernel.block_vars, kernel.grid)}
 
     def runtime_value(expr, definitions):
-        if expr.op in ("load", "mutable"):
+        if expr.op in ("load", "mutable", "parameter"):
             return True
         if expr.op == "var" and expr.value in definitions:
             return runtime_value(definitions[expr.value], definitions)
@@ -541,7 +541,10 @@ def validate(kernel: Kernel):
                     raise
                 raise CompileError(str(exc), stmt.location) from exc
 
-    statements(kernel.body, initial_bounds, {})
+    parameter_definitions = {
+        p.name: Expr("parameter", value=p.dtype) for p in kernel.parameters if isinstance(p, ScalarParameter)
+    }
+    statements(kernel.body, initial_bounds, parameter_definitions)
     if reads & writes.keys():
         raise CompileError(
             "Global parameters cannot be both read and written in this version: "

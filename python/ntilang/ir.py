@@ -79,6 +79,17 @@ class Buffer:
 
 
 @dataclass(frozen=True)
+class ScalarParameter:
+    name: str
+    dtype: str
+
+    def __post_init__(self):
+        object.__setattr__(self, "dtype", str(DTYPE_ALIASES.get(self.dtype, self.dtype)))
+        if self.dtype not in DTYPES:
+            raise CompileError(f"Unsupported scalar parameter dtype {self.dtype!r}")
+
+
+@dataclass(frozen=True)
 class Expr:
     op: str
     args: tuple[Expr, ...] = ()
@@ -127,7 +138,7 @@ def loop_controls(body):
 @dataclass(frozen=True)
 class Kernel:
     name: str
-    parameters: tuple[Buffer, ...]
+    parameters: tuple[Buffer | ScalarParameter, ...]
     buffers: tuple[Buffer, ...]
     grid: tuple[int, ...]
     block_vars: tuple[str, ...]
@@ -137,7 +148,7 @@ class Kernel:
 
     @property
     def buffer_map(self) -> dict[str, Buffer]:
-        return {b.name: b for b in (*self.parameters, *self.buffers)}
+        return {b.name: b for b in (*self.parameters, *self.buffers) if isinstance(b, Buffer)}
 
 
 @dataclass(frozen=True)

@@ -73,6 +73,10 @@ and basic integer constant arithmetic, preserves sequential multiplication for
 nonnegative integer exponents, and uses floating promotion for other exponents.
 Remaining work includes full constant evaluation, integer-index integration,
 vector/sub-byte forms, and the other binary math operations listed above.
+Basic runtime scalar parameters now pass through mixed tensor/scalar signatures,
+typed CuTe arguments, host validation, and reference evaluation. Further argument
+work includes symbolic dimensions, defaults/keywords, vector types, and broader
+index-range analysis.
 The upstream `pow_of_int` helper returns the base for nonpositive template
 exponents; the public `T.pow` adapter handles zero and negative exponents
 separately. This source distinction remains relevant to further parser work.

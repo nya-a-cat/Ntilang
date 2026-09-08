@@ -81,6 +81,16 @@ The 169 pairwise basic-type additions use explicit operand conversions before
 NVIDIA's numeric operators. Vector and sub-byte dtype variants, external constructor
 behavior, and the remaining dtype utility APIs still need implementation.
 
+Kernel signatures accept these basic scalar dtypes alongside static tensors,
+preserving positional argument order. Scalars remain runtime values in generated
+CuTe signatures and support arithmetic, predicates, mutable initializers,
+captured serial bounds, and guarded integer gathers. The host wrapper checks
+integer ranges and accepts real floating values, including infinities and NaNs;
+Boolean parameters require Python `bool`. Full-width `uint64` inputs use a
+bit-preserving signed TVM FFI payload. Tensor dimensions and launch grids remain
+static. Scalar-index checks retain the current signed-32-bit intermediate limit;
+keyword/default arguments, symbolic shapes, and vector scalar ABIs remain open.
+
 Bitwise operators and their six upstream function spellings are implemented for
 basic integer types, with Boolean support for non-shift operations. Lowering
 uses explicit common-type conversions. Static shift counts, unsigned index
@@ -158,7 +168,7 @@ loop lowering require further implementation.
 ## Remaining language families
 
 - Python/TIR syntax: general branch write analysis, broader early exits and scalar mutation, macros,
-  function attributes, assertions, lets, eager definitions, and scalar arguments.
+  function attributes, assertions, lets, eager definitions, and full scalar argument forms.
 - Tensor declarations: symbolic/dynamic dimensions, strides, local/global
   allocations, scalar variables, general buffer regions and slicing, views, reshape,
   reinterpretation, pointers, and dtype coverage.

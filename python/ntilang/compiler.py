@@ -11,8 +11,9 @@ from pathlib import Path
 
 from .codegen import generate
 from .frontend import parse
-from .ir import DTYPES, Kernel
+from .ir import DTYPES, Kernel, ScalarParameter
 from .language import PrimFunc
+from .runtime import scalar_ffi_argument
 from .validation import validate
 
 
@@ -56,12 +57,17 @@ class CompiledKernel:
             sys.modules.pop(module_name, None)
         return self._executable
 
-    def __call__(self, *tensors):
-        if len(tensors) != len(self.ir.parameters):
-            raise TypeError(f"Expected {len(self.ir.parameters)} tensor arguments, received {len(tensors)}")
+    def __call__(self, *arguments):
+        if len(arguments) != len(self.ir.parameters):
+            raise TypeError(f"Expected {len(self.ir.parameters)} arguments, received {len(arguments)}")
         devices = set()
         ranges = []
-        for tensor, param in zip(tensors, self.ir.parameters):
+        ffi_arguments = []
+        for tensor, param in zip(arguments, self.ir.parameters):
+            if isinstance(param, ScalarParameter):
+                ffi_arguments.append(scalar_ffi_argument(tensor, param))
+                continue
+            ffi_arguments.append(tensor)
             if not hasattr(tensor, "__dlpack_device__") or tensor.__dlpack_device__()[0] != 2:
                 raise TypeError(f"{param.name} must be a CUDA tensor supporting DLPack")
             devices.add(tensor.__dlpack_device__()[1])
@@ -96,7 +102,7 @@ class CompiledKernel:
             ranges.append((pointer, pointer + size, param.name))
         if len(devices) != 1:
             raise ValueError("All tensor arguments must be on the same CUDA device")
-        return self.build()(*tensors)
+        return self.build()(*ffi_arguments)
 
 
 def compile(program: PrimFunc, *, target: str = "sm_80") -> CompiledKernel:
