@@ -20,12 +20,12 @@ implemented or validated compatibility.
 
 ## Current baseline
 
-Implementation revision: `39b46cf8dd9fb2550fe91683a96a4e34cb139e92`.
-[GitHub Actions run 34197576659](https://github.com/nya-a-cat/Ntilang/actions/runs/34197576659)
+Implementation revision: `e637116b5a0103f3ae3e1dc7e1df9605f5a6e74b`.
+[GitHub Actions run 34198679774](https://github.com/nya-a-cat/Ntilang/actions/runs/34198679774)
 passed with NVIDIA CuTe DSL 4.7.1 and TVM FFI 0.1.11:
 
-- Linux: 1,705 semantic, native compilation, and host FFI checks passed.
-- Windows: 1,038 checks passed; 667 compiler-dependent checks were skipped.
+- Linux: 1,840 semantic, native compilation, and host FFI checks passed.
+- Windows: 1,132 checks passed; 708 compiler-dependent checks were skipped.
 - Both jobs deselected 29 GPU tests. No GPU execution was performed.
 - Source and wheel distributions built successfully.
 
@@ -45,7 +45,7 @@ Implemented areas, within the restrictions in
   operations, integer division/remainder, conditional expressions, rounding,
   absolute value, classification, 23 transcendental operations, power, floating
   remainder, `atan2`, `copysign`, `hypot`, `nextafter`, `ldexp`, explicit scalar
-  IEEE rounding, FMA, and the explicit multiply boundary.
+  IEEE rounding, FMA, the explicit multiply boundary, and nine fast-math calls.
 - Eight basic reduction kinds, broadcast reads, warp MMA GEMM, accumulator
   epilogues, and propagation of compatible fragment ownership layouts.
 - Conservative ownership, initialization, alias, index-range, and shared-memory
@@ -86,8 +86,11 @@ The three new libdevice calls currently use float32/float64 results, with an
 independent int32 exponent conversion for ldexp. Scalar IEEE rounding and fused
 operations now use typed FP32/FP64 libdevice calls and native FP16/BF16 helper
 instructions, including CUDA's approximate low-precision division/root paths.
-Further work includes vector forms, other low-precision variants, fast-math
-functions, and hardware validation of these numerical contracts.
+The nine scalar fast-math interfaces now retain FP32 fast calls, FP64 ordinary
+calls, low-precision template/header dispatch, and the math-header interaction
+with IEEE square root. Further work includes vector forms, other low-precision
+variants, complete interactions among ordinary and fast functions, and hardware
+validation of these numerical contracts.
 Basic runtime scalar parameters now pass through mixed tensor/scalar signatures,
 typed CuTe arguments, host validation, and reference evaluation. Further argument
 work includes symbolic dimensions, defaults/keywords, vector types, and broader

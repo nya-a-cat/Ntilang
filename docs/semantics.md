@@ -303,7 +303,7 @@ and [CUDA math extension](https://github.com/tile-ai/tilelang/blob/62bba8d20ddb2
 FP16/BF16 accept `rn` only for these interfaces. Generated standalone helpers
 use native half arithmetic and FMA instructions. On SM80 through SM89, BF16
 add/subtract/multiply use the CUDA header's BF16 FMA identities; SM90 and newer
-use direct BF16 instructions. FP16 reciprocal, square root, and reciprocal
+use direct BF16 instructions. With the common CUDA header, FP16 reciprocal, square root, and reciprocal
 square root widen to FP32 approximate instructions with FTZ, then convert back.
 Their BF16 counterparts use FP32 approximate instructions without FTZ.
 FP16 division retains the approximate reciprocal and the two FMA corrections
@@ -315,6 +315,15 @@ define the approximation and rounding behavior. Half/BF16 root and division
 paths inherit those approximations. Their numerical results have not been
 measured on hardware.
 
+The pinned TileLang emitter includes `math.h` when an emitted expression uses
+`__exp`, `__log`, `__sin`, `__cos`, or `fast_rcp`. That header aliases `hsqrt`
+to CUTLASS's FP32 `sqrtf` wrapper. In such kernels, FP16/BF16 `ieee_fsqrt`
+therefore uses FP32 library square root followed by conversion. Ntilang retains
+this kernel-wide interaction, including when the square root appears before
+the triggering expression. FP32/FP64 IEEE roots and the low-precision reciprocal
+and reciprocal-square-root paths keep their existing dispatch. The source of
+this behavior is [TileLang's math header](https://github.com/tile-ai/tilelang/blob/62bba8d20ddb232e29050770472cb2649dd3e718/src/tl_templates/cuda/math.h).
+
 The reference evaluator uses exact rational arithmetic and integer square-root
 comparisons for explicit rounding. Its checks include FMA cancellation and
 intermediate overflow, rounding midpoints, directed underflow/overflow, signed
@@ -322,6 +331,35 @@ zeros, infinities, and NaNs. For the approximate low-precision operations it
 supplies ideal mathematical reference values. It does not simulate approximate
 instruction results or NaN payloads. BF16 buffer evaluation remains unsupported;
 the internal scalar oracle can represent BF16 values for arithmetic checks.
+
+Fast scalar calls are `T.__exp(x)`, `__exp10`, `__log`, `__log2`, `__log10`,
+`__sin`, `__cos`, `__tan`, and `T.fast_rcp(x)`. They accept positional or named
+`x` and retain its floating dtype. `fast_rcp` accepts scalar FP32 only and emits
+`rcp.approx.ftz.f32`. The other calls use CUDA's `__nv_fast_*f` library functions
+for FP32 and the ordinary double-precision functions for FP64. In particular,
+`__tan` uses the fast FP32 tangent intrinsic in this explicit fast family.
+CUDA documents their approximation and denormal behavior in the
+[libdevice fast-function reference](https://docs.nvidia.com/cuda/libdevice-users-guide/__nv_fast_logf.html).
+
+Low-precision fast calls follow the pinned TileLang template wrappers and
+CUTLASS revision `b2dd65dc864e09688245b316ac46c4a6cd07e15c`:
+
+| Calls | FP16 | BF16 |
+| --- | --- | --- |
+| `__log`, `__sin`, `__cos`, `__tan` | FP32 ordinary library call, then conversion | FP32 ordinary library call, then conversion |
+| `__exp` | CUDA half exponential instruction sequence and corrections | FP32 ordinary exponential, then conversion |
+| `__exp10`, `__log2`, `__log10` | CUDA half instruction sequences and corrections | CUDA BF16 instruction sequences and the exp10 special case |
+
+The CUDA half sequences use FP32 approximate log2/exp2 instructions with FTZ,
+typed scaling, and the header's representable-result corrections. BF16 uses
+the corresponding approximate instructions without FTZ. Exported generated
+modules include every required helper and library declaration. The reference
+evaluator supplies ideal mathematical values and preserves the declared type;
+it does not simulate approximation errors, flush-to-zero, or NaN payloads.
+Native compilation checks cover scalar dispatch for all four floating types.
+Device numerical accuracy and performance remain unmeasured. Vector forms and
+complete interactions with the other ordinary low-precision math families
+remain part of the compatibility work.
 
 Integer expressions support `&`, `|`, `^`, `~`, `<<`, and `>>`, together with
 `T.bitwise_and`, `T.bitwise_or`, `T.bitwise_xor`, `T.bitwise_not`, `T.shift_left`,

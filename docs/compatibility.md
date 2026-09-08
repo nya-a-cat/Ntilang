@@ -197,7 +197,15 @@ boundaries. An exact arithmetic oracle checks single rounding and special
 values. For low-precision approximate operations the oracle gives ideal values;
 hardware approximation behavior and numerical parity remain unverified.
 See [scalar arithmetic](semantics.md#scalar-arithmetic) for the target rules,
-FTZ behavior, and reference limits. Vector forms and fast-math APIs remain open.
+FTZ behavior, and reference limits. Scalar fast calls now include `__exp`,
+`__exp10`, `__log`, `__log2`, `__log10`, `__sin`, `__cos`, `__tan`, and the
+FP32-only `fast_rcp`. FP32 fast library calls, FP64 ordinary calls, and the
+FP16/BF16 template/header routes retain their source dispatch. Module-level
+math-header requests also select the upstream widened low-precision IEEE square
+root path. Macro/conditional/header-interaction checks and native standalone
+compilation cover these scalar forms. Their references are ideal values;
+hardware approximation and FTZ behavior remain unverified. Vector forms and
+complete ordinary low-precision math interactions remain open.
 
 Local scalar annotations preserve the expression dtype according to the default
 eager frontend, including branch-local values and captured specialization dtype names.
