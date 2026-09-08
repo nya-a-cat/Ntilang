@@ -20,12 +20,12 @@ implemented or validated compatibility.
 
 ## Current baseline
 
-Implementation revision: `b7a5d1e2bf738b9d73a9f05ee430e43fe20fade6`.
-[GitHub Actions run 34144875353](https://github.com/nya-a-cat/Ntilang/actions/runs/34144875353)
+Implementation revision: `b264587a801334813796cccdc030ffc50f23353d`.
+[GitHub Actions run 34186308771](https://github.com/nya-a-cat/Ntilang/actions/runs/34186308771)
 passed with NVIDIA CuTe DSL 4.7.1 and TVM FFI 0.1.4:
 
-- Linux: 1,206 semantic and native compilation checks passed.
-- Windows: 755 checks passed; 451 compiler-dependent checks were skipped.
+- Linux: 1,312 semantic and native compilation checks passed.
+- Windows: 814 checks passed; 498 compiler-dependent checks were skipped.
 - Both jobs deselected 29 GPU tests. No GPU execution was performed.
 - Source and wheel distributions built successfully.
 
@@ -67,11 +67,15 @@ and full compilation-chain formal verification remain unverified.
 - [ ] Extend constant evaluation and branch/range analysis while preserving
   overflow, initialization, and mutable-state semantics.
 
-At pause, source inspection for power and floating binary operations had started.
-No implementation for those operations was added after revision `b7a5d1e`.
-The upstream `pow_of_int` helper uses sequential multiplication and returns the
-base for nonpositive template exponents; the public `T.pow` adapter handles
-zero and negative exponents separately. Preserve this distinction when resuming.
+Basic scalar `T.pow`, `fmod`, `atan2`, and `copysign` paths are implemented and
+covered by the current CI baseline. Power recognizes immutable integer aliases
+and basic integer constant arithmetic, preserves sequential multiplication for
+nonnegative integer exponents, and uses floating promotion for other exponents.
+Remaining work includes full constant evaluation, integer-index integration,
+vector/sub-byte forms, and the other binary math operations listed above.
+The upstream `pow_of_int` helper returns the base for nonpositive template
+exponents; the public `T.pow` adapter handles zero and negative exponents
+separately. This source distinction remains relevant to further parser work.
 
 ## 2. Generalize tensors, indexing, and layouts
 

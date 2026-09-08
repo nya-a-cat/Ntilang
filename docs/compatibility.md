@@ -143,8 +143,8 @@ Floor and truncating integer division/remainder support signed and unsigned
 data operands. The index analysis handles either divisor sign and bounded
 nonzero variable divisors. Expression `ceildiv`, `cdiv`, and `align_up` preserve
 the pinned upstream formula and participate in static shape specialization.
-Zero-divisor and signed-overflow preconditions remain explicit. Floating
-remainder intrinsics and broader path-sensitive arithmetic analysis remain open.
+Zero-divisor and signed-overflow preconditions remain explicit. Additional
+remainder signatures and broader path-sensitive arithmetic analysis remain open.
 
 Loop steps and empty iteration domains are preserved. Serial/unroll loops accept
 keyword start/stop/step arguments. Unroll's explicit expansion, full-unroll hint,
