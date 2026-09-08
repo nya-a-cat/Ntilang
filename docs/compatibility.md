@@ -29,6 +29,20 @@ Both upstream spellings are now implemented with their non-NaN preference.
 
 ## Current work
 
+CUDA diagnostic calls support `T.print` for scalar IR values, messages and the
+existing global/shared/fragment buffer types, plus `T.device_assert` with optional
+source/macro stack information. Print thread selection and fragment materialization
+follow the pinned scope-specific paths. The generated CuTe helpers preserve
+literal message text and full-width numeric formatting. Zero-argument and scalar-only
+kernels can launch without block-variable bindings and can emit diagnostics
+without a tensor output. A default launch uses one block. Reference diagnostics
+use linear row-major logical ownership; physical MMA lanes and device output
+ordering remain unmodeled. Python construction-time assertions are supported;
+runtime Python assertions, `T.Assert`, host exception checks, assumption forms,
+local/vector/pointer diagnostics and GPU execution remain open.
+`T.likely` preserves its operand/dtype and participates in index and lazy-predicate
+analysis. Backend branch weights are currently left to the compiler.
+
 The frontend expands `@T.macro` and `@T.macro()` from available Python source.
 Expansion isolates definition-side closures and local names, binds positional,
 keyword, default, and tuple/dictionary argument forms, and supports scalar,

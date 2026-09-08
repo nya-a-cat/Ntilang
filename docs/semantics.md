@@ -26,6 +26,9 @@ are positive static integers within CUDA limits. Runtime scalar definitions,
 local allocations, and loop variables receive distinct internal identities.
 Source names can be rebound; existing values and buffer aliases keep their
 earlier identities. Names beginning with `_nt_` are reserved.
+The block-variable `as ...` binding is optional. Omitting grid dimensions uses
+one block. Kernels may have only scalar parameters or no parameters, and may
+perform diagnostics without writing a tensor output.
 
 Dtype symbols work as tensor dtype names and scalar casts within parsed bodies,
 for example `T.Tensor((32,), T.float32)` and `T.float32(value)`. Common aliases
@@ -488,6 +491,62 @@ its behavior for negative divisors. With a positive divisor and representable
 intermediates, this equals the mathematical ceiling. `T.align_up(x, y)` is
 `T.cdiv(x, y) * y`. The index checker rejects numerator or final-result overflow;
 data-value arithmetic retains the source dtype's overflow constraints.
+
+## Diagnostics and hints
+
+`T.print(obj=None, msg="", warp_group_id=0, warp_id=0)` accepts a scalar IR
+expression, a global/shared/fragment buffer, or a nonempty message with no
+object. A Python integer, float, or Boolean object must first be constructed
+as an IR scalar, for example `T.int32(7)`. Messages and warp selectors are
+construction-time values. Argument effects retain source evaluation order;
+the call returns the construction value `None`.
+
+Scalar and message prints run on every active thread. A global-buffer print
+iterates through every flattened element on each active thread, following the
+[pinned CUDA print implementation](https://github.com/tile-ai/tilelang/blob/62bba8d20ddb232e29050770472cb2649dd3e718/tilelang/cuda/language/print.py).
+Shared and fragment buffer prints use thread
+`warp_group_id * 128 + warp_id * 32`; an absent selected thread produces no
+output. Fragment buffers are first materialized into synchronized shared
+storage using their current ownership layout, including MMA partitions.
+That temporary storage counts toward the 48 KiB shared-memory limit. Full
+fragment prints require uniform execution outside `T.Parallel`. Existing
+initialization and cross-element shared-read checks still apply.
+
+Output includes block/thread coordinates, dtype, value, and buffer/index fields
+for buffer prints. Boolean values print as `true`/`false`; integer output
+preserves full width, and low-precision floats widen for decimal printing.
+Buffer labels preserve their source allocation name. Default scalar labels
+use Ntilang source text and may differ from TileLang's printed TIR expression.
+Message contents are literal, including percent signs and braces; embedded NUL
+ends the message as in the CUDA string argument. Device-wide output ordering,
+printf-buffer exhaustion, and flushing follow CUDA runtime behavior.
+
+`T.device_assert(condition, msg="", no_stack_info=False)` converts the scalar
+condition to Boolean and emits a device assertion. Nonempty messages print on
+failure; by default they include source locations through nested macros.
+`no_stack_info=True` omits that stack. Ntilang emits these checks for its explicit
+CUDA target independently of whether the source-generation host has a GPU.
+The serial reference raises `AssertionError` on a failed condition. Diagnostic
+reads may inspect output buffers; ordinary numeric read/write alias restrictions
+remain enforced. Concurrent diagnostic observations do not establish memory
+synchronization or deterministic ordering.
+
+Ordinary Python assertions with construction-time conditions execute during
+parsing, including before `T.Kernel`. A false condition raises `AssertionError`.
+Runtime Python assertions, `T.Assert` frames and host exception lowering remain
+open; use `T.device_assert` for the implemented device-side check.
+
+`T.likely(cond, span=None)` preserves the operand and its dtype. The wrapper's
+`dtype` keyword is evaluated and ignored. Index bounds, affine ownership and
+lazy conditional predicates look through the hint. This implementation does
+not force backend branch weights. Non-default spans remain unsupported.
+
+Reference print events model linear row-major thread ownership and execute in
+serial order. They do not model the physical MMA lane mapping or GPU diagnostic
+ordering. Native CPU helper tests exercise decimal formatting, message escaping,
+Unicode and unsigned 64-bit values. GPU printf and assertion execution remain
+unverified. Local-thread buffers, vector/sub-byte values, pointer diagnostics,
+and the remaining assertion/assumption forms require further implementation.
 
 ## GEMM
 

@@ -20,12 +20,12 @@ implemented or validated compatibility.
 
 ## Current baseline
 
-Implementation revision: `bc6fa70dd2ae2c525dd8dce289a32b306ec2d05a`.
-[GitHub Actions run 34201208555](https://github.com/nya-a-cat/Ntilang/actions/runs/34201208555)
+Implementation revision: `1e04fa5e4b03c5a82582414a0b8e44eb25605d70`.
+[GitHub Actions run 34204909253](https://github.com/nya-a-cat/Ntilang/actions/runs/34204909253)
 passed with NVIDIA CuTe DSL 4.7.1 and TVM FFI 0.1.11:
 
-- Linux: 2,199 semantic, native compilation, and host FFI checks passed.
-- Windows: 1,373 checks passed; 826 compiler-dependent checks were skipped.
+- Linux: 2,332 semantic, native compilation, and host FFI checks passed.
+- Windows: 1,433 checks passed; 899 compiler-dependent checks were skipped.
 - Both jobs deselected 29 GPU tests. No GPU execution was performed.
 - Source and wheel distributions built successfully.
 
@@ -34,6 +34,8 @@ Implemented areas, within the restrictions in
 
 - Static tensor declarations, basic runtime scalar parameters, kernel launches, independent IR, source generation,
   fake-tensor compilation, and standalone generated modules.
+- Scalar/message/buffer printing, device assertions with source stacks,
+  construction-time Python assertions, likely hints and diagnostic-only kernels.
 - Buffer/scalar metadata, basic dtype descriptors and conversions, and pure
   construction bindings before the final Kernel frame.
 - Shared/register fragments, guarded global accesses, sliced synchronous copies,
@@ -101,6 +103,12 @@ full-width source words in lookup indices, while affine integer reinterpretation
 retains checked output ownership. CPU-only generated helpers expose raw
 floating bit patterns and BF16 roundtrips through host output storage. Remaining
 work includes vector/sub-byte/pointer forms, other bit utilities, and GPU checks.
+CUDA diagnostics now cover messages, scalar IR and global/shared/fragment
+buffers, including selected-thread printing and synchronized fragment snapshots.
+Device assertions retain optional source stacks. Construction-time Python
+assertions, default one-block launches, omitted block bindings and zero-argument
+kernels are supported. Runtime Python assertions, T.Assert frames, assumption
+checks, local/vector/pointer diagnostics and hardware execution remain open.
 Basic runtime scalar parameters now pass through mixed tensor/scalar signatures,
 typed CuTe arguments, host validation, and reference evaluation. Further argument
 work includes symbolic dimensions, defaults/keywords, vector types, and broader
