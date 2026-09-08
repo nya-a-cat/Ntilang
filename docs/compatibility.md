@@ -59,8 +59,18 @@ static branches, allocation shapes, dtype aliases, and operation aliases.
 Macro-returned Python constants preserve their construction phase through scalar
 operators. Chained comparisons follow the pinned AST mutator, including its
 repeated evaluation of middle expressions and runtime Boolean-frame restrictions.
-General Python objects, container mutation, comprehensions, and the remaining
-constructor/metadata forms still require frontend work.
+Buffer metadata supports shape, dtype, source strides/scope, and the default
+offset/alignment fields; scalar dtype metadata follows expression promotion and
+rebinding. Tensor parameters retain explicit contiguous strides and allocations
+retain empty source strides. Basic dtype descriptors expose bits/bytes/itemsize,
+lanes, and DLPack type code; Boolean uses 8-bit metadata in the pinned TVM version.
+Basic dtype/get_tvm_dtype conversions and primitive len/tuple/int/str calls are
+implemented. Pure bindings can precede the single final Kernel frame, preserving
+the upstream distinction between PrimFunc-level IR constants and Kernel-level
+Python int bindings. Host operations before the launch, general Python objects,
+container mutation, comprehensions, and the remaining constructor/metadata forms
+still require frontend work. See [semantics.md](semantics.md#construction-metadata)
+for supported fields and conversion restrictions.
 
 The compiler currently handles static tensor kernels, linear register fragments,
 shared copies, scalar arithmetic, bounded strided serial loops, unrolled loops,

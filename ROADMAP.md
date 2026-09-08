@@ -20,12 +20,12 @@ implemented or validated compatibility.
 
 ## Current baseline
 
-Implementation revision: `95df89540523d04cef72d99c10228d3b2e590b42`.
-[GitHub Actions run 34192681449](https://github.com/nya-a-cat/Ntilang/actions/runs/34192681449)
+Implementation revision: `36c378cdd5af68831ba978da32d86658377bf80b`.
+[GitHub Actions run 34194743329](https://github.com/nya-a-cat/Ntilang/actions/runs/34194743329)
 passed with NVIDIA CuTe DSL 4.7.1 and TVM FFI 0.1.11:
 
-- Linux: 1,466 semantic, native compilation, and host FFI checks passed.
-- Windows: 907 checks passed; 559 compiler-dependent checks were skipped.
+- Linux: 1,487 semantic, native compilation, and host FFI checks passed.
+- Windows: 921 checks passed; 566 compiler-dependent checks were skipped.
 - Both jobs deselected 29 GPU tests. No GPU execution was performed.
 - Source and wheel distributions built successfully.
 
@@ -34,6 +34,8 @@ Implemented areas, within the restrictions in
 
 - Static tensor declarations, basic runtime scalar parameters, kernel launches, independent IR, source generation,
   fake-tensor compilation, and standalone generated modules.
+- Buffer/scalar metadata, basic dtype descriptors and conversions, and pure
+  construction bindings before the final Kernel frame.
 - Shared/register fragments, guarded global accesses, sliced synchronous copies,
   temporary copy snapshots, and shared communication for cross-element reads.
 - Multidimensional and contiguous nested parallel loops; serial/unrolled loops
@@ -87,8 +89,10 @@ Source macro expansion now covers hygienic calls, ordinary and reference
 arguments, nested calls, static recursive branches, and scalar/buffer/tuple
 returns. Scalar/buffer rebinding, construction-time expressions, region checks,
 loop-name reuse and chained assignments now follow the eager source environment.
-General Python objects, container mutation, remaining metadata forms, and exits
-into caller scopes remain in the frontend work above.
+Buffer/scalar metadata and pure pre-launch bindings preserve source strides,
+scope, dtype, and the PrimFunc/Kernel constant-binding phases. General Python
+objects, container mutation, remaining metadata forms, host operations before
+the launch, and exits into caller scopes remain in the frontend work above.
 The upstream `pow_of_int` helper returns the base for nonpositive template
 exponents; the public `T.pow` adapter handles zero and negative exponents
 separately. This source distinction remains relevant to further parser work.

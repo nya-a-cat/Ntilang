@@ -4,7 +4,7 @@ This document describes the implemented Ntilang 0.1 subset.
 
 ## Parameters and shapes
 
-Parameters use `T.Tensor(shape, dtype)` with positive static dimensions or a basic
+Parameters use `T.Tensor(shape, dtype="float32", data=None, scope=None)` with positive static dimensions or a basic
 scalar dtype annotation. The dtype is Boolean, signed or unsigned 8/16/32/64-bit integer, or
 `float16`, `bfloat16`, `float32`, or `float64`. Tensor size and
 every intermediate integer index expression must fit signed 32-bit arithmetic.
@@ -12,9 +12,16 @@ Runtime tensors are contiguous in row-major order, 16-byte aligned, on the same
 CUDA device, and have pairwise disjoint storage.
 Scalar arguments remain runtime inputs, interspersed with tensors in declaration
 order. Rebinding a parameter inside a kernel preserves its original input ABI.
+An integer shape denotes a one-dimensional tensor. Tensor arguments accept
+positional and keyword forms; explicit data pointers and parameter scopes other
+than `None` or `"global"` require further lowering.
 
 `@T.prim_func` captures a function whose source is available in a Python file.
-The body contains one `with T.Kernel(..., threads=...)` block. Grid dimensions
+The body ends with one `with T.Kernel(..., threads=...)` block. Pure construction
+bindings may precede it, including buffer aliases, shape/type queries, static
+Python conditionals, and scalar parameter expressions. These scalar expressions
+are inlined into their device uses. Host buffer reads, allocations, loops, and
+runtime control flow preceding the launch remain unsupported. Grid dimensions
 are positive static integers within CUDA limits. Runtime scalar definitions,
 local allocations, and loop variables receive distinct internal identities.
 Source names can be rebound; existing values and buffer aliases keep their
@@ -22,10 +29,46 @@ earlier identities. Names beginning with `_nt_` are reserved.
 
 Dtype symbols work as tensor dtype names and scalar casts within parsed bodies,
 for example `T.Tensor((32,), T.float32)` and `T.float32(value)`. Common aliases
-include `short`, `int`, `uint`, `long`, `half`, `float`, and `double`. Dtype
-descriptors expose `bits` and `bytes`; Boolean has one logical bit and one byte
-of tensor storage. Sub-byte and vector dtype variants remain open compatibility
-work. Calling a dtype constructor outside a parsed body is currently unsupported.
+include `short`, `int`, `uint`, `long`, `ulong`, `half`, `float`, and `double`.
+`T.dtype(value)` and `T.get_tvm_dtype(value)` accept these supported names, dtype
+objects, and the Python `int`, `float`, and `bool` types. Descriptors expose
+`bits`, `bytes`, `itemsize`, `lanes`, and `type_code`. The pinned TVM version
+represents Boolean metadata with 8 bits, one storage byte, and DLPack type code 6.
+Sub-byte/vector descriptors and NumPy/PyTorch dtype conversion remain open.
+Scalar cast syntax such as `T.float32(value)` requires a parsed body.
+
+## Construction metadata
+
+Buffers expose `shape`, `dtype`, `strides`, `scope()`, `elem_offset`,
+`data_alignment`, `offset_factor`, `buffer_type`, and `axis_separators`.
+Tensor parameters have explicit row-major strides; shared/fragment allocations
+retain the upstream empty stride list. Shape, stride, and element-offset entries
+are integer IR constants. The supported declarations have element offset zero,
+offset factor 1, buffer type 1, and no axis separators. The source alignment
+metadata is 64 bytes; generated pointer operations use the conservative 16-byte
+alignment checked by the current runtime.
+
+`T.alloc_shared(shape, dtype, scope="shared.dyn")` and
+`T.alloc_fragment(shape, dtype, scope="local.fragment")` accept argument names
+and supported scopes `shared`, `shared.dyn`, and `local.fragment`. Shared Boolean
+allocation follows the upstream override to `shared`. Other memory scopes remain
+open. Buffer pointer/name/span objects and general buffer construction APIs
+require further integration.
+
+IR scalars and buffer elements expose their resolved `dtype`, including scalar
+parameters and mutable values. An element dtype query inspects its buffer
+declaration without reading its contents. Dtype values can select static source
+branches or perform scalar casts, for example `A.dtype(value)`.
+
+Construction supports `len` and `tuple` on built-in containers, `str` on primitive
+values/dtypes, and `int` on primitive values or constant integer IR values.
+Integer metadata constants also expose `value`. Each of these conversion calls
+currently requires one positional argument.
+
+The eager binding phase is preserved: `n = A.shape[0]` before the launch keeps
+an integer IR constant. The same assignment inside the Kernel frame converts
+an int32 constant into a Python integer. A subsequent condition on the former
+builds both source arms; a Python condition on the latter selects one source arm.
 
 ## Tiles and iteration
 
@@ -136,7 +179,7 @@ a separate allocation. Chained assignments capture their right-hand side before
 target updates and target-specific dtype conversions.
 
 Whitelisted construction expressions include built-in scalar arithmetic,
-comparisons, Boolean operations, tuples/dictionaries, indexing, dtype/operation
+comparisons, Boolean operations, tuples/dictionaries, indexing, basic metadata, dtype/operation
 aliases, and conditional expressions. Macro-returned Python values participate in
 these expressions. User Python function bodies and arbitrary object operators
 are not executed by the source parser. General container mutation, comprehensions,
