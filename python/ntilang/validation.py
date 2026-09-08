@@ -351,6 +351,8 @@ def validate(kernel: Kernel):
         return any(runtime_value(arg, definitions) for arg in expr.args)
 
     def expression(expr, bounds, definitions):
+        if expr.op == "var" and expr.value not in bounds and expr.value not in definitions:
+            raise CompileError(f"Scalar {expr.value} is not defined on this control-flow path")
         if expr.op in BITWISE_OPS | BINARY_NUMERIC_OPS | BINARY_MATH_OPS | CHOICE_OPS | UNARY_MATH_OPS | {
             "and",
             "or",
@@ -465,6 +467,10 @@ def validate(kernel: Kernel):
                     expression(args[2], bounds, definitions)
                     definitions[args[0]] = Expr("mutable", value=args[1])
                 elif op == "assign":
+                    if args[0] not in definitions or definitions[args[0]].op != "mutable":
+                        raise CompileError(
+                            f"Mutable scalar {args[0]} is not defined on this control-flow path"
+                        )
                     expression(args[1], bounds, definitions)
                 elif op == "while":
                     expression(args[0], bounds, definitions)

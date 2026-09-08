@@ -113,6 +113,78 @@ def test_construction_constants_control_shapes_aliases_and_selected_source():
     np.testing.assert_array_equal(b, np.arange(16) / 8)
 
 
+@T.macro
+def large_python_constant(counter: T.Ref):
+    counter += 1
+    return 16777216.0
+
+
+def macro_construction_expressions():
+    @T.prim_func
+    def kernel(B: T.Tensor((32,), "float64")):
+        with T.Kernel(1, threads=32) as _bx:
+            counter = T.alloc_var("int32")
+            large = large_python_constant(counter) + 1.0
+            selected = 2.0 if large_python_constant(counter) == 16777216.0 and True else T.unavailable_value()
+            offset = -large_python_constant(counter) + 16777216.0
+            if large == 16777217.0:
+                for i in T.Parallel(32):
+                    B[i] = T.float64(large - 16777216.0 + selected + offset) + counter
+            else:
+                T.unavailable_operation(B)
+
+    return ntilang.compile(kernel)
+
+
+def test_macro_python_results_preserve_precision_and_static_selection():
+    b = np.empty(32, dtype=np.float64)
+    reference(macro_construction_expressions(), b)
+    np.testing.assert_array_equal(b, 6.0)
+
+
+@T.macro
+def middle_comparison(counter: T.Ref):
+    counter += 1
+    return 2
+
+
+def construction_chained_comparison():
+    @T.prim_func
+    def kernel(B: T.Tensor((32,), "int32")):
+        with T.Kernel(1, threads=32) as _bx:
+            counter = T.alloc_var("int32")
+            if 0 < middle_comparison(counter) < 4:
+                for i in T.Parallel(32):
+                    B[i] = counter
+            else:
+                T.unavailable_operation(B)
+
+    return ntilang.compile(kernel)
+
+
+def test_chained_comparison_repeats_middle_macro_like_upstream_mutator():
+    b = np.empty(32, dtype=np.int32)
+    reference(construction_chained_comparison(), b)
+    np.testing.assert_array_equal(b, 2)
+
+
+def runtime_chained_comparison():
+    @T.prim_func
+    def kernel(A: T.Tensor((39,), "int32"), B: T.Tensor((39,), "bool")):
+        with T.Kernel(2, threads=32) as bx:
+            for i in T.Parallel(32):
+                B[bx * 32 + i] = 0 < A[bx * 32 + i] < 10
+
+    return ntilang.compile(kernel)
+
+
+def test_runtime_chained_comparison():
+    a = np.arange(-12, 27, dtype=np.int32)
+    b = np.empty(39, dtype=np.bool_)
+    reference(runtime_chained_comparison(), a, b)
+    np.testing.assert_array_equal(b, (a > 0) & (a < 10))
+
+
 def construction_in_runtime_frames(count=3):
     @T.prim_func
     def kernel(B: T.Tensor((32,), "int32")):
@@ -266,6 +338,36 @@ def test_runtime_binding_cannot_escape_defining_region(kind):
         ntilang.compile(bad)
 
 
+def test_sibling_branch_cannot_use_an_unallocated_mutable():
+    @T.prim_func
+    def bad(B: T.Tensor((32,), "int32")):
+        with T.Kernel(1, threads=32) as _bx:
+            for i in T.Parallel(32):
+                if i < 16:
+                    value = T.alloc_var("int32", 2)
+                else:
+                    value = 3  # noqa: F841 - The eager binding updates the first branch's local.var.
+                B[i] = i
+
+    with pytest.raises(ntilang.CompileError, match="not defined"):
+        ntilang.compile(bad)
+
+
+def test_sibling_branch_cannot_read_an_undefined_runtime_value():
+    @T.prim_func
+    def bad(B: T.Tensor((32,), "int32")):
+        with T.Kernel(1, threads=32) as _bx:
+            for i in T.Parallel(32):
+                if i < 16:
+                    value = i + 2
+                    B[i] = value
+                else:
+                    B[i] = value
+
+    with pytest.raises(ntilang.CompileError, match="not defined"):
+        ntilang.compile(bad)
+
+
 shadowed_value = 29
 
 
@@ -295,6 +397,9 @@ requires_cute = pytest.mark.skipif(
         macro_parameter_rebinding,
         scalar_parameter_rebinding,
         construction_constants,
+        macro_construction_expressions,
+        construction_chained_comparison,
+        runtime_chained_comparison,
         construction_in_runtime_frames,
         loop_name_rebinding,
         buffer_rebinding,

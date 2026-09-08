@@ -325,6 +325,89 @@ class Parser:
                     name, origin, extents = self.region_spec(node)
                     return macros.RegionValue(name, origin, extents)
                 return macros.ReferenceValue(self.element_node(node))
+        if isinstance(node, ast.BinOp):
+            values = (self.macro_value(node.left), self.macro_value(node.right))
+            rewritten = ast.copy_location(
+                ast.BinOp(
+                    left=macros.ValueNode(values[0], node.left),
+                    op=node.op,
+                    right=macros.ValueNode(values[1], node.right),
+                ),
+                node,
+            )
+            if all(not isinstance(value, (Expr, macros.ReferenceValue)) for value in values):
+                return self.python_value(rewritten)
+            if type(node.op) not in BINOPS:
+                self.fail(node, "Unsupported runtime binary operation")
+            return Expr(BINOPS[type(node.op)], tuple(self.scalar_value(value, node) for value in values))
+        if isinstance(node, ast.UnaryOp):
+            value = self.macro_value(node.operand)
+            if not isinstance(value, (Expr, macros.ReferenceValue)):
+                return self.python_value(
+                    ast.copy_location(
+                        ast.UnaryOp(op=node.op, operand=macros.ValueNode(value, node.operand)), node
+                    )
+                )
+            operators = {ast.USub: "neg", ast.UAdd: "pos", ast.Not: "not", ast.Invert: "invert"}
+            if type(node.op) not in operators:
+                self.fail(node, "Unsupported runtime unary operation")
+            return Expr(operators[type(node.op)], (self.scalar_value(value, node),))
+        if isinstance(node, ast.Compare):
+            if len(node.ops) > 1:
+                # DSLMutator.visit_Compare repeats each middle expression in
+                # adjacent comparisons and combines them with eager boolop.
+                operands = (node.left, *node.comparators)
+                comparisons = [
+                    ast.copy_location(ast.Compare(left=left, ops=[op], comparators=[right]), node)
+                    for left, op, right in zip(operands, node.ops, operands[1:])
+                ]
+                return self.macro_value(ast.copy_location(ast.BoolOp(op=ast.And(), values=comparisons), node))
+            left, right = self.macro_value(node.left), self.macro_value(node.comparators[0])
+            if not isinstance(left, (Expr, macros.ReferenceValue)) and not isinstance(
+                right, (Expr, macros.ReferenceValue)
+            ):
+                return self.python_value(
+                    ast.copy_location(
+                        ast.Compare(
+                            left=macros.ValueNode(left, node.left),
+                            ops=node.ops,
+                            comparators=[macros.ValueNode(right, node.comparators[0])],
+                        ),
+                        node,
+                    )
+                )
+            if type(node.ops[0]) not in COMPARISONS:
+                self.fail(node, "Unsupported runtime comparison")
+            return Expr(
+                COMPARISONS[type(node.ops[0])],
+                (self.scalar_value(left, node), self.scalar_value(right, node)),
+            )
+        if isinstance(node, ast.BoolOp):
+            value = self.macro_value(node.values[0])
+            if len(node.values) == 1:
+                return value
+            rest = ast.copy_location(ast.BoolOp(op=node.op, values=node.values[1:]), node)
+            if type(value) in (int, float, bool, str, tuple, dict, type(None)):
+                return value if bool(value) == isinstance(node.op, ast.Or) else self.macro_value(rest)
+            self.boolean_macro_context += 1
+            try:
+                right = self.macro_value(rest)
+            finally:
+                self.boolean_macro_context -= 1
+            return Expr(
+                "and" if isinstance(node.op, ast.And) else "or",
+                (self.scalar_value(value, node), self.scalar_value(right, node)),
+            )
+        if isinstance(node, ast.IfExp):
+            value = self.macro_value(node.test)
+            if type(value) in (int, float, bool, str, tuple, dict, type(None)):
+                return self.macro_value(node.body if value else node.orelse)
+            self.boolean_macro_context += 1
+            try:
+                left, right = self.macro_value(node.body), self.macro_value(node.orelse)
+            finally:
+                self.boolean_macro_context -= 1
+            return Expr("if_then_else", tuple(self.scalar_value(item, node) for item in (value, left, right)))
         try:
             return self.python_value(node)
         except CompileError:
@@ -858,48 +941,8 @@ class Parser:
             if len(indices) != len(buf.type.shape):
                 self.fail(node, f"Buffer {name} expects {len(buf.type.shape)} indices")
             return Expr("load", indices, name)
-        if isinstance(node, ast.BinOp) and type(node.op) in BINOPS:
-            return Expr(BINOPS[type(node.op)], (self.expr(node.left), self.expr(node.right)))
-        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Not, ast.Invert)):
-            op = {ast.USub: "neg", ast.UAdd: "pos", ast.Not: "not", ast.Invert: "invert"}[type(node.op)]
-            operand = self.expr(node.operand)
-            if op in ("neg", "pos") and operand.op == "const" and type(operand.value) in (int, float):
-                return Expr("const", value=-operand.value if op == "neg" else operand.value)
-            return Expr(op, (operand,))
-        if isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]) in COMPARISONS:
-            return Expr(
-                COMPARISONS[type(node.ops[0])], (self.expr(node.left), self.expr(node.comparators[0]))
-            )
-        if isinstance(node, ast.BoolOp):
-            op = "and" if isinstance(node.op, ast.And) else "or"
-            values = [self.expr(node.values[0])]
-            for child in node.values[1:]:
-                known = values[-1]
-                if (
-                    known.op == "const"
-                    and type(known.value) is bool
-                    and all(value.op == "const" for value in values)
-                ):
-                    if known.value == (op == "or"):
-                        return known
-                    values = [self.expr(child)]
-                else:
-                    self.boolean_macro_context += 1
-                    try:
-                        values.append(self.expr(child))
-                    finally:
-                        self.boolean_macro_context -= 1
-            return values[0] if len(values) == 1 else Expr(op, tuple(values))
-        if isinstance(node, ast.IfExp):
-            condition = self.expr(node.test)
-            if condition.op == "const" and type(condition.value) is bool:
-                return self.expr(node.body if condition.value else node.orelse)
-            self.boolean_macro_context += 1
-            try:
-                true_value, false_value = self.expr(node.body), self.expr(node.orelse)
-            finally:
-                self.boolean_macro_context -= 1
-            return Expr("if_then_else", (condition, true_value, false_value))
+        if isinstance(node, (ast.BinOp, ast.UnaryOp, ast.Compare, ast.BoolOp, ast.IfExp)):
+            return self.scalar_value(self.macro_value(node), node)
         if isinstance(node, ast.Call):
             name = self.call_name(node)
             if name in BINARY_MATH_OPS:
@@ -1023,7 +1066,7 @@ class Parser:
             name = self.buffer_name(node)
             shape = self.buffers[name].type.shape
             return name, tuple(Expr("const", value=0) for _ in shape), shape
-        elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+        elif isinstance(node, ast.Subscript):
             name = self.buffer_name(node.value)
         else:
             self.fail(node, "Expected a buffer, a sliced region, or a tile origin")
