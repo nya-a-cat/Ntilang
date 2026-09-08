@@ -999,14 +999,19 @@ class Parser:
             def capture(item):
                 if isinstance(item, tuple):
                     return tuple(capture(child) for child in item)
-                if isinstance(item, Expr):
-                    return self.bind_macro_scalar(self.fresh("unpack"), item, node)
+                if isinstance(item, (Expr, macros.ReferenceValue)):
+                    return self.bind_macro_scalar(self.fresh("unpack"), self.scalar_value(item, node), node)
                 return item
 
             values = tuple(capture(item) for item in value)
             result = []
             for left, right in zip(target.elts, values):
-                statement = self.assign_macro_result(left, right, node, parallel=parallel, nested=nested)
+                previous_pending, self.pending = self.pending, []
+                try:
+                    statement = self.assign_macro_result(left, right, node, parallel=parallel, nested=nested)
+                    result.extend(self.pending)
+                finally:
+                    self.pending = previous_pending
                 result.extend(statement if isinstance(statement, tuple) else (statement,))
             return tuple(result)
         if isinstance(target, ast.Name) and isinstance(value, (Buffer, macros.RegionValue, tuple, dict, str)):
@@ -1135,6 +1140,10 @@ class Parser:
             return self.statement(assignment, parallel=parallel, nested=nested)
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
             target = self.assignment_target(node.targets[0])
+            if isinstance(target, ast.Subscript):
+                # The eager parser calls assign_slice(buffer, indices, value).
+                # Expand each target expression once, before the value's macros.
+                target = self.element_node(target)
             if self.macro_object(node.value) is not None:
                 return self.assign_macro_result(
                     target, self.expand_macro(node.value), node, parallel=parallel, nested=nested

@@ -302,6 +302,96 @@ def test_macro_call_bodies_expand_before_scalar_intrinsic():
     np.testing.assert_array_equal(b, 22)
 
 
+@T.macro
+def record_buffer(counter: T.Ref, buffer):
+    counter = counter * 10 + 1
+    return buffer
+
+
+@T.macro
+def record_index(counter: T.Ref, index):
+    counter = counter * 10 + 2
+    return index
+
+
+@T.macro
+def record_value(counter: T.Ref):
+    counter = counter * 10 + 3
+    return counter
+
+
+@T.macro
+def ordered_store(mode, output, index, counter: T.Ref):
+    if mode == "direct":
+        record_buffer(counter, output)[record_index(counter, index)] = record_value(counter)
+    else:
+        record_buffer(counter, output)[record_index(counter, index)] = record_value(counter) + 0
+
+
+def macro_store_order(mode="direct"):
+    @T.prim_func
+    def kernel(B: T.Tensor((39,), "int32")):
+        with T.Kernel(1, threads=32) as _bx:
+            for i in T.Parallel(64):
+                counter = T.alloc_var("int32")
+                ordered_store(mode, B, i, counter)
+
+    return ntilang.compile(kernel)
+
+
+@pytest.mark.parametrize("mode", ["direct", "expression"])
+def test_macro_store_expands_buffer_then_index_then_value(mode):
+    b = np.empty(39, dtype=np.int32)
+    reference(macro_store_order(mode), b)
+    np.testing.assert_array_equal(b, 123)
+
+
+def macro_tuple_store_order():
+    @T.prim_func
+    def kernel(B: T.Tensor((32,), "int32"), C: T.Tensor((32,), "int32")):
+        with T.Kernel(1, threads=32) as _bx:
+            for i in T.Parallel(32):
+                counter = T.alloc_var("int32")
+                counter, B[record_index(counter, i)] = record_value(counter), counter
+                C[i] = counter
+
+    return ntilang.compile(kernel)
+
+
+def test_macro_tuple_snapshots_precede_ordered_target_updates():
+    b = np.empty(32, dtype=np.int32)
+    c = np.empty_like(b)
+    reference(macro_tuple_store_order(), b, c)
+    # The RHS first sets and snapshots 3; target binding then sets 3 and records 2.
+    np.testing.assert_array_equal(b, 3)
+    np.testing.assert_array_equal(c, 32)
+
+
+@T.macro
+def read_element_and_step(source: T.Ref, index: T.Ref):
+    index += 1
+    return source
+
+
+def macro_element_index_capture():
+    @T.prim_func
+    def kernel(A: T.Tensor((64,), "int32"), B: T.Tensor((32,), "int32")):
+        with T.Kernel(1, threads=32) as _bx:
+            for i in T.Parallel(32):
+                index = T.alloc_var("int16", i)
+                value = read_element_and_step(A[index], index)
+                B[i] = value + index * 100
+
+    return ntilang.compile(kernel)
+
+
+def test_macro_element_reference_snapshots_mutable_index():
+    a = np.arange(64, dtype=np.int32) ** 2
+    b = np.empty(32, dtype=np.int32)
+    reference(macro_element_index_capture(), a, b)
+    np.testing.assert_array_equal(b, a[:32] + (np.arange(32) + 1) * 100)
+
+
 def test_runtime_boolean_macro_branch_is_rejected():
     @T.prim_func
     def bad(A: T.Tensor((32,), "int32"), B: T.Tensor((32,), "bool")):
@@ -392,6 +482,9 @@ requires_cute = pytest.mark.skipif(
         recursive_macro,
         macro_while_condition,
         macro_eager_arguments,
+        macro_store_order,
+        macro_tuple_store_order,
+        macro_element_index_capture,
     ],
 )
 def test_native_macro_compilation(factory):
