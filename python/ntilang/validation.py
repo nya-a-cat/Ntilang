@@ -8,6 +8,7 @@ from .scalar import (
     BINARY_NUMERIC_OPS,
     BITWISE_OPS,
     CHOICE_OPS,
+    IEEE_MATH_OPS,
     INTEGER_DIVISION_OPS,
     ROUNDING_OPS,
     UNARY_MATH_OPS,
@@ -353,12 +354,21 @@ def validate(kernel: Kernel):
     def expression(expr, bounds, definitions):
         if expr.op == "var" and expr.value not in bounds and expr.value not in definitions:
             raise CompileError(f"Scalar {expr.value} is not defined on this control-flow path")
-        if expr.op in BITWISE_OPS | BINARY_NUMERIC_OPS | BINARY_MATH_OPS | CHOICE_OPS | UNARY_MATH_OPS | {
-            "and",
-            "or",
-            "not",
-            "pow_integer",
-        }:
+        if (
+            expr.op
+            in BITWISE_OPS
+            | BINARY_NUMERIC_OPS
+            | BINARY_MATH_OPS
+            | CHOICE_OPS
+            | UNARY_MATH_OPS
+            | IEEE_MATH_OPS.keys()
+            | {
+                "and",
+                "or",
+                "not",
+                "pow_integer",
+            }
+        ):
             dtype = resolved_dtype(expr, bounds, definitions, buffers)
             if expr.op in ("<<", ">>"):
                 try:

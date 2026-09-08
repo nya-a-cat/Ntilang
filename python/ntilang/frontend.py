@@ -25,7 +25,14 @@ from .ir import (
     TensorType,
     loop_controls,
 )
-from .scalar import BINARY_MATH_OPS, TRANSCENDENTAL_OPS, UNARY_MATH_OPS, constant_integer, expression_dtype
+from .scalar import (
+    BINARY_MATH_OPS,
+    IEEE_MATH_OPS,
+    TRANSCENDENTAL_OPS,
+    UNARY_MATH_OPS,
+    constant_integer,
+    expression_dtype,
+)
 from .validation import affine, resolved_dtype
 
 NO_CONSTRUCTION_CALL = object()
@@ -1056,6 +1063,14 @@ class Parser:
             if value is not NO_CONSTRUCTION_CALL:
                 return self.scalar_value(value, node)
             name = self.call_name(node)
+            if name in IEEE_MATH_OPS:
+                parameters = ["x", "y", "z"][: IEEE_MATH_OPS[name][1]]
+                defaults = {} if name in ("fma", "fmul", "ieee_frsqrt") else {"rounding_mode": "rn"}
+                args = self.bind_call(node, [*parameters, *defaults], defaults)
+                mode = self.static(args["rounding_mode"]) if defaults else "rn"
+                if not isinstance(mode, str) or mode not in ("rn", "rz", "ru", "rd"):
+                    self.fail(node, "IEEE rounding_mode must be rn, rz, ru, or rd")
+                return Expr(name, tuple(self.expr(args[key]) for key in parameters), mode)
             if name in BINARY_MATH_OPS:
                 parameters = (
                     ["x1", "x2"]

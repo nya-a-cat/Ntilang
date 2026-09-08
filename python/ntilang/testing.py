@@ -11,11 +11,13 @@ import math
 import operator
 
 from .compiler import CompiledKernel
+from .floating import evaluate as evaluate_floating
 from .ir import Expr, ScalarParameter, integer_limits
 from .runtime import normalize_scalar
 from .scalar import (
     BINARY_MATH_OPS,
     CHOICE_OPS,
+    IEEE_MATH_OPS,
     INTEGER_DIVISION_OPS,
     ROUNDING_OPS,
     TRANSCENDENTAL_OPS,
@@ -157,6 +159,11 @@ def reference(kernel: CompiledKernel, *arrays):
         if e.op == "or":
             return any(args)
         dtype = expression_dtype(e, buffer_types, variable_types)
+        if e.op in IEEE_MATH_OPS:
+            return cast(
+                evaluate_floating(IEEE_MATH_OPS[e.op][0], [cast(arg, dtype) for arg in args], dtype, e.value),
+                dtype,
+            )
         if e.op == "ldexp":
             # CUDA's exponent parameter is int32, independently of x1's dtype.
             return cast(np.ldexp(cast(args[0], dtype), cast(args[1], "int32")), dtype)

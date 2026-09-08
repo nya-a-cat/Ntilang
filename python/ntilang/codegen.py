@@ -6,6 +6,7 @@ import ast
 import re
 from math import isfinite, isnan, prod
 
+from .cuda_math import low_precision_asm
 from .ir import DTYPES, CompileError, Expr, Kernel, Partition, ScalarParameter, integer_limits, loop_controls
 from .scalar import (
     BINARY_MATH_OPS,
@@ -13,6 +14,7 @@ from .scalar import (
     BITWISE_OPS,
     CHOICE_OPS,
     CLASSIFICATION_OPS,
+    IEEE_MATH_OPS,
     INTEGER_DIVISION_OPS,
     TRANSCENDENTAL_OPS,
     UNARY_MATH_OPS,
@@ -68,6 +70,7 @@ class Emitter:
         self.counter = 0
         self.mmas = {}
         self.math_externs = {}
+        self.math_ptx = {}
         self.parallel = None
         self.control = None
         self.scalar_types = {name: "int32" for name in kernel.block_vars}
@@ -327,6 +330,20 @@ class Emitter:
             self.depth -= 1
             return temp
         values = [self.expression(x) for x in expr.args]
+        if op in IEEE_MATH_OPS:
+            dtype = expression_dtype(expr, self.buffers, self.scalar_types)
+            operation, arity = IEEE_MATH_OPS[op]
+            if dtype in ("float16", "bfloat16"):
+                helper = f"_nt_{operation}_{dtype}"
+                self.math_ptx[helper] = (operation, dtype, arity)
+                arguments = ", ".join(f"cutlass.{CUTLASS_TYPES[dtype]}({value})" for value in values)
+                return f"{helper}({arguments})"
+            stem = (
+                ("fmaf" if dtype == "float32" else "fma")
+                if operation == "fma"
+                else (("f" if dtype == "float32" else "d") + operation)
+            )
+            return self.math_external(f"__nv_{stem}_{expr.value}", dtype, values, (dtype,) * arity)
         if op == "pow_integer":
             dtype = expression_dtype(expr, self.buffers, self.scalar_types)
             type_name = f"cutlass.{CUTLASS_TYPES[dtype]}"
@@ -937,6 +954,32 @@ class Emitter:
         self.statements(self.kernel.body)
         self.depth = 0
         self.emit()
+        if self.math_ptx:
+            self.emit("from cutlass.cutlass_dsl import dsl_user_op")
+            self.emit("from cutlass._mlir.dialects import llvm")
+            self.emit()
+        for helper, (operation, dtype, arity) in sorted(self.math_ptx.items()):
+            typ = f"cutlass.{CUTLASS_TYPES[dtype]}"
+            self.emit("@dsl_user_op")
+            arguments = ", ".join(f"arg{i}: {typ}" for i in range(arity))
+            self.emit(f"def {helper}({arguments}, *, loc=None, ip=None):")
+            self.depth = 1
+            self.emit("operands = [")
+            self.depth += 1
+            for i in range(arity):
+                self.emit(
+                    f"llvm.bitcast(cutlass.Uint16.mlir_type, arg{i}.ir_value(loc=loc, ip=ip), loc=loc, ip=ip),"
+                )
+            self.depth -= 1
+            self.emit("]")
+            assembly = low_precision_asm(operation, dtype, self.target)
+            constraints = "=h" + ",h" * arity
+            self.emit(
+                f"result = llvm.inline_asm(cutlass.Uint16.mlir_type, operands, {assembly!r}, {constraints!r}, has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)"
+            )
+            self.emit(f"return {typ}(llvm.bitcast({typ}.mlir_type, result, loc=loc, ip=ip))")
+            self.depth = 0
+            self.emit()
         for symbol, (dtype, dtypes) in sorted(self.math_externs.items()):
             self.emit(f'@cute.extern(name="{symbol}", overloaded=False)')
             arguments = ", ".join(f"arg{i}: cutlass.{CUTLASS_TYPES[typ]}" for i, typ in enumerate(dtypes))

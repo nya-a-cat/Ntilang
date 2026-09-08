@@ -36,6 +36,18 @@ TRANSCENDENTAL_OPS = frozenset(
 )
 UNARY_MATH_OPS = ROUNDING_OPS | CLASSIFICATION_OPS | TRANSCENDENTAL_OPS | {"abs"}
 BINARY_MATH_OPS = frozenset(("pow", "fmod", "atan2", "copysign", "hypot", "nextafter", "ldexp"))
+IEEE_MATH_OPS = {
+    "ieee_add": ("add", 2),
+    "ieee_sub": ("sub", 2),
+    "ieee_mul": ("mul", 2),
+    "ieee_fmaf": ("fma", 3),
+    "ieee_frcp": ("rcp", 1),
+    "ieee_fsqrt": ("sqrt", 1),
+    "ieee_frsqrt": ("rsqrt", 1),
+    "ieee_fdiv": ("div", 2),
+    "fma": ("fma", 3),
+    "fmul": ("mul", 2),
+}
 BINARY_NUMERIC_OPS = (
     frozenset(("+", "-", "*", "/", "<", "<=", ">", ">=", "==", "!=", "maximum", "minimum", "max", "min"))
     | INTEGER_DIVISION_OPS
@@ -100,6 +112,18 @@ def expression_dtype(expr, buffers, variables):
         return expr.value
     if expr.op == "pow_integer":
         return expression_dtype(expr.args[0], buffers, variables)
+    if expr.op in IEEE_MATH_OPS:
+        types = [expression_dtype(arg, buffers, variables) for arg in expr.args]
+        dtype = types[0]
+        if dtype not in ("float16", "bfloat16", "float32", "float64"):
+            raise CompileError(f"T.{expr.op} requires a floating first operand")
+        if expr.op in ("fma", "fmul") and any(typ != dtype for typ in types):
+            raise CompileError(f"T.{expr.op} requires identical floating operand dtypes")
+        if dtype in ("float16", "bfloat16") and expr.value != "rn":
+            raise CompileError(f"T.{expr.op} supports only rn rounding for {dtype}")
+        if expr.op == "ieee_frsqrt" and dtype == "float64":
+            raise CompileError("T.ieee_frsqrt does not support float64 in the pinned CUDA lowering")
+        return dtype
     if expr.op in BINARY_MATH_OPS:
         dtype = operand_dtype(expr, buffers, variables)
         if expr.op in ("hypot", "nextafter", "ldexp") and dtype not in ("float32", "float64"):
