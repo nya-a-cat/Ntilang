@@ -358,8 +358,36 @@ evaluator supplies ideal mathematical values and preserves the declared type;
 it does not simulate approximation errors, flush-to-zero, or NaN payloads.
 Native compilation checks cover scalar dispatch for all four floating types.
 Device numerical accuracy and performance remain unmeasured. Vector forms and
-complete interactions with the other ordinary low-precision math families
-remain part of the compatibility work.
+global compiler flags remain part of the compatibility work.
+
+Ordinary FP16/BF16 `exp`, `exp2`, `exp10`, `log`, `log2`, `log10`, `sin`,
+`cos`, `sqrt`, `rsqrt`, and `tanh` also follow the native CUDA wrappers and
+module math-header aliases. Without the math header, BF16 `exp` uses its native
+FP32 approximate exp2 sequence with an upward-rounded log2(e) coefficient;
+FP16 uses the distinct coefficient and correction points from its own header.
+FP16 `exp2` retains the FMA adjustment before conversion. Ordinary low-precision
+logarithms retain the native approximate log2 instruction, typed scaling, and
+applicable correction points. Ordinary FP32/FP64 `exp10` calls CUDA's dedicated
+base-ten exponential function.
+
+For FP16 sine and cosine without the math header, the generated helper performs
+the CUDA half-range argument reduction, selects the sine/cosine polynomial by
+quadrant, evaluates with explicit FP32 FMAs, and applies the final FP16
+corrections. BF16 sine/cosine use ordinary FP32 library calls. With the math
+header, FP16 sine/cosine and both low-precision logarithm/square-root types use
+the widened library wrappers. The header also selects `tanh.approx.f16` for
+FP16 tanh and widened `tanh.approx.f32` for BF16 tanh; without it, tanh uses the
+ordinary FP32 library wrapper. These dispatch rules follow
+[TileLang's common header](https://github.com/tile-ai/tilelang/blob/62bba8d20ddb232e29050770472cb2649dd3e718/src/tl_templates/cuda/common.h)
+and [pinned CUTLASS fast math](https://github.com/NVIDIA/cutlass/blob/b2dd65dc864e09688245b316ac46c4a6cd07e15c/include/cutlass/fast_math.h).
+
+Low-precision sigmoid evaluates `1 / (1 + exp(-x))` with a destination-typed
+exponential and addition, followed by the native CUDA half/BF16 division path.
+Intermediate overflow and rounding are retained, including the exponential's
+math-header dispatch. The mathematical reference preserves those intermediate
+types while supplying ideal values for approximate operations. The remaining
+inverse-function/dtype combinations and global fast-math compiler options need
+further upstream lowering work. Hardware parity remains unverified.
 
 Integer expressions support `&`, `|`, `^`, `~`, `<<`, and `>>`, together with
 `T.bitwise_and`, `T.bitwise_or`, `T.bitwise_xor`, `T.bitwise_not`, `T.shift_left`,
@@ -378,10 +406,9 @@ rejected. A constant left shift can participate in the affine ownership proof.
 Masks can bound input indices, while general bitwise output permutations still
 require additional ownership analysis.
 
-`T.maximum` and `T.minimum` propagate NaNs. The generator does not request fast
-math for exponential and square-root operations. Floating-point operations
-follow the target compiler's CUDA semantics; bitwise identity with NumPy is not
-specified.
+`T.maximum` and `T.minimum` propagate NaNs. Floating-point operations follow
+their explicit CUDA library or instruction path above, including the native
+low-precision approximations. Bitwise identity with NumPy is not specified.
 
 The upstream `T.max` and `T.min` spellings prefer a non-NaN operand. The two
 longer spellings are Ntilang extensions. Scalar promotion follows the pinned

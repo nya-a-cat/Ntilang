@@ -167,11 +167,15 @@ and explicit source span objects remain open.
 The floating scalar family includes exponential, logarithmic, trigonometric,
 inverse trigonometric, hyperbolic, inverse hyperbolic, square-root, reciprocal
 square-root, error-function, and sigmoid operations. Integer `exp` inputs convert
-to float32 before evaluation. Half/bfloat inputs use widened math with a typed
-result; sigmoid additionally preserves the source formula's intermediate result
-types. `exp10` currently uses CuTe's power operation with base ten. Mathematical
+to float32 before evaluation. FP16/BF16 exp/log/root paths now use native CUDA
+wrapper instructions and their correction points; FP16 sine/cosine retain
+argument reduction and the CUDA polynomial. Template math-header aliases select
+the corresponding widened FP32 library paths and approximate tanh instructions.
+Sigmoid composes a typed exponential, native addition, and CUDA half/BF16
+division. FP32/FP64 `exp10` uses the dedicated library function. Mathematical
 reference comparisons and native compilation cover these paths; hardware ULP
-accuracy and equivalence to upstream CUDA library implementations remain unverified.
+accuracy and numerical equivalence remain unverified. The remaining inverse
+function/dtype combinations need complete upstream lowering analysis.
 
 Binary scalar math includes `pow`, `fmod`, `atan2`, `copysign`, `hypot`,
 `nextafter`, and `ldexp`. Constant
@@ -204,8 +208,9 @@ FP16/BF16 template/header routes retain their source dispatch. Module-level
 math-header requests also select the upstream widened low-precision IEEE square
 root path. Macro/conditional/header-interaction checks and native standalone
 compilation cover these scalar forms. Their references are ideal values;
-hardware approximation and FTZ behavior remain unverified. Vector forms and
-complete ordinary low-precision math interactions remain open.
+hardware approximation and FTZ behavior remain unverified. Ordinary low-precision
+exp/log/trig/root/tanh/sigmoid interactions now retain the template header rules.
+Vector forms, remaining dtype combinations, and global compiler flags remain open.
 
 Local scalar annotations preserve the expression dtype according to the default
 eager frontend, including branch-local values and captured specialization dtype names.
