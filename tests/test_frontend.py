@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ntilang
 import ntilang.language as T
+import numpy as np
+from ntilang.testing import reference
 
 
 def test_factory_constants_in_deferred_annotations():
@@ -32,3 +34,20 @@ def test_jit_factory():
     assert isinstance(kernel, ntilang.CompiledKernel)
     assert kernel.ir.grid == (3,)
     assert make.__name__ == "make"
+
+
+def test_factory_scalar_dtype_in_deferred_annotations():
+    def make(dtype):
+        @T.prim_func
+        def init(value: dtype, A: T.Tensor((48,), dtype)):
+            with T.Kernel(2, threads=32) as bx:
+                for i in T.Parallel(32):
+                    A[bx * 32 + i] = value
+
+        return ntilang.compile(init)
+
+    kernel = make(T.int16)
+    output = np.empty(48, dtype=np.int16)
+    reference(kernel, -321, output)
+    np.testing.assert_array_equal(output, -321)
+    assert kernel.ir.parameters[0].dtype == "int16"

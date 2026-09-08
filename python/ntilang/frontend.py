@@ -892,7 +892,9 @@ class Parser:
         parameters = []
         for param in fn.args.args:
             annotation = self.function.__annotations__.get(param.arg)
-            if not isinstance(annotation, TensorType):
+            if isinstance(annotation, str) and annotation in language.DTYPE_NAMES:
+                annotation = language.DTYPE_NAMES[annotation]
+            elif not isinstance(annotation, TensorType):
                 node = param.annotation
                 if isinstance(node, ast.Call) and self.call_name(node) == "Tensor":
                     if len(node.args) != 2 or node.keywords:
