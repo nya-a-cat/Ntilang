@@ -20,12 +20,12 @@ implemented or validated compatibility.
 
 ## Current baseline
 
-Implementation revision: `36c378cdd5af68831ba978da32d86658377bf80b`.
-[GitHub Actions run 34194743329](https://github.com/nya-a-cat/Ntilang/actions/runs/34194743329)
+Implementation revision: `b69880bf2e70835706d7a47bc30052bd9e9e7c46`.
+[GitHub Actions run 34195771263](https://github.com/nya-a-cat/Ntilang/actions/runs/34195771263)
 passed with NVIDIA CuTe DSL 4.7.1 and TVM FFI 0.1.11:
 
-- Linux: 1,487 semantic, native compilation, and host FFI checks passed.
-- Windows: 921 checks passed; 566 compiler-dependent checks were skipped.
+- Linux: 1,520 semantic, native compilation, and host FFI checks passed.
+- Windows: 941 checks passed; 579 compiler-dependent checks were skipped.
 - Both jobs deselected 29 GPU tests. No GPU execution was performed.
 - Source and wheel distributions built successfully.
 
@@ -44,7 +44,7 @@ Implemented areas, within the restrictions in
 - Basic integer, Boolean, and floating types; numeric promotion, bitwise
   operations, integer division/remainder, conditional expressions, rounding,
   absolute value, classification, 23 transcendental operations, power, floating
-  remainder, `atan2`, and `copysign`.
+  remainder, `atan2`, `copysign`, `hypot`, `nextafter`, and `ldexp`.
 - Eight basic reduction kinds, broadcast reads, warp MMA GEMM, accumulator
   epilogues, and propagation of compatible fragment ownership layouts.
 - Conservative ownership, initialization, alias, index-range, and shared-memory
@@ -75,12 +75,15 @@ and full compilation-chain formal verification remain unverified.
 - [ ] Extend constant evaluation and branch/range analysis while preserving
   overflow, initialization, and mutable-state semantics.
 
-Basic scalar `T.pow`, `fmod`, `atan2`, and `copysign` paths are implemented and
+Basic scalar `T.pow`, `fmod`, `atan2`, `copysign`, `hypot`, `nextafter`, and `ldexp` paths are implemented and
 covered by the current CI baseline. Power recognizes immutable integer aliases
 and basic integer constant arithmetic, preserves sequential multiplication for
 nonnegative integer exponents, and uses floating promotion for other exponents.
 Remaining work includes full constant evaluation, integer-index integration,
 vector/sub-byte forms, and the other binary math operations listed above.
+The three new libdevice calls currently use float32/float64 results, with an
+independent int32 exponent conversion for ldexp. Explicit IEEE rounding,
+fused operations, low-precision variants, and fast-math functions remain open.
 Basic runtime scalar parameters now pass through mixed tensor/scalar signatures,
 typed CuTe arguments, host validation, and reference evaluation. Further argument
 work includes symbolic dimensions, defaults/keywords, vector types, and broader

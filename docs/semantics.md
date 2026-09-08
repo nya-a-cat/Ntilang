@@ -267,6 +267,25 @@ Type ranges, integer min/max, and bit masks can bound their addresses. All index
 intermediates must still fit the checked 32-bit domain and their own dtypes.
 Data-dependent scatter writes require additional ownership analysis.
 
+`T.hypot(x1, x2)`, `T.nextafter(x1, x2)`, and `T.ldexp(x1, x2)` preserve the
+first operand's `float32` or `float64` result type and accept positional or named
+operands. They use typed `cute.extern` declarations for CUDA libdevice calls.
+The generated module contains these declarations and compiles independently
+of Ntilang. Half, BF16, integer, and vector result forms require further lowering.
+
+`hypot` uses the library's scaled hypotenuse calculation to avoid undue
+intermediate overflow/underflow. `nextafter` selects the adjacent representable
+value in its result precision, including signed-zero and subnormal transitions.
+Their second argument is converted to the first argument's type. `ldexp`
+converts its exponent directly to signed int32; integer narrowing retains the
+low 32 bits. A floating exponent must be finite and fit int32 after truncation.
+This is the CUDA/C++ conversion precondition. Exponent conversion happens
+independently of the floating input's type. See the CUDA libdevice documentation
+for [hypot](https://docs.nvidia.com/cuda/libdevice-users-guide/__nv_hypotf.html),
+[nextafter](https://docs.nvidia.com/cuda/libdevice-users-guide/__nv_nextafterf.html),
+and [ldexp](https://docs.nvidia.com/cuda/libdevice-users-guide/__nv_ldexpf.html).
+Reference checks cover these boundary cases; GPU numerical behavior remains unverified.
+
 Integer expressions support `&`, `|`, `^`, `~`, `<<`, and `>>`, together with
 `T.bitwise_and`, `T.bitwise_or`, `T.bitwise_xor`, `T.bitwise_not`, `T.shift_left`,
 and `T.shift_right`. Function spellings accept their upstream operand keyword

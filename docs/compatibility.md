@@ -173,12 +173,17 @@ types. `exp10` currently uses CuTe's power operation with base ten. Mathematical
 reference comparisons and native compilation cover these paths; hardware ULP
 accuracy and equivalence to upstream CUDA library implementations remain unverified.
 
-Binary scalar math includes `pow`, `fmod`, `atan2`, and `copysign`. Constant
+Binary scalar math includes `pow`, `fmod`, `atan2`, `copysign`, `hypot`,
+`nextafter`, and `ldexp`. Constant
 nonnegative integer powers retain the base dtype and sequential multiplication;
 zero powers produce a typed one. Immutable integer aliases and basic constant
 integer arithmetic participate in selecting that path. Dynamic and negative
 exponents use the promoted floating power contract. The remaining binary
-intrinsics convert operands according to the first argument's result dtype.
+intrinsics use the first argument's result dtype. `hypot`/`nextafter`/`ldexp`
+currently require float32 or float64 results and call CUDA libdevice through
+typed CuTe extern declarations. `ldexp` converts its exponent directly to int32;
+the other binary arguments convert to the result type. Special-value reference
+checks and native/standalone compilation cover this path.
 General constant folding, power expressions in integer index analysis, other
 binary functions, and device-level numerical parity remain open.
 
