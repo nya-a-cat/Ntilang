@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import ast
 import re
+from hashlib import sha256
 from math import isfinite, isnan, prod
 
 from .cuda_math import low_precision_asm
-from .debug import c_literal, print_format
+from .debug import print_format
 from .ir import (
     DTYPES,
     Buffer,
@@ -808,8 +809,7 @@ class Emitter:
             if args[1]:
                 self.emit(f"if not {condition}:")
                 self.depth += 1
-                fmt = self.printf_literal(f"Device assert failed: {c_literal(args[1])}\n")
-                self.emit(f"cute.printf({fmt!r}, end='')")
+                self.emit(f"cute.printf('Device assert failed: %s\\n', {self.debug_string(args[1])}, end='')")
                 self.depth -= 1
             self.emit(f"_nt_device_assert({condition}, 'Device assertion failed')")
         elif op in ("break", "continue"):
@@ -979,10 +979,10 @@ class Emitter:
             raise CompileError(f"Unsupported IR operation {op}", stmt.location)
 
     @staticmethod
-    def printf_literal(text):
-        # CuTe accepts both C specifiers and brace placeholders. User text has
-        # already escaped percent signs before it joins the numeric format.
-        return text.replace("{", "{{").replace("}", "}}")
+    def debug_string(text):
+        text = text.split("\0", 1)[0]
+        symbol = "_nt_debug_text_" + sha256(text.encode("utf-8")).hexdigest()
+        return f"_nt_debug_string({text!r}, {symbol!r})"
 
     def debug_call(self, message, dtype=None, value=None, buffer=None, index=None):
         key = (message, dtype, buffer)
@@ -1031,15 +1031,48 @@ class Emitter:
                 self.emit("cute.arch.sync_threads()")
 
     def emit_debug_helpers(self):
+        if self.debug_prints or self.device_asserts:
+            # Use a real C string operand. CuTe's brace substitution does not
+            # escape {{}}; embedding user text in its format can consume numeric
+            # operands. Globals also keep the argument count independent of text.
+            self.emit("@dsl_user_op")
+            self.emit("def _nt_debug_string(text, symbol, *, loc=None, ip=None):")
+            self.depth = 1
+            self.emit("owner = ir.InsertionPoint.current.block.owner")
+            self.emit("while str(owner.name) not in ('gpu.module', 'builtin.module'):")
+            self.depth += 1
+            self.emit("owner = getattr(owner, 'parent_op', None) or owner.parent")
+            self.depth -= 1
+            self.emit("space = 4 if str(owner.name) == 'gpu.module' else 0")
+            self.emit("body = owner.regions[0].blocks[0]")
+            self.emit(
+                "exists = any('sym_name' in op.attributes and ir.StringAttr(op.attributes['sym_name']).value == symbol for op in body)"
+            )
+            self.emit("if not exists:")
+            self.depth += 1
+            self.emit("with ir.InsertionPoint.at_block_begin(body):")
+            self.depth += 1
+            self.emit(
+                "llvm.GlobalOp(sym_name=symbol, global_type=ir.Type.parse(f'!llvm.array<{len(text.encode(\"utf-8\")) + 1} x i8>'), linkage=ir.Attribute.parse('#llvm.linkage<internal>'), constant=True, addr_space=space, value=ir.StringAttr.get(text + '\\0'))"
+            )
+            self.depth -= 2
+            self.emit(
+                "pointer = llvm.AddressOfOp(llvm.PointerType.get(space), symbol, loc=loc, ip=ip).result"
+            )
+            self.emit(
+                "return llvm.addrspacecast(llvm.PointerType.get(0), pointer, loc=loc, ip=ip) if space else pointer"
+            )
+            self.depth = 0
+            self.emit()
         if self.device_asserts:
             self.emit("from cutlass.cute.testing import assert_ as _nt_device_assert")
             self.emit()
         for (message, dtype, buffer), helper in self.debug_prints.items():
             arguments = [f"{name}: cutlass.Int32" for name in ("bx", "by", "bz", "tx")]
-            values = ["bx", "by", "bz", "tx"]
+            values = [self.debug_string(message), "bx", "by", "bz", "tx"]
             if buffer is not None:
                 arguments.append("index: cutlass.Int32")
-                values.append("index")
+                values.extend([self.debug_string(buffer), "index"])
             if dtype is not None:
                 arguments.append(f"value: cutlass.{CUTLASS_TYPES[dtype]}")
             self.emit("@cute.jit")
@@ -1048,12 +1081,12 @@ class Emitter:
             if dtype == "bool":
                 self.emit("if value:")
                 self.depth += 1
-                fmt = self.printf_literal(print_format(message, dtype, buffer, boolean=True))
+                fmt = print_format(dtype, buffer, boolean=True)
                 self.emit(f"cute.printf({fmt!r}, {', '.join(values)}, end='')")
                 self.depth -= 1
                 self.emit("else:")
                 self.depth += 1
-                fmt = self.printf_literal(print_format(message, dtype, buffer, boolean=False))
+                fmt = print_format(dtype, buffer, boolean=False)
             else:
                 if dtype is not None:
                     typ = (
@@ -1066,7 +1099,7 @@ class Emitter:
                         else CUTLASS_TYPES[dtype]
                     )
                     values.append(f"cutlass.{typ}(value)")
-                fmt = self.printf_literal(print_format(message, dtype, buffer))
+                fmt = print_format(dtype, buffer)
             self.emit(f"cute.printf({fmt!r}, {', '.join(values)}, end='')")
             self.depth = 0
             self.emit()
@@ -1174,11 +1207,14 @@ class Emitter:
         self.statements(self.kernel.body)
         self.depth = 0
         self.emit()
-        self.emit_debug_helpers()
-        if self.math_ptx or self.bitcasts:
+        if self.math_ptx or self.bitcasts or self.debug_prints or self.device_asserts:
             self.emit("from cutlass.cutlass_dsl import dsl_user_op")
             self.emit("from cutlass._mlir.dialects import llvm")
             self.emit()
+        if self.debug_prints or self.device_asserts:
+            self.emit("from cutlass._mlir import ir")
+            self.emit()
+        self.emit_debug_helpers()
         for helper, (source, dtype) in sorted(self.bitcasts.items()):
             typ = f"cutlass.{CUTLASS_TYPES[dtype]}"
             self.emit("@dsl_user_op")

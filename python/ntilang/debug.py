@@ -19,17 +19,12 @@ PRINT_TYPES = {
 }
 
 
-def c_literal(text):
-    """Embed a C string value as literal text in a printf format."""
-    return text.split("\0", 1)[0].replace("%", "%%")
-
-
-def print_format(message, dtype=None, buffer=None, *, boolean=None):
-    result = f"msg='{c_literal(message)}' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, 0, 0)"
+def print_format(dtype=None, buffer=None, *, boolean=None):
+    result = "msg='%s' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, 0, 0)"
     if dtype is not None:
         label, specifier = PRINT_TYPES[dtype]
         if buffer is not None:
-            result += f": buffer={c_literal(buffer)}, index=%d, "
+            result += ": buffer=%s, index=%d, "
             if dtype == "uint16":
                 label = "uint16_t"
         else:

@@ -304,6 +304,7 @@ def test_native_device_assert(dtype):
 def test_native_zero_argument_and_empty_message_assert():
     assert message_kernel().build().has_gpu_module
     assert assert_kernel(no_stack=True, message="").build().has_gpu_module
+    assert message_kernel("{}" * 40 + "%n 猫").build().has_gpu_module
 
 
 @pytest.mark.cuda
@@ -325,7 +326,7 @@ def test_actual_generated_print_helper_on_cpu(dtype_name, tmp_path, capfd):
     import cutlass.cute as cute
 
     dtype = getattr(cutlass, CUTLASS_TYPES[dtype_name])
-    message = "literal %n %lld {x} {{}} ' \" \\ 猫\0ignored"
+    message = "literal %n %lld {x} {{}} ' \" \\ 猫" + "{}" * 40 + "\0ignored"
     path = scalar_kernel(dtype_name, message).save(tmp_path / "print.py")
     helper = runpy.run_path(path)["_nt_debug_print_0"]
     expected = (
@@ -346,6 +347,7 @@ def test_actual_generated_print_helper_on_cpu(dtype_name, tmp_path, capfd):
     ctypes.CDLL(None).fflush(None)
     output = capfd.readouterr().out
     assert "literal %n %lld {x} {{}} ' \" \\ 猫" in output
+    assert "{}" * 40 in output
     assert "ignored" not in output
     assert "BlockIdx=(1, 2, 3), ThreadIdx=(7, 0, 0)" in output
     value_text = (
