@@ -1060,8 +1060,9 @@ class Emitter:
                 "pointer = llvm.AddressOfOp(llvm.PointerType.get(space), symbol, loc=loc, ip=ip).result"
             )
             self.emit(
-                "return llvm.addrspacecast(llvm.PointerType.get(0), pointer, loc=loc, ip=ip) if space else pointer"
+                "pointer = llvm.addrspacecast(llvm.PointerType.get(0), pointer, loc=loc, ip=ip) if space else pointer"
             )
+            self.emit("return cute.make_ptr(cutlass.Int8, pointer, assumed_align=1, loc=loc, ip=ip)")
             self.depth = 0
             self.emit()
         if self.device_asserts:
