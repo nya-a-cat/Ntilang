@@ -459,6 +459,8 @@ def validate(kernel: Kernel):
                     expression(args[1], bounds, definitions)
                     # Assignments use fresh names in the frontend, avoiding cycles.
                     definitions[args[0]] = args[1]
+                elif op == "evaluate":
+                    expression(args[0], bounds, definitions)
                 elif op == "declare":
                     expression(args[2], bounds, definitions)
                     definitions[args[0]] = Expr("mutable", value=args[1])

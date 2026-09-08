@@ -68,7 +68,24 @@ class PrimFunc:
         raise TypeError("Compile a prim_func with ntilang.compile() before calling it")
 
 
-def prim_func(function: Callable) -> PrimFunc:
+@dataclass(frozen=True, eq=False)
+class Macro:
+    function: Callable
+    annotation_locals: tuple = ()
+
+    @property
+    def __name__(self):
+        return self.function.__name__
+
+    def __call__(self, *args, **kwargs):
+        raise TypeError("T.macro calls are expanded inside a compiled prim_func or another macro")
+
+
+class Ref:
+    """Macro parameter annotation for a mutable scalar, element, or buffer region."""
+
+
+def _annotation_bindings(function, caller):
     # Deferred annotations may mention factory arguments that are absent from
     # the function's bytecode closure. Capture just those referenced names.
     names = set()
@@ -84,13 +101,36 @@ def prim_func(function: Callable) -> PrimFunc:
                 names.update(n.id for n in ast.walk(node.annotation) if isinstance(n, ast.Name))
     except (OSError, TypeError):
         pass  # The frontend reports source availability when compilation is requested.
+    return tuple((name, caller[name]) for name in names if name in caller)
+
+
+def prim_func(function: Callable) -> PrimFunc:
     frame = inspect.currentframe()
     try:
         caller = frame.f_back.f_locals if frame is not None and frame.f_back is not None else {}
-        bindings = tuple((name, caller[name]) for name in names if name in caller)
+        bindings = _annotation_bindings(function, caller)
     finally:
         del frame
     return PrimFunc(function, bindings)
+
+
+def macro(func=None):
+    def decorate(function):
+        frame = inspect.currentframe()
+        try:
+            caller = frame.f_back.f_locals if frame is not None and frame.f_back is not None else {}
+            return Macro(function, _annotation_bindings(function, caller))
+        finally:
+            del frame
+
+    if func is None:
+        return decorate
+    frame = inspect.currentframe()
+    try:
+        caller = frame.f_back.f_locals if frame is not None and frame.f_back is not None else {}
+        return Macro(func, _annotation_bindings(func, caller))
+    finally:
+        del frame
 
 
 def _syntax_operation(name):

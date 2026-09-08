@@ -80,6 +80,10 @@ Basic runtime scalar parameters now pass through mixed tensor/scalar signatures,
 typed CuTe arguments, host validation, and reference evaluation. Further argument
 work includes symbolic dimensions, defaults/keywords, vector types, and broader
 index-range analysis.
+Source macro expansion now covers hygienic calls, ordinary and reference
+arguments, nested calls, static recursive branches, and scalar/buffer/tuple
+returns. Broader Python bindings, object forms, and exits into caller scopes
+remain in the frontend work above.
 The upstream `pow_of_int` helper returns the base for nonpositive template
 exponents; the public `T.pow` adapter handles zero and negative exponents
 separately. This source distinction remains relevant to further parser work.

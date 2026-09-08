@@ -29,6 +29,22 @@ Both upstream spellings are now implemented with their non-NaN preference.
 
 ## Current work
 
+The frontend expands `@T.macro` and `@T.macro()` from available Python source.
+Expansion isolates definition-side closures and local names, binds positional,
+keyword, default, and tuple/dictionary argument forms, and supports scalar,
+buffer, region, and tuple results. Basic `T.Ref` annotations preserve mutable
+scalar and buffer-element updates and capture region origins at macro entry.
+Expanded statements participate in the existing ownership and initialization
+checks. Scalar annotations on ordinary macro arguments preserve the argument's
+dtype, following the default eager builder.
+
+Macro statements are emitted at the call's construction position. This includes
+expansion before a while loop and expansion of both macro arguments to a scalar
+`if_then_else` call. Runtime Boolean branches and returns inside runtime control
+flow retain upstream diagnostics. Static branches can select recursive expansion
+with a depth limit of 128. Macro exits into caller loops, general Python rebinding,
+arbitrary object constructors, and full buffer metadata/parser forms remain open.
+
 The compiler currently handles static tensor kernels, linear register fragments,
 shared copies, scalar arithmetic, bounded strided serial loops, unrolled loops,
 and warp MMA GEMM. Fragment element assignment and augmented assignment use the
@@ -171,7 +187,7 @@ loop lowering require further implementation.
 
 ## Remaining language families
 
-- Python/TIR syntax: general branch write analysis, broader early exits and scalar mutation, macros,
+- Python/TIR syntax: general branch write analysis, broader early exits and scalar mutation, remaining macro forms,
   function attributes, assertions, lets, eager definitions, and full scalar argument forms.
 - Tensor declarations: symbolic/dynamic dimensions, strides, local/global
   allocations, scalar variables, general buffer regions and slicing, views, reshape,

@@ -210,6 +210,8 @@ def reference(kernel: CompiledKernel, *arrays):
                 buffers[b.name] = np.empty(b.type.shape, dtype=b.type.dtype)
             elif op == "pass":
                 continue
+            elif op == "evaluate":
+                expr(args[0])
             elif op == "break":
                 raise LoopBreak
             elif op == "continue":

@@ -690,6 +690,9 @@ class Emitter:
             return
         if op == "pass":
             self.emit("pass")
+        elif op == "evaluate":
+            value = self.expression(args[0])
+            self.emit(f"{self.unique('evaluate')} = {value}")
         elif op in ("break", "continue"):
             alive, skip = self.control
             self.emit(f"{skip} = cutlass.Boolean(True)")
