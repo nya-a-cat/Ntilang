@@ -46,8 +46,21 @@ Macro statements are emitted at the call's construction position. This includes
 expansion before a while loop and expansion of both macro arguments to a scalar
 `if_then_else` call. Runtime Boolean branches and returns inside runtime control
 flow retain upstream diagnostics. Static branches can select recursive expansion
-with a depth limit of 128. Macro exits into caller loops, general Python rebinding,
-arbitrary object constructors, and full buffer metadata/parser forms remain open.
+with a depth limit of 128. Macro exits into caller loops, arbitrary object
+constructors, and full buffer metadata/parser forms remain open.
+
+The source environment separates Python construction values from runtime IR
+values. Basic scalar rebinding creates fresh IR identities and preserves earlier
+snapshots. Buffer aliases retain their allocation when a source name is rebound;
+`alloc_var` reallocation also preserves the prior scalar used in an initializer.
+Loop-variable reuse, ordinary augmented assignments, tuple unpacking, and chained
+assignments follow this environment. Whitelisted Python expressions can determine
+static branches, allocation shapes, dtype aliases, and operation aliases.
+Macro-returned Python constants preserve their construction phase through scalar
+operators. Chained comparisons follow the pinned AST mutator, including its
+repeated evaluation of middle expressions and runtime Boolean-frame restrictions.
+General Python objects, container mutation, comprehensions, and the remaining
+constructor/metadata forms still require frontend work.
 
 The compiler currently handles static tensor kernels, linear register fragments,
 shared copies, scalar arithmetic, bounded strided serial loops, unrolled loops,
@@ -61,9 +74,13 @@ preserves fragment/shared ownership, guarded global accesses, deepest-body local
 scalars, and cross-element temporary reads. Statements between parallel levels,
 dependent extents, and explicit nested layout annotations need further lowering.
 
-Conditional statements support branch-defined scalar joins, conditional fragment
-updates, and uniform collective branches. Initialization is intersected across
-paths. Multiple global stores are accepted for proven disjoint ranges or in
+Conditional statements support mutable scalar updates, conditional fragment
+updates, and uniform collective branches. Runtime bindings retain their defining
+region; fresh values created inside a branch or loop cannot be read after it.
+Python constant assignments execute in construction order, including both sides
+of a runtime conditional. Earlier implicit branch-result joins were removed to
+match the pinned eager builder. Initialization is intersected across paths.
+Multiple global stores are accepted for proven disjoint ranges or in
 exclusive branches with the same ownership mapping; general path-dependent
 write analysis remains open.
 
@@ -122,7 +139,7 @@ inversion, and narrow index overflow have dedicated checks. General bitwise
 output permutations and non-default source span objects remain open.
 
 Numeric promotion follows the pinned TIR matching source across arithmetic,
-comparisons, and scalar joins. Floating/integer pairs preserve the floating
+comparisons, and conditional expressions. Floating/integer pairs preserve the floating
 operand's dtype. Bitwise integer literals adopt the other operand's integer
 type. Integer `/` and non-Boolean logical operands are rejected according to
 the source contract. General constant folding, non-default constructor forms,
@@ -156,7 +173,7 @@ General constant folding, power expressions in integer index analysis, other
 binary functions, and device-level numerical parity remain open.
 
 Local scalar annotations preserve the expression dtype according to the default
-eager frontend, including branch joins and captured specialization dtype names.
+eager frontend, including branch-local values and captured specialization dtype names.
 Legacy TIR annotation semantics and buffer annotations remain open.
 
 `alloc_var` supports basic scalar dtypes in the local.var scope, initialization,

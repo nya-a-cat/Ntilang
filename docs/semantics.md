@@ -4,17 +4,21 @@ This document describes the implemented Ntilang 0.1 subset.
 
 ## Parameters and shapes
 
-Every parameter is a `T.Tensor(shape, dtype)` with positive static dimensions.
-The dtype is Boolean, signed or unsigned 8/16/32/64-bit integer, or
+Parameters use `T.Tensor(shape, dtype)` with positive static dimensions or a basic
+scalar dtype annotation. The dtype is Boolean, signed or unsigned 8/16/32/64-bit integer, or
 `float16`, `bfloat16`, `float32`, or `float64`. Tensor size and
 every intermediate integer index expression must fit signed 32-bit arithmetic.
 Runtime tensors are contiguous in row-major order, 16-byte aligned, on the same
 CUDA device, and have pairwise disjoint storage.
+Scalar arguments remain runtime inputs, interspersed with tensors in declaration
+order. Rebinding a parameter inside a kernel preserves its original input ABI.
 
 `@T.prim_func` captures a function whose source is available in a Python file.
 The body contains one `with T.Kernel(..., threads=...)` block. Grid dimensions
-are positive static integers within CUDA limits. Block and loop variables and
-scalar local assignments use fresh names. Names beginning with `_nt_` are reserved.
+are positive static integers within CUDA limits. Runtime scalar definitions,
+local allocations, and loop variables receive distinct internal identities.
+Source names can be rebound; existing values and buffer aliases keep their
+earlier identities. Names beginning with `_nt_` are reserved.
 
 Dtype symbols work as tensor dtype names and scalar casts within parsed bodies,
 for example `T.Tensor((32,), T.float32)` and `T.float32(value)`. Common aliases
@@ -114,18 +118,35 @@ that the source does not write retain their prior contents.
 
 ## Conditional statements
 
-`if`, `elif`, `else`, and `pass` preserve conditional execution. A scalar first
-defined in a branch is available after the conditional only when both paths
-define it. Joined scalars receive a common numeric type and a declaration before
-the generated CuTe branch. Fragment initialization must hold on both paths;
-conditionally updating an already initialized fragment is allowed.
+`if`, `elif`, `else`, and `pass` follow the default eager parser. A Python
+construction-time condition selects the source branch to expand. A runtime
+condition creates a conditional IR statement, and both source branches are
+constructed in order. Runtime values and buffer aliases created inside a branch
+retain that defining region and cannot be read after it. Fragment initialization
+must hold on both paths; conditionally updating an initialized fragment is allowed.
+
+Python scalar constants, tuples, and strings update during construction. For
+example, assigning `value = 1` and `value = 2` in the two arms of a runtime
+conditional leaves the Python value `2` after constructing those arms. Declare
+`value = T.alloc_var("int32")` before the conditional to make those assignments
+update a runtime scalar. Rebinding a runtime value to another expression creates
+a fresh immutable definition; ordinary aliases preserve their earlier values.
+Reallocating a buffer or local.var under the same source name similarly creates
+a separate allocation. Chained assignments capture their right-hand side before
+target updates and target-specific dtype conversions.
+
+Whitelisted construction expressions include built-in scalar arithmetic,
+comparisons, Boolean operations, tuples/dictionaries, indexing, dtype/operation
+aliases, and conditional expressions. Macro-returned Python values participate in
+these expressions. User Python function bodies and arbitrary object operators
+are not executed by the source parser. General container mutation, comprehensions,
+and remaining object/metadata APIs still need implementation.
 
 Branches inside `T.Parallel` can depend on element values. Collective operations
 remain outside parallel loops. At block scope, predicates use block-uniform
 indices and values, so every thread participates in any selected shared-memory
-barriers. Branch-dependent global write mappings remain outside the currently
-implemented ownership proof. `while`, scalar mutation, and loop exits still need
-implementation.
+barriers. Global writes use the disjoint-region and exclusive-branch ownership
+checks described above.
 
 `T.Select(condition, true_value, false_value, span=None)` selects between values
 with identical dtypes and a Boolean condition. Its value expressions can both
@@ -134,6 +155,11 @@ be evaluated; it does not provide a guard for division or memory operations.
 and matches the two branch dtypes using the scalar promotion rules. Generated
 code places branch-local loads and arithmetic inside the corresponding branch.
 Both forms compose with fragment communication and MMA epilogues.
+Chained Python comparisons follow the pinned eager AST rewrite: adjacent
+comparisons are combined through Boolean operations, and middle source
+expressions are repeated. A macro in a repeated runtime Boolean branch receives
+the upstream macro restriction. Static Boolean short-circuiting selects the
+construction expressions that execute.
 
 Local `name: T.dtype = expression` bindings follow the default upstream eager
 frontend: the expression determines the value dtype. The annotation is retained
@@ -162,7 +188,8 @@ more precise mutable ranges and ownership still requires loop-state analysis.
 after every body execution. Condition-local tensor loads and conditional
 expressions are regenerated at both evaluation sites, so updates remain visible.
 Mutable scalars retain their values through nested loops. The body may run zero
-times; its new bindings and buffer initialization do not escape the loop.
+times; its new runtime bindings and buffer initialization do not escape the loop.
+Python constant updates happen once while constructing the loop body.
 Uniform while loops may contain collective tile operations. Per-element loops
 inside `T.Parallel` retain the restriction against collective operations.
 Termination and absence of arithmetic overflow are caller preconditions for
@@ -227,10 +254,10 @@ wider type, with unsigned winning at equal width. Boolean converts to the other
 numeric operand's type. Bare arithmetic constants default to `int32`/`int64`
 or `float32`. Bitwise integer literals use the contextual rule above.
 
-These conversions apply before arithmetic and comparisons and when joining
-branch-defined scalars. For example, FP16 plus INT64 first converts the integer
+These conversions apply before runtime arithmetic, comparisons, and conditional
+expressions. For example, FP16 plus INT64 first converts the integer
 to FP16, so rounding can occur before addition. Both generated source and the
-reference evaluator apply the same conversion. Integer `/` requires an explicit
+reference evaluator apply the same conversion. Runtime integer `/` requires an explicit
 division choice or a floating cast, following the source language's ambiguity
 check. Logical operations require Boolean operands.
 

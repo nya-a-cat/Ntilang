@@ -20,12 +20,12 @@ implemented or validated compatibility.
 
 ## Current baseline
 
-Implementation revision: `446ff6e44435761500b69877f9075a1e6bf9b318`.
-[GitHub Actions run 34190311315](https://github.com/nya-a-cat/Ntilang/actions/runs/34190311315)
+Implementation revision: `95df89540523d04cef72d99c10228d3b2e590b42`.
+[GitHub Actions run 34192681449](https://github.com/nya-a-cat/Ntilang/actions/runs/34192681449)
 passed with NVIDIA CuTe DSL 4.7.1 and TVM FFI 0.1.11:
 
-- Linux: 1,430 semantic, native compilation, and host FFI checks passed.
-- Windows: 884 checks passed; 546 compiler-dependent checks were skipped.
+- Linux: 1,466 semantic, native compilation, and host FFI checks passed.
+- Windows: 907 checks passed; 559 compiler-dependent checks were skipped.
 - Both jobs deselected 29 GPU tests. No GPU execution was performed.
 - Source and wheel distributions built successfully.
 
@@ -38,7 +38,7 @@ Implemented areas, within the restrictions in
   temporary copy snapshots, and shared communication for cross-element reads.
 - Multidimensional and contiguous nested parallel loops; serial/unrolled loops
   with runtime start/stop and static steps; while, break, continue, conditionals,
-  scalar joins, and typed mutable local scalars.
+  construction-time values, lexical rebinding, and typed mutable local scalars.
 - Basic integer, Boolean, and floating types; numeric promotion, bitwise
   operations, integer division/remainder, conditional expressions, rounding,
   absolute value, classification, 23 transcendental operations, power, floating
@@ -85,8 +85,10 @@ work includes symbolic dimensions, defaults/keywords, vector types, and broader
 index-range analysis.
 Source macro expansion now covers hygienic calls, ordinary and reference
 arguments, nested calls, static recursive branches, and scalar/buffer/tuple
-returns. Broader Python bindings, object forms, and exits into caller scopes
-remain in the frontend work above.
+returns. Scalar/buffer rebinding, construction-time expressions, region checks,
+loop-name reuse and chained assignments now follow the eager source environment.
+General Python objects, container mutation, remaining metadata forms, and exits
+into caller scopes remain in the frontend work above.
 The upstream `pow_of_int` helper returns the base for nonpositive template
 exponents; the public `T.pow` adapter handles zero and negative exponents
 separately. This source distinction remains relevant to further parser work.

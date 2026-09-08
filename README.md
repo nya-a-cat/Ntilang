@@ -127,7 +127,9 @@ this TVM FFI conversion automatically.
 - Integer and Boolean bitwise operations, integer shifts, and their `T.bitwise_*` / `T.shift_*` spellings.
 - Floor/truncating integer division and remainder, expression `T.ceildiv` / `T.cdiv`, and `T.align_up`.
 - Static shapes; Boolean, signed/unsigned 8/16/32/64-bit integers, FP16, BF16, FP32, and FP64.
-- Conditional statements, branch-defined scalar values, and branch-aware fragment initialization.
+- Static Python branches, runtime conditional statements, and branch-aware fragment initialization.
+- Scalar rebinding, preserved value snapshots, buffer aliases and reallocation,
+  loop-variable reuse, tuple unpacking, and chained assignments.
 - Mutable `T.alloc_var` scalars with typed initialization, loop accumulation, and conditional updates.
 - `T.Select` and lazy `T.if_then_else`, including guarded division and bounded conditional indices.
 - Source-based `@T.macro` expansion with definition closures, nested calls,
@@ -148,6 +150,12 @@ the tile's matching parallel loop. Macros can allocate and return temporary
 buffers, use static branches, and call other macros. Returns inside runtime
 control flow and macro calls inside runtime Boolean branches retain upstream
 restrictions. Full parser and object compatibility remains in progress.
+
+Python constants update while the source is being constructed. Runtime scalar
+rebindings create distinct IR values; snapshots keep their earlier values.
+Declare `T.alloc_var` before a runtime branch or loop to carry updates through it.
+Runtime values created inside a control-flow region cannot escape that region.
+The [language semantics](docs/semantics.md) describe these eager binding rules.
 
 Fragments support element assignment and augmented assignment inside a
 matching parallel tile. MMA layouts propagate through pointwise operations and
