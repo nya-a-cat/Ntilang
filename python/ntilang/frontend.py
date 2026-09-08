@@ -27,6 +27,7 @@ from .ir import (
 )
 from .scalar import (
     BINARY_MATH_OPS,
+    BIT_COUNT_OPS,
     FAST_MATH_OPS,
     IEEE_MATH_OPS,
     TRANSCENDENTAL_OPS,
@@ -1064,6 +1065,23 @@ class Parser:
             if value is not NO_CONSTRUCTION_CALL:
                 return self.scalar_value(value, node)
             name = self.call_name(node)
+            if name == "reinterpret":
+                args = self.bind_call(node, ["dtype", "value", "span"], {"span": None})
+                values = {
+                    key: self.expr(arg) if key == "value" else self.static(arg) for key, arg in args.items()
+                }
+                if values["span"] is not None:
+                    self.fail(node, "Explicit source span objects require further parser integration")
+                return Expr(name, (values["value"],), TensorType((1,), values["dtype"]).dtype)
+            if name in BIT_COUNT_OPS:
+                if len(node.args) > 1:
+                    self.fail(node, f"T.{name} takes one positional argument")
+                args = self.bind_call(node, ["x", "dtype"], {"dtype": None})
+                # The pinned TileLang wrapper evaluates and discards keyword dtype.
+                values = {
+                    key: self.expr(arg) if key == "x" else self.macro_value(arg) for key, arg in args.items()
+                }
+                return Expr(name, (values["x"],))
             if name in IEEE_MATH_OPS:
                 parameters = ["x", "y", "z"][: IEEE_MATH_OPS[name][1]]
                 defaults = {} if name in ("fma", "fmul", "ieee_frsqrt") else {"rounding_mode": "rn"}

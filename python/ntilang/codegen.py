@@ -11,6 +11,7 @@ from .ir import DTYPES, CompileError, Expr, Kernel, Partition, ScalarParameter, 
 from .scalar import (
     BINARY_MATH_OPS,
     BINARY_NUMERIC_OPS,
+    BIT_COUNT_OPS,
     BITWISE_OPS,
     CHOICE_OPS,
     CLASSIFICATION_OPS,
@@ -83,6 +84,7 @@ class Emitter:
         self.mmas = {}
         self.math_externs = {}
         self.math_ptx = {}
+        self.bitcasts = {}
         self.math_header = any(requests_math_header(stmt.args) for stmt in walk(kernel.body))
         self.parallel = None
         self.control = None
@@ -343,6 +345,21 @@ class Emitter:
             self.depth -= 1
             return temp
         values = [self.expression(x) for x in expr.args]
+        if op in BIT_COUNT_OPS | {"reinterpret"}:
+            source = expression_dtype(expr.args[0], self.buffers, self.scalar_types)
+            dtype = expression_dtype(expr, self.buffers, self.scalar_types)
+            typ = f"cutlass.{CUTLASS_TYPES[dtype]}"
+            value = f"cutlass.{CUTLASS_TYPES[source]}({values[0]})"
+            if op == "reinterpret":
+                if source == dtype or "bool" in (source, dtype):
+                    # Valid C++ Boolean byte representations are 0 and 1. CuTe
+                    # stores the Boolean scalar in i1, so adapt that representation.
+                    return f"{typ}({value})"
+                helper = f"_nt_reinterpret_{source}_{dtype}"
+                self.bitcasts[helper] = (source, dtype)
+                return f"{helper}({value})"
+            operation = "popc" if op == "popcount" else "clz"
+            return f"{typ}(cute.arch.{operation}({value}))"
         if op in FAST_MATH_OPS:
             dtype = expression_dtype(expr, self.buffers, self.scalar_types)
             if op == "fast_rcp":
@@ -1027,9 +1044,20 @@ class Emitter:
         self.statements(self.kernel.body)
         self.depth = 0
         self.emit()
-        if self.math_ptx:
+        if self.math_ptx or self.bitcasts:
             self.emit("from cutlass.cutlass_dsl import dsl_user_op")
             self.emit("from cutlass._mlir.dialects import llvm")
+            self.emit()
+        for helper, (source, dtype) in sorted(self.bitcasts.items()):
+            typ = f"cutlass.{CUTLASS_TYPES[dtype]}"
+            self.emit("@dsl_user_op")
+            self.emit(f"def {helper}(arg: cutlass.{CUTLASS_TYPES[source]}, *, loc=None, ip=None):")
+            self.depth = 1
+            value = "arg.ir_value(loc=loc, ip=ip)"
+            if not (source.startswith(("int", "uint")) and dtype.startswith(("int", "uint"))):
+                value = f"llvm.bitcast({typ}.mlir_type, {value}, loc=loc, ip=ip)"
+            self.emit(f"return {typ}({value})")
+            self.depth = 0
             self.emit()
         for helper, (operation, dtype, arity) in sorted(self.math_ptx.items()):
             typ = f"cutlass.{CUTLASS_TYPES[dtype]}"

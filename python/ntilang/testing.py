@@ -12,10 +12,11 @@ import operator
 
 from .compiler import CompiledKernel
 from .floating import evaluate as evaluate_floating
-from .ir import Expr, ScalarParameter, integer_limits
+from .ir import DTYPES, Expr, ScalarParameter, integer_limits
 from .runtime import normalize_scalar
 from .scalar import (
     BINARY_MATH_OPS,
+    BIT_COUNT_OPS,
     CHOICE_OPS,
     FAST_MATH_OPS,
     IEEE_MATH_OPS,
@@ -160,6 +161,18 @@ def reference(kernel: CompiledKernel, *arrays):
         if e.op == "or":
             return any(args)
         dtype = expression_dtype(e, buffer_types, variable_types)
+        if e.op == "reinterpret":
+            source = expression_dtype(e.args[0], buffer_types, variable_types)
+            if "bfloat16" in (source, dtype):
+                raise TypeError("The NumPy evaluator does not support bfloat16 reinterpretation")
+            if dtype == "bool" and int(args[0]) not in (0, 1):
+                raise ValueError("Boolean reinterpretation requires a valid byte representation (0 or 1)")
+            return np.asarray(args[0], dtype=source).view(dtype)[()]
+        if e.op in BIT_COUNT_OPS:
+            width = DTYPES[expression_dtype(e.args[0], buffer_types, variable_types)] * 8
+            word = int(args[0]) & ((1 << width) - 1)
+            result = word.bit_count() if e.op == "popcount" else width - word.bit_length()
+            return cast(result, dtype)
         if e.op in FAST_MATH_OPS:
             # Ideal mathematical values; SFU approximation and FTZ are device
             # contracts and are not simulated by this reference evaluator.

@@ -1,8 +1,9 @@
 """Scalar type inference shared by source generation and IR evaluation."""
 
-from .ir import DTYPES, CompileError, integer_limits
+from .ir import DTYPES, CompileError, Expr, integer_limits
 
 BITWISE_OPS = frozenset(("&", "|", "^", "invert", "<<", ">>"))
+BIT_COUNT_OPS = frozenset(("popcount", "clz"))
 INTEGER_DIVISION_OPS = frozenset(("//", "%", "truncdiv", "truncmod", "ceildiv"))
 CHOICE_OPS = frozenset(("select", "if_then_else"))
 ROUNDING_OPS = frozenset(("floor", "ceil", "trunc", "round", "round_away", "nearbyint"))
@@ -113,6 +114,17 @@ def expression_dtype(expr, buffers, variables):
         return buffers[expr.value].type.dtype
     if expr.op in ("cast", "mutable", "parameter"):
         return expr.value
+    if expr.op == "reinterpret":
+        source = expression_dtype(expr.args[0], buffers, variables)
+        if DTYPES[source] != DTYPES[expr.value]:
+            raise CompileError("T.reinterpret requires identical source and destination bit widths")
+        return expr.value
+    if expr.op in BIT_COUNT_OPS:
+        dtype = expression_dtype(expr.args[0], buffers, variables)
+        allowed = ("uint32", "uint64") if expr.op == "popcount" else ("int32", "uint32", "int64", "uint64")
+        if dtype not in allowed:
+            raise CompileError(f"T.{expr.op} requires {' or '.join(allowed)} in the pinned CUDA lowering")
+        return dtype if expr.op == "popcount" else "int32"
     if expr.op == "pow_integer":
         return expression_dtype(expr.args[0], buffers, variables)
     if expr.op in FAST_MATH_OPS:
@@ -198,7 +210,22 @@ def constant_integer(expr, bindings):
             return resolve(bindings[value.value]) if value.value in bindings else None
         if value.op == "const" and type(value.value) in (int, bool):
             return int(value.value), expression_dtype(value, {}, {})
-        if value.op == "cast" and value.value.startswith(("int", "uint")):
+        if value.op in BIT_COUNT_OPS | {"reinterpret"}:
+            item = resolve(value.args[0])
+            if item is None:
+                return None
+            number, source = item
+            typed = Expr(value.op, (Expr("parameter", value=source),), value.value)
+            dtype = expression_dtype(typed, {}, {})
+            if value.op == "reinterpret":
+                if not dtype.startswith(("int", "uint")):
+                    return None
+                result = number
+            else:
+                width = DTYPES[source] * 8
+                word = number & ((1 << width) - 1)
+                result = word.bit_count() if value.op == "popcount" else width - word.bit_length()
+        elif value.op == "cast" and value.value.startswith(("int", "uint")):
             item = resolve(value.args[0])
             if item is None:
                 return None

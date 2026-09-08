@@ -6,6 +6,7 @@ from .ir import DTYPES, CompileError, Expr, Kernel, ScalarParameter, integer_lim
 from .scalar import (
     BINARY_MATH_OPS,
     BINARY_NUMERIC_OPS,
+    BIT_COUNT_OPS,
     BITWISE_OPS,
     CHOICE_OPS,
     FAST_MATH_OPS,
@@ -13,6 +14,7 @@ from .scalar import (
     INTEGER_DIVISION_OPS,
     ROUNDING_OPS,
     UNARY_MATH_OPS,
+    constant_integer,
     expression_dtype,
 )
 
@@ -112,6 +114,33 @@ def interval(expr, bounds, definitions, buffers=None):
     buffers = {} if buffers is None else buffers
     if expr.op == "const" and type(expr.value) is int:
         result = (expr.value, expr.value)
+    elif expr.op in BIT_COUNT_OPS:
+        resolved_dtype(expr, bounds, definitions, buffers)
+        source = resolved_dtype(expr.args[0], bounds, definitions, buffers)
+        known = constant_integer(expr, definitions)
+        # Full-width words are valid operands even though index arithmetic itself
+        # must fit int32. Recursive expression validation checks their load indices.
+        result = (0, DTYPES[source] * 8) if known is None else (known, known)
+    elif expr.op == "reinterpret":
+        dtype = resolved_dtype(expr, bounds, definitions, buffers)
+        if not (dtype.startswith(("int", "uint")) or dtype == "bool"):
+            raise CompileError("Data-dependent indices require an integer dtype")
+        source = resolved_dtype(expr.args[0], bounds, definitions, buffers)
+        type_low, type_high = integer_limits(dtype)
+        if source.startswith(("int", "uint")) or source == "bool":
+            try:
+                low, high = interval(expr.args[0], bounds, definitions, buffers)
+            except CompileError:
+                low, high = integer_limits(source)
+            modulus = type_high - type_low + 1
+            if dtype == "bool":
+                result = (0, 1)
+            elif (low - type_low) // modulus == (high - type_low) // modulus:
+                result = tuple((value - type_low) % modulus + type_low for value in (low, high))
+            else:
+                result = (type_low, type_high)
+        else:
+            result = (type_low, type_high)
     elif expr.op == "phi" or expr.op in CHOICE_OPS:
         alternatives = []
         for index, branch in enumerate(expr.args if expr.op == "phi" else expr.args[1:]):
@@ -258,6 +287,16 @@ def affine(expr, definitions, bounds=None, buffers=None):
     """Return constant and integer coefficients, or reject a non-affine expression."""
     if expr.op == "const" and type(expr.value) is int:
         return expr.value, {}
+    if expr.op in BIT_COUNT_OPS | {"reinterpret"}:
+        actual_bounds = {} if bounds is None else bounds
+        low, high = interval(expr, actual_bounds, definitions, buffers)
+        if low == high:
+            return low, {}
+        if expr.op == "reinterpret" and expr.value != "bool":
+            source_low, source_high = interval(expr.args[0], actual_bounds, definitions, buffers)
+            if low - source_low == high - source_high:
+                const, coeff = affine(expr.args[0], definitions, bounds, buffers)
+                return const + low - source_low, coeff
     if expr.op == "phi" or expr.op in CHOICE_OPS:
         alternatives = [
             affine(x, definitions, bounds, buffers)
@@ -358,6 +397,7 @@ def validate(kernel: Kernel):
         if (
             expr.op
             in BITWISE_OPS
+            | BIT_COUNT_OPS
             | BINARY_NUMERIC_OPS
             | BINARY_MATH_OPS
             | CHOICE_OPS
@@ -369,6 +409,7 @@ def validate(kernel: Kernel):
                 "or",
                 "not",
                 "pow_integer",
+                "reinterpret",
             }
         ):
             dtype = resolved_dtype(expr, bounds, definitions, buffers)
