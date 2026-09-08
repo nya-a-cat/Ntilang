@@ -104,8 +104,10 @@ def test_upstream_minmax_nan_reference():
 
 def test_dtype_alias_metadata():
     assert T.short == "int16" and T.short.bits == 16 and T.short.bytes == 2
-    assert T.bool.bits == 1 and T.bool.bytes == 1
+    assert T.bool.bits == 8 and T.bool.bytes == 1 and T.bool.type_code == 6
     assert T.Tensor((3,), "double").dtype == "float64"
+    assert T.dtype(int) == "int32" and T.get_tvm_dtype("ulong") == "uint64"
+    assert T.dtype("float16").lanes == 1 and T.dtype("float16").itemsize == 2
 
 
 REDUCTION_CASES = [(dtype, kind) for dtype in DTYPES for kind in ("sum", "max", "min")]

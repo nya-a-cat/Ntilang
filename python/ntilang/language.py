@@ -16,13 +16,41 @@ from .ir import DTYPE_ALIASES, DTYPES, TensorType
 class DType(str):
     """A dtype name that also denotes a scalar cast inside parsed kernels."""
 
+    def __new__(cls, value):
+        for builtin, name in ((builtins.bool, "bool"), (builtins.int, "int32"), (builtins.float, "float32")):
+            if value is builtin:
+                value = name
+                break
+        if type(value) not in (str, DType):
+            raise TypeError("dtype requires a supported name or Python scalar type")
+        value = DTYPE_ALIASES.get(value, value)
+        if value not in DTYPES:
+            raise ValueError(f"Unsupported dtype {value!r}")
+        return super().__new__(cls, value)
+
     @property
     def bits(self):
-        return 1 if self == "bool" else DTYPES[self] * 8
+        return DTYPES[self] * 8
 
     @property
     def bytes(self):
         return DTYPES[self]
+
+    @property
+    def itemsize(self):
+        return self.bytes
+
+    @property
+    def lanes(self):
+        return 1
+
+    @property
+    def type_code(self):
+        if self == "bool":
+            return 6
+        if self == "bfloat16":
+            return 4
+        return 1 if self.startswith("uint") else 0 if self.startswith("int") else 2
 
     def __call__(self, value):
         raise RuntimeError(f"T.{self}(value) is a scalar cast inside a @T.prim_func body")
@@ -34,8 +62,17 @@ for _dtype_name, _canonical_dtype in DTYPE_NAMES.items():
 del _dtype_name, _canonical_dtype
 
 
-def Tensor(shape, dtype="float32") -> TensorType:
-    return TensorType(tuple(shape), dtype)
+dtype = DType
+
+
+def get_tvm_dtype(value):
+    return value if type(value) is DType else DType(value)
+
+
+def Tensor(shape, dtype="float32", data=None, scope=None) -> TensorType:
+    if data is not None or scope not in (None, "global"):
+        raise ValueError("Tensor pointer bindings and non-global parameter scopes require further lowering")
+    return TensorType((shape,) if type(shape) is builtins.int else tuple(shape), DType(dtype))
 
 
 def ceildiv(lhs: int, rhs: int, span=None) -> int:

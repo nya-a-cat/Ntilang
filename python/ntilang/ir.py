@@ -24,6 +24,7 @@ DTYPE_ALIASES = {
     "short": "int16",
     "int": "int32",
     "uint": "uint32",
+    "ulong": "uint64",
     "long": "int64",
     "half": "float16",
     "float": "float32",
@@ -76,6 +77,8 @@ class Buffer:
     name: str
     type: TensorType
     space: str = "global"
+    strides: tuple[int, ...] = ()
+    source_scope: str | None = None
 
 
 @dataclass(frozen=True)

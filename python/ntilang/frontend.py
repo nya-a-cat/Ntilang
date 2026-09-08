@@ -10,7 +10,7 @@ import textwrap
 from contextlib import contextmanager
 from math import prod
 
-from . import language, macros
+from . import language, macros, metadata
 from .ir import (
     DTYPES,
     Buffer,
@@ -26,7 +26,9 @@ from .ir import (
     loop_controls,
 )
 from .scalar import BINARY_MATH_OPS, TRANSCENDENTAL_OPS, UNARY_MATH_OPS, constant_integer, expression_dtype
-from .validation import affine
+from .validation import affine, resolved_dtype
+
+NO_CONSTRUCTION_CALL = object()
 
 BINOPS = {
     ast.Add: "+",
@@ -103,6 +105,8 @@ class Parser:
         self.parallel_context = None
         self.mutable = {}
         self.bindings = {}
+        self.parameter_types = {}
+        self.before_launch = False
         self.loops = []
         self.values = {}
         self.pending = []
@@ -257,7 +261,87 @@ class Parser:
             self.fail(node, "Expected a Python construction-time value")
         if isinstance(value, (Expr, macros.ReferenceValue, macros.RegionValue, Buffer)):
             self.fail(node, "Expected a Python construction-time value")
+        if type(value) is language.DType:
+            return str(value)
         return value
+
+    def value_dtype(self, value, node):
+        if isinstance(value, macros.ReferenceValue):
+            target = value.target
+            if isinstance(target, ast.Subscript):
+                return language.DType(self.buffers[self.buffer_name(target.value)].type.dtype)
+            value = self.scalar_value(value, node)
+        if not isinstance(value, Expr):
+            self.fail(node, "Scalar dtype metadata requires an IR scalar expression")
+        definitions = {**self.bindings, **self.parameter_types}
+        definitions.update({name: Expr("mutable", value=dtype) for name, (dtype, _) in self.mutable.items()})
+        induction = {name: None for name in self.variables if name not in definitions}
+        return language.DType(resolved_dtype(value, induction, definitions, self.buffers))
+
+    def attribute_value(self, node):
+        owner = self.macro_value(node.value)
+        try:
+            if owner is language:
+                value = inspect.getattr_static(owner, node.attr, NO_CONSTRUCTION_CALL)
+                if value is NO_CONSTRUCTION_CALL:
+                    self.fail(node, f"Unknown language attribute {node.attr!r}")
+                return value
+            if isinstance(owner, Buffer):
+                return metadata.buffer_attribute(owner, node.attr)
+            if type(owner) is language.DType:
+                return metadata.dtype_attribute(owner, node.attr)
+            if isinstance(owner, (Expr, macros.ReferenceValue)) and node.attr == "dtype":
+                return self.value_dtype(owner, node)
+            if (
+                isinstance(owner, Expr)
+                and owner.op == "const"
+                and type(owner.value) is int
+                and node.attr == "value"
+            ):
+                return owner.value
+        except (TypeError, ValueError) as exc:
+            self.fail(node, str(exc))
+        self.fail(node, f"Unsupported construction-time attribute {node.attr!r}")
+
+    def construction_call(self, node):
+        target = self.macro_value(node.func)
+        if type(target) is language.DType:
+            if len(node.args) != 1 or node.keywords:
+                self.fail(node, "Scalar dtype conversion requires one positional argument")
+            return Expr("cast", (self.expr(node.args[0]),), str(target))
+        if isinstance(target, metadata.ScopeQuery):
+            self.bind_call(node, [], {})
+            return target.value
+        constructors = (
+            language.dtype,
+            language.get_tvm_dtype,
+            builtins.len,
+            builtins.tuple,
+            builtins.int,
+            builtins.str,
+        )
+        if not any(target is item for item in constructors):
+            return NO_CONSTRUCTION_CALL
+        if len(node.args) != 1 or node.keywords:
+            self.fail(node, "Construction-time conversion requires one positional argument")
+        value = self.macro_value(node.args[0])
+        try:
+            if target is language.dtype or target is language.get_tvm_dtype:
+                return language.get_tvm_dtype(value)
+            if target is builtins.len or target is builtins.tuple:
+                if type(value) not in (tuple, dict, str):
+                    self.fail(node, "Construction-time len/tuple requires a built-in container")
+                return target(value)
+            if target is builtins.int and isinstance(value, Expr):
+                known = constant_integer(value, {})
+                if known is None:
+                    self.fail(node, "int() requires a constant integer IR value")
+                return known
+            if type(value) in (int, float, bool, str, language.DType):
+                return target(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            self.fail(node, str(exc))
+        self.fail(node, "Unsupported construction-time conversion operand")
 
     def fresh(self, label):
         while True:
@@ -303,6 +387,14 @@ class Parser:
                 and node.id in self.constants
             ):
                 return self.constants[node.id]
+            if node.id not in self.local_names and hasattr(builtins, node.id):
+                return getattr(builtins, node.id)
+        if isinstance(node, ast.Attribute):
+            return self.attribute_value(node)
+        if isinstance(node, ast.Call):
+            value = self.construction_call(node)
+            if value is not NO_CONSTRUCTION_CALL:
+                return value
         if isinstance(node, ast.Constant):
             return node.value
         if isinstance(node, (ast.Tuple, ast.List)):
@@ -310,16 +402,17 @@ class Parser:
         if isinstance(node, ast.Dict) and all(key is not None for key in node.keys):
             return {self.static(key): self.macro_value(value) for key, value in zip(node.keys, node.values)}
         if isinstance(node, ast.Subscript):
-            if isinstance(node.value, ast.Name) and node.value.id in self.values:
-                value = self.values[node.value.id]
-                if isinstance(value, (tuple, dict)):
-                    try:
-                        return value[self.static(node.slice)]
-                    except (IndexError, KeyError, TypeError) as exc:
-                        self.fail(node, f"Invalid macro argument access: {exc}")
-            if not isinstance(node.value, ast.Name) or not isinstance(
-                self.values.get(node.value.id), (tuple, dict)
-            ):
+            value = self.macro_value(node.value)
+            if type(value) in (tuple, dict, str):
+                try:
+                    return value[self.static(node.slice)]
+                except (IndexError, KeyError, TypeError) as exc:
+                    self.fail(node, f"Invalid macro argument access: {exc}")
+            else:
+                node = ast.copy_location(
+                    ast.Subscript(value=macros.ValueNode(value, node.value), slice=node.slice, ctx=node.ctx),
+                    node,
+                )
                 parts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
                 if any(isinstance(part, ast.Slice) for part in parts):
                     name, origin, extents = self.region_spec(node)
@@ -439,6 +532,9 @@ class Parser:
         return ast.copy_location(result, node)
 
     def bind_macro_scalar(self, name, value, node):
+        if self.before_launch and not self.macro_stack:
+            self.check_prelude_expr(value, node)
+            return value
         self.pending.append(Statement("let", (name, value), self.location(node)))
         self.variables.add(name)
         self.bindings[name] = value
@@ -627,6 +723,8 @@ class Parser:
                 known = constant_integer(value, self.bindings)
                 if known is not None:
                     return known
+            if type(value) is tuple:
+                return tuple(self.static(macros.ValueNode(item, node)) for item in value)
             if type(value) in (int, float, str, bool, tuple, dict) or value is None:
                 return value
             self.fail(node, "Expected a static macro value")
@@ -634,11 +732,7 @@ class Parser:
             self.check_name(node)
         if isinstance(node, ast.Name) and node.id in self.values:
             return self.static(macros.ValueNode(self.values[node.id], node))
-        if (
-            isinstance(node, ast.Subscript)
-            and isinstance(node.value, ast.Name)
-            and isinstance(self.values.get(node.value.id), (tuple, dict))
-        ):
+        if isinstance(node, (ast.Attribute, ast.Subscript)):
             return self.static(macros.ValueNode(self.macro_value(node), node))
         if isinstance(node, ast.Name) and node.id in self.variables:
             known = constant_integer(Expr("var", value=node.id), self.bindings)
@@ -683,11 +777,8 @@ class Parser:
                 ast.NotEq: operator.ne,
             }
             return operations[type(node.ops[0])](self.static(node.left), self.static(node.comparators[0]))
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            if self.constants.get(node.value.id) is language and node.attr in language.DTYPE_NAMES:
-                return language.DTYPE_NAMES[node.attr]
-        if isinstance(node, ast.Call) and self.call_name(node) in ("ceildiv", "cdiv", "align_up"):
-            name = self.call_name(node)
+        name = self.optional_call_name(node)
+        if name in ("ceildiv", "cdiv", "align_up"):
             parameters = ["x", "y"] if name == "align_up" else ["lhs", "rhs", "span"]
             args = self.bind_call(node, parameters, {} if name == "align_up" else {"span": None})
             try:
@@ -695,7 +786,15 @@ class Parser:
                 return operation(*(self.static(args[key]) for key in parameters))
             except (TypeError, ValueError) as exc:
                 self.fail(node, str(exc))
+        if isinstance(node, ast.Call):
+            return self.static(macros.ValueNode(self.macro_value(node), node))
         self.fail(node, "Expected a static specialization constant")
+
+    def optional_call_name(self, node):
+        try:
+            return self.call_name(node)
+        except CompileError:
+            return None
 
     def keywords(self, node, allowed):
         result = {}
@@ -930,11 +1029,20 @@ class Parser:
             if node.id in self.variables:
                 return Expr("var", value=node.id)
             return Expr("const", value=self.static(node))
+        if isinstance(node, ast.Attribute):
+            return self.scalar_value(self.macro_value(node), node)
         if isinstance(node, ast.Subscript):
-            if isinstance(node.value, ast.Name) and isinstance(self.values.get(node.value.id), (tuple, dict)):
+            owner = self.macro_value(node.value)
+            if type(owner) in (tuple, dict, str):
+                node = ast.copy_location(
+                    ast.Subscript(value=macros.ValueNode(owner, node.value), slice=node.slice, ctx=node.ctx),
+                    node,
+                )
                 return self.scalar_value(self.macro_value(node), node)
-            name = self.buffer_name(node.value)
+            name = self.buffer_name(macros.ValueNode(owner, node.value))
             buf = self.buffers[name]
+            if self.before_launch:
+                self.fail(node, "Buffer reads before T.Kernel require host execution lowering")
             if buf.space != "global" and name not in self.initialized:
                 self.fail(node, f"Buffer {name} is read before initialization")
             indices = self.indices(node.slice)
@@ -944,6 +1052,9 @@ class Parser:
         if isinstance(node, (ast.BinOp, ast.UnaryOp, ast.Compare, ast.BoolOp, ast.IfExp)):
             return self.scalar_value(self.macro_value(node), node)
         if isinstance(node, ast.Call):
+            value = self.construction_call(node)
+            if value is not NO_CONSTRUCTION_CALL:
+                return self.scalar_value(value, node)
             name = self.call_name(node)
             if name in BINARY_MATH_OPS:
                 parameters = ["x1", "x2"] if name in ("atan2", "copysign") else ["x", "y"]
@@ -1242,6 +1353,11 @@ class Parser:
                 "assign", (name, Expr("cast", (self.scalar_value(value, node),), dtype)), self.location(node)
             )
         if isinstance(value, Expr):
+            if self.before_launch and not self.macro_stack:
+                self.check_prelude_expr(value, node)
+                self.values[name] = value
+                self.value_frames[name] = self.frames[-1]
+                return Statement("pass", (), self.location(node))
             known = constant_integer(value, {})
             if known is not None and expression_dtype(value, {}, {}) == "int32":
                 # Builder.bind converts an int32 IntImm back into a Python int.
@@ -1258,6 +1374,14 @@ class Parser:
             self.value_frames[name] = self.frames[-1]
         return Statement("pass", (), self.location(node))
 
+    def check_prelude_expr(self, value, node):
+        if value.op in ("load", "mutable"):
+            self.fail(node, "Buffer reads before T.Kernel require host execution lowering")
+        if value.op == "var" and value.value not in self.parameter_types:
+            self.fail(node, "Only pure scalar parameter expressions can be bound before T.Kernel")
+        for child in value.args:
+            self.check_prelude_expr(child, node)
+
     def assign_macro_result(self, target, value, node, *, parallel, nested):
         if isinstance(target, (ast.Tuple, ast.List)):
             if not isinstance(value, tuple) or len(target.elts) != len(value):
@@ -1266,6 +1390,8 @@ class Parser:
             def capture(item):
                 if isinstance(item, tuple):
                     return tuple(capture(child) for child in item)
+                if isinstance(item, Expr) and item.op == "const":
+                    return item
                 if isinstance(item, (Expr, macros.ReferenceValue)):
                     return self.bind_macro_scalar(self.fresh("unpack"), self.scalar_value(item, node), node)
                 return item
@@ -1317,6 +1443,8 @@ class Parser:
             if type(value) in (int, float, bool, str, tuple, dict, type(None)):
                 return self.statements(node.body if value else node.orelse, parallel=parallel, nested=nested)
             condition = self.scalar_value(value, node.test)
+            if self.before_launch:
+                self.fail(node, "Runtime control flow before T.Kernel requires host execution lowering")
             before_initialized = self.initialized.copy()
             with self.lexical_scope():
                 then_body = self.statements(node.body, parallel=parallel, nested=True)
@@ -1334,6 +1462,8 @@ class Parser:
                 self.fail(node, "Early exits require an enclosing serial, unroll, or while loop")
             return Statement("break" if isinstance(node, ast.Break) else "continue", (), loc)
         if isinstance(node, ast.While):
+            if self.before_launch:
+                self.fail(node, "Loops before T.Kernel require further construction-time lowering")
             if node.orelse:
                 self.fail(node, "Loop else clauses are not supported")
             value = self.macro_value(node.test)
@@ -1403,19 +1533,31 @@ class Parser:
                     target, self.macro_value(node.value), node, parallel=parallel, nested=nested
                 )
             if isinstance(target, ast.Name) and isinstance(node.value, ast.Call):
-                name = self.call_name(node.value)
+                name = self.optional_call_name(node.value)
                 if name == "alloc_var":
+                    if self.before_launch:
+                        self.fail(node, "Allocations before T.Kernel require host execution lowering")
                     return self.scalar_allocation(node.value, target)
                 if name in ("alloc_shared", "alloc_fragment"):
+                    if self.before_launch:
+                        self.fail(node, "Allocations before T.Kernel require host execution lowering")
                     if nested:
                         self.fail(node, "Allocate buffers directly inside T.Kernel, before loops")
                     if target.id.startswith("_nt_"):
                         self.fail(node, f"Reserved name {target.id}")
-                    if len(node.value.args) != 2 or node.value.keywords:
-                        self.fail(node, "Allocation requires (shape, dtype)")
-                    typ = TensorType(tuple(self.static(node.value.args[0])), self.static(node.value.args[1]))
+                    default_scope = "shared.dyn" if name == "alloc_shared" else "local.fragment"
+                    args = self.bind_call(node.value, ["shape", "dtype", "scope"], {"scope": default_scope})
+                    shape, dtype, scope = (self.static(args[key]) for key in ("shape", "dtype", "scope"))
+                    typ = TensorType((shape,) if type(shape) is int else tuple(shape), dtype)
+                    if name == "alloc_shared" and dtype == "bool":
+                        scope = "shared"
+                    if scope not in ("shared", "shared.dyn", "local.fragment"):
+                        self.fail(node, f"Allocation scope {scope!r} requires further memory lowering")
                     buf = Buffer(
-                        self.fresh(target.id), typ, "shared" if name == "alloc_shared" else "fragment"
+                        self.fresh(target.id),
+                        typ,
+                        "fragment" if scope == "local.fragment" else "shared",
+                        source_scope=scope,
                     )
                     self.buffers[buf.name] = buf
                     self.allocated.append(buf)
@@ -1443,6 +1585,8 @@ class Parser:
                     self.initialized.add(name)
                 return Statement("store", (name, idx, value), loc)
         if isinstance(node, ast.For):
+            if self.before_launch:
+                self.fail(node, "Loops before T.Kernel require further construction-time lowering")
             name = self.call_name(node.iter)
             if name not in ("Parallel", "serial", "Serial", "Pipelined", "unroll", "Unroll"):
                 self.fail(node, f"Unsupported loop {name}")
@@ -1582,9 +1726,17 @@ class Parser:
             elif not isinstance(annotation, TensorType):
                 node = param.annotation
                 if isinstance(node, ast.Call) and self.call_name(node) == "Tensor":
-                    if len(node.args) != 2 or node.keywords:
-                        self.fail(param, "Tensor parameters need T.Tensor(shape, dtype)")
-                    annotation = TensorType(tuple(self.static(node.args[0])), self.static(node.args[1]))
+                    args = self.bind_call(
+                        node,
+                        ["shape", "dtype", "data", "scope"],
+                        {"dtype": "float32", "data": None, "scope": None},
+                    )
+                    try:
+                        annotation = language.Tensor(
+                            *(self.static(args[key]) for key in ("shape", "dtype", "data", "scope"))
+                        )
+                    except (TypeError, ValueError) as exc:
+                        self.fail(param, str(exc))
                 else:
                     if node is None:
                         self.fail(param, "Every parameter needs T.Tensor(shape, dtype) or a scalar dtype")
@@ -1594,11 +1746,19 @@ class Parser:
             if param.arg.startswith("_nt_"):
                 self.fail(param, "Names starting with _nt_ are reserved")
             if isinstance(annotation, TensorType):
-                parameter = Buffer(param.arg, annotation)
+                parameter = Buffer(
+                    param.arg,
+                    annotation,
+                    strides=tuple(
+                        prod(annotation.shape[index + 1 :]) for index in range(len(annotation.shape))
+                    ),
+                    source_scope="global",
+                )
                 self.buffers[param.arg] = parameter
             else:
                 parameter = ScalarParameter(param.arg, annotation)
                 self.variables.add(param.arg)
+                self.parameter_types[param.arg] = Expr("parameter", value=parameter.dtype)
             self.value_frames[param.arg] = self.frames[-1]
             parameters.append(parameter)
         parameters = tuple(parameters)
@@ -1610,9 +1770,22 @@ class Parser:
             and isinstance(body[0].value.value, str)
         ):
             body = body[1:]
-        if len(body) != 1 or not isinstance(body[0], ast.With) or len(body[0].items) != 1:
-            self.fail(fn, "A kernel must contain one top-level with T.Kernel(...) block")
-        launch = body[0]
+        if (
+            not body
+            or not isinstance(body[-1], ast.With)
+            or len(body[-1].items) != 1
+            or any(isinstance(node, ast.With) for node in body[:-1])
+        ):
+            self.fail(fn, "A kernel must end with one top-level with T.Kernel(...) block")
+        self.before_launch = True
+        prefix = self.statements(body[:-1])
+        for statement in prefix:
+            if statement.op == "evaluate":
+                self.check_prelude_expr(statement.args[0], fn)
+            elif statement.op != "pass":
+                self.fail(fn, "Statements before T.Kernel require pure construction-time bindings")
+        self.before_launch = False
+        launch = body[-1]
         item = launch.items[0]
         call = item.context_expr
         if self.call_name(call) != "Kernel":
@@ -1631,14 +1804,18 @@ class Parser:
         )
         if len(targets) != len(grid) or any(not isinstance(t, ast.Name) for t in targets):
             self.fail(launch, "T.Kernel needs one block variable per grid dimension")
-        block_vars = tuple(t.id for t in targets)
-        if len(set(block_vars)) != len(block_vars) or any(
-            v in self.buffers or v in self.variables or v.startswith("_nt_") for v in block_vars
+        source_names = tuple(t.id for t in targets)
+        if len(set(source_names)) != len(source_names) or any(
+            v in self.buffers or v in self.variables or v.startswith("_nt_") for v in source_names
         ):
             self.fail(launch, "Duplicate or reserved block variable")
+        block_vars = tuple(self.fresh(name) if name in self.values else name for name in source_names)
         self.variables.update(block_vars)
-        self.value_frames.update({name: self.frames[-1] for name in block_vars})
-        statements = self.statements(launch.body)
+        with self.lexical_scope():
+            for name, canonical in zip(source_names, block_vars):
+                self.values[name] = Expr("var", value=canonical)
+                self.value_frames[name] = self.frames[-1]
+            statements = self.statements(launch.body)
         if not statements or not any(isinstance(p, Buffer) for p in parameters):
             self.fail(fn, "A kernel requires tensor parameters and statements")
         shared_bytes = 0
