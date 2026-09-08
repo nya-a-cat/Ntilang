@@ -30,7 +30,7 @@ uv sync --python 3.12 --extra cuda
 ```
 
 The checked compiler version is `nvidia-cutlass-dsl==4.7.1`, with
-`apache-tvm-ffi==0.1.4` for its Python tensor ABI. NVIDIA's compiler extra includes
+`apache-tvm-ffi==0.1.11` for its Python tensor/scalar ABI. NVIDIA's compiler extra includes
 native compiler libraries. Ntilang's own implementation and wheel are pure Python.
 
 ## Quick start

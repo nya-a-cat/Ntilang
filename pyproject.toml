@@ -13,7 +13,7 @@ authors = [{ name = "Ntilang contributors" }]
 dependencies = []
 
 [project.optional-dependencies]
-cuda = ["nvidia-cutlass-dsl==4.7.1; sys_platform == 'linux'", "apache-tvm-ffi==0.1.4; sys_platform == 'linux'"]
+cuda = ["nvidia-cutlass-dsl==4.7.1; sys_platform == 'linux'", "apache-tvm-ffi==0.1.11; sys_platform == 'linux'"]
 
 [dependency-groups]
 dev = ["pytest>=8.3,<10", "numpy>=2.0,<3", "ruff>=0.12,<1"]
