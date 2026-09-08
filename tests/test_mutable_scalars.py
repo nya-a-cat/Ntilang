@@ -84,17 +84,18 @@ def conditional_declaration():
     def kernel(B: T.Tensor((32,), "int32")):
         with T.Kernel(1, threads=32) as _bx:
             for i in T.Parallel(32):
+                acc = T.alloc_var("int32")
                 if i < 16:
-                    acc = T.alloc_var("int32", 2)
+                    acc = 2
                 else:
-                    acc = T.alloc_var("int32", 5)
+                    acc = 5
                 acc += i
                 B[i] = acc
 
     return ntilang.compile(kernel)
 
 
-def test_conditional_mutable_declarations():
+def test_conditionally_updated_mutable_declaration():
     out = np.empty(32, dtype=np.int32)
     reference(conditional_declaration(), out)
     np.testing.assert_array_equal(out, np.where(np.arange(32) < 16, 2, 5) + np.arange(32))
@@ -127,7 +128,7 @@ def test_mutable_output_ownership_is_not_inferred_from_initializer():
         ntilang.compile(bad)
 
 
-def test_conflicting_conditional_scalar_kinds_rejected():
+def test_conditional_declaration_cannot_escape_its_frame():
     @T.prim_func
     def bad(B: T.Tensor((32,), "int32")):
         with T.Kernel(1, threads=32) as _bx:
@@ -138,7 +139,7 @@ def test_conflicting_conditional_scalar_kinds_rejected():
                     acc = 0
                 B[i] = acc
 
-    with pytest.raises(ntilang.CompileError, match="agree in kind"):
+    with pytest.raises(ntilang.CompileError, match="defining region"):
         ntilang.compile(bad)
 
 

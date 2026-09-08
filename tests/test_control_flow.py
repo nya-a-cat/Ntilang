@@ -41,7 +41,7 @@ def uniform_collective():
     return ntilang.compile(kernel)
 
 
-def scalar_join():
+def branch_local_aliases():
     @T.prim_func
     def kernel(A: T.Tensor((93,), "float32"), B: T.Tensor((93,), "float32")):
         with T.Kernel(3, threads=32) as bx:
@@ -51,15 +51,18 @@ def scalar_join():
                     offset = bx * 32
                     index = offset + i
                     value = x * 2.0
+                    B[index] = value
                 else:
                     index = bx * 32 + i
                     value = -x
-                B[index] = value
+                    B[index] = value
 
     return ntilang.compile(kernel)
 
 
-@pytest.mark.parametrize("factory", [piecewise, conditional_fragment, uniform_collective, scalar_join])
+@pytest.mark.parametrize(
+    "factory", [piecewise, conditional_fragment, uniform_collective, branch_local_aliases]
+)
 def test_conditional_reference(factory):
     a = np.linspace(-2, 2, 93, dtype=np.float32)
     b = np.full_like(a, np.nan)
@@ -68,7 +71,7 @@ def test_conditional_reference(factory):
         piecewise: np.where(a < 0, -a, np.where(a < 1, a * a, a + 2)),
         conditional_fragment: np.abs(a) + (np.arange(93) % 32 < 16),
         uniform_collective: np.where(np.arange(93) // 32 % 2 == 0, a, -2),
-        scalar_join: np.where(a > 0, a * 2, -a),
+        branch_local_aliases: np.where(a > 0, a * 2, -a),
     }[factory]
     np.testing.assert_array_equal(b, expected)
 
@@ -121,15 +124,17 @@ def test_single_branch_local_does_not_escape():
         with T.Kernel(1, threads=32) as _bx:
             for i in T.Parallel(32):
                 if i < 16:
-                    value = 2.0
+                    value = i + 2.0
                 A[i] = value
 
-    with pytest.raises(ntilang.CompileError, match="static specialization"):
+    with pytest.raises(ntilang.CompileError, match="defining region"):
         ntilang.compile(bad)
 
 
 @pytest.mark.cuda
 @pytest.mark.skipif(importlib.util.find_spec("cutlass") is None, reason="CuTe DSL compiler is not installed")
-@pytest.mark.parametrize("factory", [piecewise, conditional_fragment, uniform_collective, scalar_join])
+@pytest.mark.parametrize(
+    "factory", [piecewise, conditional_fragment, uniform_collective, branch_local_aliases]
+)
 def test_conditional_cute_compilation(factory):
     assert factory().build().has_gpu_module

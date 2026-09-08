@@ -7,6 +7,7 @@ import builtins
 import inspect
 import operator
 import textwrap
+from contextlib import contextmanager
 from math import prod
 
 from . import language, macros
@@ -24,7 +25,7 @@ from .ir import (
     TensorType,
     loop_controls,
 )
-from .scalar import BINARY_MATH_OPS, TRANSCENDENTAL_OPS, UNARY_MATH_OPS, constant_integer
+from .scalar import BINARY_MATH_OPS, TRANSCENDENTAL_OPS, UNARY_MATH_OPS, constant_integer, expression_dtype
 from .validation import affine
 
 BINOPS = {
@@ -72,6 +73,16 @@ STATIC_OPS = {
 }
 
 
+def python_literal(value):
+    if type(value) in (int, float, bool, str, type(None)):
+        return True
+    if type(value) is tuple:
+        return all(python_literal(item) for item in value)
+    if type(value) is dict:
+        return all(python_literal(key) and python_literal(item) for key, item in value.items())
+    return False
+
+
 class Parser:
     def __init__(self, program: language.PrimFunc):
         self.function = program.function
@@ -98,6 +109,11 @@ class Parser:
         self.parse_context = (False, False)
         self.macro_stack = []
         self.boolean_macro_context = 0
+        self.frames = [object()]
+        self.value_frames = {}
+        self.local_names = {
+            n.id for n in ast.walk(self.node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+        } | {arg.arg for arg in self.node.args.args}
         self.name_counter = 0
         self.used_names = set(self.constants) | {
             n.id if isinstance(n, ast.Name) else n.arg
@@ -110,6 +126,138 @@ class Parser:
 
     def fail(self, node, message):
         raise CompileError(message, self.location(node))
+
+    @contextmanager
+    def lexical_scope(self):
+        self.frames.append(object())
+        try:
+            yield
+        finally:
+            self.frames.pop()
+
+    def check_name(self, node):
+        frame = self.value_frames.get(node.id)
+        if frame is not None and frame not in self.frames:
+            self.fail(node, f"Variable {node.id} is used outside its defining region")
+
+    def python_value(self, node):
+        """Evaluate whitelisted construction-time expressions without running user code."""
+        if isinstance(node, macros.ValueNode):
+            value = node.value
+        elif isinstance(node, ast.Constant):
+            value = node.value
+        elif isinstance(node, ast.Name):
+            self.check_name(node)
+            if node.id in self.values:
+                value = self.values[node.id]
+            elif node.id in self.variables or node.id in self.buffers or node.id in self.local_names:
+                self.fail(node, "Expected a Python construction-time value")
+            else:
+                value = self.constants.get(node.id, getattr(builtins, node.id, None))
+                if value is None and node.id not in self.constants:
+                    self.fail(node, "Expected a Python construction-time value")
+        elif isinstance(node, (ast.Tuple, ast.List)):
+            return tuple(self.python_value(item) for item in node.elts)
+        elif isinstance(node, ast.Dict) and all(key is not None for key in node.keys):
+            values = {}
+            for key, item in zip(node.keys, node.values):
+                key = self.python_value(key)
+                if not python_literal(key) or type(key) is dict:
+                    self.fail(node, "Construction-time dictionary keys require built-in immutable values")
+                values[key] = self.python_value(item)
+            return values
+        elif isinstance(node, ast.Subscript):
+            value, key = self.python_value(node.value), self.python_value(node.slice)
+            if type(value) not in (tuple, dict, str):
+                self.fail(node, "Construction-time indexing requires a tuple, dictionary, or string")
+            if not python_literal(key) or type(key) is dict:
+                self.fail(node, "Construction-time indices require built-in immutable values")
+            try:
+                return self.python_value(macros.ValueNode(value[key], node))
+            except (IndexError, KeyError, TypeError) as exc:
+                self.fail(node, f"Invalid construction-time index: {exc}")
+        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            owner = self.python_value(node.value)
+            if owner is language:
+                value = inspect.getattr_static(owner, node.attr, None)
+                if value is None:
+                    self.fail(node, "Unknown language attribute")
+            else:
+                self.fail(node, "Construction-time attributes require a language namespace")
+        elif isinstance(node, ast.BinOp) and type(node.op) in {*STATIC_OPS, ast.Div}:
+            left, right = self.python_value(node.left), self.python_value(node.right)
+            if type(left) not in (int, float, bool, str, tuple) or type(right) not in (
+                int,
+                float,
+                bool,
+                str,
+                tuple,
+            ):
+                self.fail(node, "Construction-time arithmetic requires built-in scalar or tuple values")
+            try:
+                return (operator.truediv if isinstance(node.op, ast.Div) else STATIC_OPS[type(node.op)])(
+                    left, right
+                )
+            except (TypeError, ValueError, ZeroDivisionError, OverflowError) as exc:
+                self.fail(node, f"Invalid construction-time arithmetic: {exc}")
+        elif isinstance(node, ast.UnaryOp):
+            value = self.python_value(node.operand)
+            operators = {
+                ast.UAdd: operator.pos,
+                ast.USub: operator.neg,
+                ast.Invert: operator.invert,
+                ast.Not: operator.not_,
+            }
+            if type(node.op) not in operators or type(value) not in (int, float, bool):
+                self.fail(node, "Unsupported construction-time unary expression")
+            return operators[type(node.op)](value)
+        elif isinstance(node, ast.Compare):
+            operators = {
+                ast.Lt: operator.lt,
+                ast.LtE: operator.le,
+                ast.Gt: operator.gt,
+                ast.GtE: operator.ge,
+                ast.Eq: operator.eq,
+                ast.NotEq: operator.ne,
+                ast.Is: operator.is_,
+                ast.IsNot: operator.is_not,
+                ast.In: lambda x, y: x in y,
+                ast.NotIn: lambda x, y: x not in y,
+            }
+            left = self.python_value(node.left)
+            for op, child in zip(node.ops, node.comparators):
+                right = self.python_value(child)
+                if (
+                    type(op) not in operators
+                    or type(left) not in (int, float, bool, str, tuple, type(None))
+                    or type(right) not in (int, float, bool, str, tuple, dict, type(None))
+                    or not python_literal(left)
+                    or not python_literal(right)
+                ):
+                    self.fail(node, "Unsupported construction-time comparison")
+                if not operators[type(op)](left, right):
+                    return False
+                left = right
+            return True
+        elif isinstance(node, ast.BoolOp):
+            value = self.python_value(node.values[0])
+            for child in node.values[1:]:
+                if type(value) not in (int, float, bool, str, tuple, dict, type(None)):
+                    self.fail(node, "Unsupported construction-time truth value")
+                if bool(value) == isinstance(node.op, ast.Or):
+                    return value
+                value = self.python_value(child)
+            return value
+        elif isinstance(node, ast.IfExp):
+            condition = self.python_value(node.test)
+            if type(condition) not in (int, float, bool, str, tuple, dict, type(None)):
+                self.fail(node, "Unsupported construction-time truth value")
+            return self.python_value(node.body if condition else node.orelse)
+        else:
+            self.fail(node, "Expected a Python construction-time value")
+        if isinstance(value, (Expr, macros.ReferenceValue, macros.RegionValue, Buffer)):
+            self.fail(node, "Expected a Python construction-time value")
+        return value
 
     def fresh(self, label):
         while True:
@@ -124,9 +272,11 @@ class Parser:
             return None
         fn = node.func
         value = None
-        if isinstance(fn, ast.Name) and fn.id not in self.variables:
+        if isinstance(fn, ast.Name) and (fn.id in self.values or fn.id not in self.variables):
+            self.check_name(fn)
             value = self.values.get(fn.id, self.constants.get(fn.id))
         elif isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name):
+            self.check_name(fn.value)
             owner = self.values.get(fn.value.id, self.constants.get(fn.value.id))
             if owner is not None:
                 value = inspect.getattr_static(owner, fn.attr, None)
@@ -138,13 +288,20 @@ class Parser:
         if self.macro_object(node) is not None:
             return self.expand_macro(node)
         if isinstance(node, ast.Name):
+            self.check_name(node)
             if node.id in self.values:
                 return self.values[node.id]
             if node.id in self.buffers:
                 return self.buffers[node.id]
             if node.id in self.mutable:
                 return macros.ReferenceValue(node)
-            if node.id not in self.variables and node.id in self.constants:
+            if node.id in self.variables:
+                return Expr("var", value=node.id)
+            if (
+                node.id not in self.variables
+                and node.id not in self.local_names
+                and node.id in self.constants
+            ):
                 return self.constants[node.id]
         if isinstance(node, ast.Constant):
             return node.value
@@ -160,8 +317,8 @@ class Parser:
                         return value[self.static(node.slice)]
                     except (IndexError, KeyError, TypeError) as exc:
                         self.fail(node, f"Invalid macro argument access: {exc}")
-            if isinstance(node.value, ast.Name) and (
-                node.value.id in self.buffers or isinstance(self.values.get(node.value.id), Buffer)
+            if not isinstance(node.value, ast.Name) or not isinstance(
+                self.values.get(node.value.id), (tuple, dict)
             ):
                 parts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
                 if any(isinstance(part, ast.Slice) for part in parts):
@@ -169,7 +326,7 @@ class Parser:
                     return macros.RegionValue(name, origin, extents)
                 return macros.ReferenceValue(self.element_node(node))
         try:
-            return self.static(node)
+            return self.python_value(node)
         except CompileError:
             return self.expr(node)
 
@@ -177,6 +334,8 @@ class Parser:
         if isinstance(value, Expr):
             return value
         if isinstance(value, macros.ReferenceValue):
+            if isinstance(value.target, ast.Name) and value.target.id in self.mutable:
+                return Expr("var", value=value.target.id)
             return self.expr(value.target)
         if type(value) in (int, float, bool):
             return Expr("const", value=value)
@@ -188,7 +347,7 @@ class Parser:
         if len(indices) != len(self.buffers[name].type.shape):
             self.fail(node, "Buffer element rank mismatch")
         result = ast.Subscript(
-            value=ast.copy_location(ast.Name(id=name, ctx=ast.Load()), node.value),
+            value=macros.ValueNode(self.buffers[name], node.value),
             slice=ast.copy_location(
                 ast.Tuple(elts=[macros.ValueNode(value, node) for value in indices], ctx=ast.Load()), node
             ),
@@ -255,21 +414,26 @@ class Parser:
         saved = (
             self.filename,
             self.first_line,
-            self.variables,
-            self.bindings,
-            self.mutable,
             self.values,
             self.constants,
             self.pending,
+            self.value_frames,
+            self.local_names,
         )
         self.filename, self.first_line = source.filename, source.first_line
-        self.variables, self.bindings, self.mutable = (
-            self.variables.copy(),
-            self.bindings.copy(),
-            self.mutable.copy(),
-        )
         self.values, self.constants = self.values.copy(), {**self.constants, **constants}
+        self.value_frames = self.value_frames.copy()
+        self.local_names = (
+            self.local_names
+            | {
+                part.id
+                for part in ast.walk(source.node)
+                if isinstance(part, ast.Name) and isinstance(part.ctx, ast.Store)
+            }
+            | {names[name] for name in bound.arguments}
+        )
         self.pending = []
+        self.frames.append(object())
         self.macro_stack.append((macro, len(self.loops)))
         try:
             for name, value in bound.arguments.items():
@@ -278,9 +442,12 @@ class Parser:
                 if macros.is_reference(annotation, source.environment):
                     self.values[formal] = self.capture_reference(value, source.node)
                 elif isinstance(value, (Expr, macros.ReferenceValue)):
-                    self.bind_macro_scalar(formal, self.scalar_value(value, source.node), source.node)
+                    self.values[formal] = self.bind_macro_scalar(
+                        formal, self.scalar_value(value, source.node), source.node
+                    )
                 else:
                     self.values[formal] = value
+                self.value_frames[formal] = self.frames[-1]
             expansion = self.pending
             self.pending = []
             queued, returned = list(body), None
@@ -299,7 +466,7 @@ class Parser:
                     break
                 if isinstance(statement, ast.If):
                     try:
-                        condition = self.static(statement.test)
+                        condition = self.python_value(statement.test)
                     except CompileError:
                         pass
                     else:
@@ -328,15 +495,15 @@ class Parser:
             expansion.extend(self.pending)
         finally:
             self.macro_stack.pop()
+            self.frames.pop()
             (
                 self.filename,
                 self.first_line,
-                self.variables,
-                self.bindings,
-                self.mutable,
                 self.values,
                 self.constants,
                 self.pending,
+                self.value_frames,
+                self.local_names,
             ) = saved
         self.pending.extend(expansion)
         return result
@@ -346,9 +513,11 @@ class Parser:
             self.fail(node, "Expected a language operation")
         fn = node.func
         if isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name):
-            if self.constants.get(fn.value.id) is language:
+            self.check_name(fn.value)
+            if self.values.get(fn.value.id, self.constants.get(fn.value.id)) is language:
                 return fn.attr
         if isinstance(fn, ast.Name):
+            self.check_name(fn)
             value = self.values.get(fn.id, self.constants.get(fn.id, getattr(builtins, fn.id, None)))
             if isinstance(value, language.DType):
                 return str(value)
@@ -367,11 +536,19 @@ class Parser:
     def static(self, node):
         if isinstance(node, macros.ValueNode):
             value = node.value
+            if isinstance(value, language.DType):
+                return str(value)
             if isinstance(value, Expr) and value.op == "const":
                 return value.value
+            if isinstance(value, Expr):
+                known = constant_integer(value, self.bindings)
+                if known is not None:
+                    return known
             if type(value) in (int, float, str, bool, tuple, dict) or value is None:
                 return value
             self.fail(node, "Expected a static macro value")
+        if isinstance(node, ast.Name):
+            self.check_name(node)
         if isinstance(node, ast.Name) and node.id in self.values:
             return self.static(macros.ValueNode(self.values[node.id], node))
         if (
@@ -389,6 +566,8 @@ class Parser:
             type(node.value) in (int, float, str, bool) or node.value is None
         ):
             return node.value
+        if isinstance(node, ast.Name) and node.id in self.local_names:
+            self.fail(node, f"Expected a static specialization constant; local {node.id} is not bound")
         if isinstance(node, ast.Name) and node.id in self.constants:
             value = self.constants[node.id]
             if isinstance(value, language.DType):
@@ -557,17 +736,17 @@ class Parser:
             self.fail(call, "alloc_var accepts at most three positional arguments")
         if scope != "local.var":
             self.fail(call, "alloc_var currently supports the local.var scope")
-        if (
-            target.id in self.variables
-            or target.id in self.buffers
-            or target.id in self.values
-            or target.id.startswith("_nt_")
-        ):
-            self.fail(target, f"Duplicate or reserved name {target.id}")
+        if target.id.startswith("_nt_"):
+            self.fail(target, f"Reserved name {target.id}")
         value = Expr("const", value=0) if optional_static(initializer) is None else self.expr(initializer)
-        self.variables.add(target.id)
-        self.mutable[target.id] = (dtype, self.parallel_context)
-        return Statement("declare", (target.id, dtype, Expr("cast", (value,), dtype)), self.location(call))
+        name = self.fresh(target.id)
+        self.variables.add(name)
+        self.mutable[name] = (dtype, self.parallel_context)
+        self.values[target.id] = macros.ReferenceValue(
+            ast.copy_location(ast.Name(id=name, ctx=ast.Load()), target)
+        )
+        self.value_frames[target.id] = self.frames[-1]
+        return Statement("declare", (name, dtype, Expr("cast", (value,), dtype)), self.location(call))
 
     def reduction(self, call, name, loc):
         kinds = {"sum", "abssum", "max", "absmax", "min", "bitand", "bitor", "bitxor"}
@@ -648,6 +827,13 @@ class Parser:
         return tuple(canonical(self.expr(p)) for p in parts)
 
     def expr(self, node):
+        try:
+            value = self.python_value(node)
+        except CompileError:
+            pass
+        else:
+            if type(value) in (int, float, bool):
+                return Expr("const", value=value)
         if isinstance(node, macros.ValueNode):
             return self.scalar_value(node.value, node)
         if self.macro_object(node) is not None:
@@ -655,13 +841,14 @@ class Parser:
         if isinstance(node, ast.Constant) and type(node.value) in (int, float, bool):
             return Expr("const", value=node.value)
         if isinstance(node, ast.Name):
+            self.check_name(node)
             if node.id in self.values:
                 return self.scalar_value(self.values[node.id], node)
             if node.id in self.variables:
                 return Expr("var", value=node.id)
             return Expr("const", value=self.static(node))
-        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
-            if isinstance(self.values.get(node.value.id), (tuple, dict)):
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Name) and isinstance(self.values.get(node.value.id), (tuple, dict)):
                 return self.scalar_value(self.macro_value(node), node)
             name = self.buffer_name(node.value)
             buf = self.buffers[name]
@@ -792,8 +979,15 @@ class Parser:
         self.fail(node, f"Unsupported expression: {ast.dump(node, include_attributes=False)}")
 
     def buffer_name(self, node):
-        if isinstance(node, ast.Name) and node.id in self.buffers:
-            return self.buffers[node.id].name
+        if isinstance(node, ast.Name):
+            self.check_name(node)
+            if node.id in self.values:
+                value = self.values[node.id]
+                if isinstance(value, Buffer):
+                    return value.name
+                self.fail(node, "Expected a declared buffer")
+            if node.id in self.buffers:
+                return self.buffers[node.id].name
         if isinstance(node, macros.ValueNode):
             value = node.value
         elif (
@@ -987,11 +1181,41 @@ class Parser:
 
     def assignment_target(self, target):
         if isinstance(target, ast.Name) and isinstance(self.values.get(target.id), macros.ReferenceValue):
+            self.check_name(target)
             return self.values[target.id].target
         return target
 
+    def bind_name(self, target, value, node):
+        name = target.id
+        if name.startswith("_nt_"):
+            self.fail(node, f"Reserved name {name}")
+        if isinstance(value, macros.ReferenceValue):
+            value = self.scalar_value(value, node)
+        if name in self.mutable and (isinstance(value, Expr) or type(value) in (int, float, bool)):
+            dtype, owner = self.mutable[name]
+            if owner != self.parallel_context:
+                self.fail(node, "Declare mutable scalars inside the parallel loop that updates them")
+            return Statement(
+                "assign", (name, Expr("cast", (self.scalar_value(value, node),), dtype)), self.location(node)
+            )
+        if isinstance(value, Expr):
+            known = constant_integer(value, {})
+            if known is not None and expression_dtype(value, {}, {}) == "int32":
+                # Builder.bind converts an int32 IntImm back into a Python int.
+                self.values[name] = known
+                return Statement("pass", (), self.location(node))
+            canonical = self.fresh(name)
+            self.variables.add(canonical)
+            self.bindings[canonical] = value
+            self.values[name] = Expr("var", value=canonical)
+            self.value_frames[name] = self.frames[-1]
+            return Statement("let", (canonical, value), self.location(node))
+        self.values[name] = value
+        if not isinstance(value, (int, float, str, tuple)):
+            self.value_frames[name] = self.frames[-1]
+        return Statement("pass", (), self.location(node))
+
     def assign_macro_result(self, target, value, node, *, parallel, nested):
-        loc = self.location(node)
         if isinstance(target, (ast.Tuple, ast.List)):
             if not isinstance(value, tuple) or len(target.elts) != len(value):
                 self.fail(node, "Macro tuple unpacking requires matching target and result lengths")
@@ -1014,16 +1238,11 @@ class Parser:
                     self.pending = previous_pending
                 result.extend(statement if isinstance(statement, tuple) else (statement,))
             return tuple(result)
-        if isinstance(target, ast.Name) and isinstance(value, (Buffer, macros.RegionValue, tuple, dict, str)):
-            if (
-                target.id in self.variables
-                or target.id in self.buffers
-                or target.id in self.values
-                or target.id.startswith("_nt_")
-            ):
-                self.fail(node, f"Cannot assign to {target.id}")
-            self.values[target.id] = value
-            return Statement("pass", (), loc)
+        if isinstance(target, ast.Name):
+            if isinstance(value, (Expr, macros.ReferenceValue)) or type(value) in (int, float, bool):
+                target = self.assignment_target(target)
+            if isinstance(target, ast.Name):
+                return self.bind_name(target, value, node)
         assignment = ast.copy_location(
             ast.Assign(targets=[target], value=macros.ValueNode(value, node)), node
         )
@@ -1038,61 +1257,30 @@ class Parser:
             if not isinstance(dtype, str) or dtype not in DTYPES:
                 self.fail(node, "Local scalar annotations require a supported scalar dtype")
             if node.value is None:
-                if node.target.id not in self.variables:
+                if node.target.id not in self.variables and node.target.id not in self.values:
                     self.fail(node, "An annotation alone does not initialize a scalar value")
+                self.check_name(node.target)
                 return Statement("pass", (), loc)
             # The default upstream eager Builder.bind uses the value dtype;
             # its annotation argument does not insert a numeric conversion.
             assignment = ast.Assign(targets=[node.target], value=node.value)
             ast.copy_location(assignment, node)
             statement = self.statement(assignment, parallel=parallel, nested=nested)
-            if statement.op != "let":
-                self.fail(node, "Scalar annotations require scalar value bindings")
+            if isinstance(statement, tuple):
+                self.fail(node, "Scalar annotations require one value binding")
             return Statement(statement.op, statement.args, loc, (("scalar_annotation", dtype),))
         if isinstance(node, ast.If):
-            if self.macro_stack:
-                try:
-                    condition = self.static(node.test)
-                except CompileError:
-                    pass
-                else:
-                    if type(condition) in (int, float, bool):
-                        return self.statements(
-                            node.body if condition else node.orelse, parallel=parallel, nested=nested
-                        )
-            condition = self.expr(node.test)
-            before_vars = self.variables.copy()
+            value = self.macro_value(node.test)
+            if type(value) in (int, float, bool, str, tuple, dict, type(None)):
+                return self.statements(node.body if value else node.orelse, parallel=parallel, nested=nested)
+            condition = self.scalar_value(value, node.test)
             before_initialized = self.initialized.copy()
-            before_mutable = self.mutable.copy()
-            before_bindings = self.bindings.copy()
-            before_values = self.values.copy()
-            then_body = self.statements(node.body, parallel=parallel, nested=True)
-            then_vars, then_initialized = self.variables.copy(), self.initialized.copy()
-            then_mutable = self.mutable.copy()
-            then_bindings = self.bindings.copy()
-            then_values = self.values.copy()
-            self.variables = before_vars
-            self.initialized = before_initialized
-            self.mutable = before_mutable
-            self.bindings = before_bindings
-            self.values = before_values
-            else_body = self.statements(node.orelse, parallel=parallel, nested=True)
-            self.variables.intersection_update(then_vars)
-            self.initialized.intersection_update(then_initialized)
-            for name in self.variables:
-                if self.mutable.get(name) != then_mutable.get(name):
-                    self.fail(node, "Conditional scalar declarations must agree in kind, dtype, and scope")
-            self.mutable = {name: info for name, info in self.mutable.items() if name in self.variables}
-            self.bindings = {
-                name: value
-                for name, value in self.bindings.items()
-                if name in self.variables and then_bindings.get(name) == value
-            }
-            self.values = {
-                name: value
-                for name, value in self.values.items()
-                if name in then_values and then_values[name] == value
-            }
+            with self.lexical_scope():
+                then_body = self.statements(node.body, parallel=parallel, nested=True)
+                then_initialized = self.initialized.copy()
+                self.initialized = before_initialized
+                else_body = self.statements(node.orelse, parallel=parallel, nested=True)
+                self.initialized.intersection_update(then_initialized)
             return Statement("if", (condition, then_body, else_body), loc)
         if isinstance(node, ast.Pass):
             return Statement("pass", (), loc)
@@ -1105,41 +1293,49 @@ class Parser:
         if isinstance(node, ast.While):
             if node.orelse:
                 self.fail(node, "Loop else clauses are not supported")
-            condition = self.expr(node.test)
-            if condition.op == "const":
-                if condition.value:
+            value = self.macro_value(node.test)
+            if type(value) in (int, float, bool, str, tuple, dict, type(None)):
+                if value:
                     self.fail(node, "A statically true while condition is an infinite loop")
                 condition = Expr("const", value=False)
-            before_vars = self.variables.copy()
+            else:
+                condition = self.scalar_value(value, node.test)
             before_initialized = self.initialized.copy()
-            before_mutable = self.mutable.copy()
-            before_bindings = self.bindings.copy()
-            before_values = self.values.copy()
             self.loops.append("while")
-            body = self.statements(node.body, parallel=parallel, nested=True)
-            self.loops.pop()
-            self.variables = before_vars
+            try:
+                with self.lexical_scope():
+                    body = self.statements(node.body, parallel=parallel, nested=True)
+            finally:
+                self.loops.pop()
             self.initialized = before_initialized
-            self.mutable = before_mutable
-            self.bindings = before_bindings
-            self.values = before_values
             return Statement("while", (condition, body), loc)
         if isinstance(node, ast.AugAssign):
             target = self.assignment_target(node.target)
             if isinstance(target, ast.Subscript):
                 target = self.element_node(target)
-            node = ast.copy_location(ast.AugAssign(target=target, op=node.op, value=node.value), node)
-            mutable_target = isinstance(node.target, ast.Name) and node.target.id in self.mutable
-            if not (isinstance(node.target, ast.Subscript) or mutable_target) or type(node.op) not in BINOPS:
-                self.fail(node, "Augmented assignment requires a tensor element or T.alloc_var scalar")
+            if isinstance(target, ast.Name):
+                value = self.macro_value(target)
+                if isinstance(value, (Buffer, macros.RegionValue)):
+                    self.fail(node, "Buffer augmented assignment requires an element target")
+            if not isinstance(target, (ast.Name, ast.Subscript)) or type(node.op) not in BINOPS:
+                self.fail(node, "Augmented assignment requires a scalar or tensor element")
             assignment = ast.Assign(
-                targets=[node.target], value=ast.BinOp(left=node.target, op=node.op, right=node.value)
+                targets=[node.target if isinstance(node.target, ast.Name) else target],
+                value=ast.BinOp(left=target, op=node.op, right=node.value),
             )
             ast.copy_location(assignment, node)
             ast.fix_missing_locations(assignment)
             return self.statement(assignment, parallel=parallel, nested=nested)
+        if isinstance(node, ast.Assign) and len(node.targets) > 1:
+            value = self.macro_value(node.value)
+            if isinstance(value, (Expr, macros.ReferenceValue)):
+                value = self.bind_macro_scalar(self.fresh("chained"), self.scalar_value(value, node), node)
+            targets = ast.copy_location(ast.Tuple(elts=node.targets, ctx=ast.Store()), node)
+            return self.assign_macro_result(
+                targets, (value,) * len(node.targets), node, parallel=parallel, nested=nested
+            )
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            target = self.assignment_target(node.targets[0])
+            target = node.targets[0]
             if isinstance(target, ast.Subscript):
                 # The eager parser calls assign_slice(buffer, indices, value).
                 # Expand each target expression once, before the value's macros.
@@ -1152,9 +1348,7 @@ class Parser:
                 return self.assign_macro_result(
                     target, self.macro_value(node.value), node, parallel=parallel, nested=nested
                 )
-            if isinstance(node.value, macros.ValueNode) and isinstance(
-                node.value.value, (Buffer, macros.RegionValue, tuple, dict, str)
-            ):
+            if isinstance(node.value, macros.ValueNode) and isinstance(target, ast.Name):
                 return self.assign_macro_result(
                     target, node.value.value, node, parallel=parallel, nested=nested
                 )
@@ -1172,39 +1366,25 @@ class Parser:
                 if name in ("alloc_shared", "alloc_fragment"):
                     if nested:
                         self.fail(node, "Allocate buffers directly inside T.Kernel, before loops")
-                    if (
-                        target.id in self.variables
-                        or target.id in self.buffers
-                        or target.id in self.values
-                        or target.id.startswith("_nt_")
-                    ):
-                        self.fail(node, f"Duplicate or reserved name {target.id}")
+                    if target.id.startswith("_nt_"):
+                        self.fail(node, f"Reserved name {target.id}")
                     if len(node.value.args) != 2 or node.value.keywords:
                         self.fail(node, "Allocation requires (shape, dtype)")
                     typ = TensorType(tuple(self.static(node.value.args[0])), self.static(node.value.args[1]))
-                    buf = Buffer(target.id, typ, "shared" if name == "alloc_shared" else "fragment")
+                    buf = Buffer(
+                        self.fresh(target.id), typ, "shared" if name == "alloc_shared" else "fragment"
+                    )
                     self.buffers[buf.name] = buf
                     self.allocated.append(buf)
+                    self.values[target.id] = buf
+                    self.value_frames[target.id] = self.frames[-1]
                     return Statement("alloc", (buf.name,), loc)
             idx = self.indices(target.slice) if isinstance(target, ast.Subscript) else None
-            value = self.expr(node.value)
+            value = self.macro_value(node.value)
             if isinstance(target, ast.Name):
-                if target.id in self.mutable:
-                    dtype, owner = self.mutable[target.id]
-                    if owner != self.parallel_context:
-                        self.fail(node, "Declare mutable scalars inside the parallel loop that updates them")
-                    return Statement("assign", (target.id, Expr("cast", (value,), dtype)), loc)
-                if (
-                    target.id in self.variables
-                    or target.id in self.buffers
-                    or target.id in self.values
-                    or target.id.startswith("_nt_")
-                ):
-                    self.fail(node, f"Cannot assign to {target.id}")
-                self.variables.add(target.id)
-                self.bindings[target.id] = value
-                return Statement("let", (target.id, value), loc)
-            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                return self.assign_macro_result(target, value, node, parallel=parallel, nested=nested)
+            value = self.scalar_value(value, node)
+            if isinstance(target, ast.Subscript):
                 name = self.buffer_name(target.value)
                 if not parallel:
                     self.fail(node, "Scalar tensor stores require a T.Parallel loop")
@@ -1239,12 +1419,10 @@ class Parser:
                 extents = tuple(self.static(a) for a in node.iter.args)
             if not targets or any(not isinstance(t, ast.Name) for t in targets):
                 self.fail(node, "Loop targets must be names")
-            names = tuple(t.id for t in targets)
-            if len(set(names)) != len(names) or any(
-                n in self.variables or n in self.buffers or n in self.values or n.startswith("_nt_")
-                for n in names
-            ):
+            source_names = tuple(t.id for t in targets)
+            if len(set(source_names)) != len(source_names) or any(n.startswith("_nt_") for n in source_names):
                 self.fail(node, "Loop variables must have unique, non-reserved names")
+            names = tuple(self.fresh(label) for label in source_names)
             if name == "Parallel":
                 Partition(extents, self.threads)
                 if len(names) != len(extents):
@@ -1278,23 +1456,21 @@ class Parser:
                     self.fail(node, "Explicit unroll requires static loop bounds")
             if node.orelse:
                 self.fail(node, "Loop else clauses are not supported")
-            old_vars = self.variables.copy()
             old_initialized = self.initialized.copy()
             old_parallel = self.parallel_context
-            old_mutable = self.mutable.copy()
-            old_bindings = self.bindings.copy()
-            old_values = self.values.copy()
             self.variables.update(names)
             if name == "Parallel":
                 self.parallel_context = (extents, names)
             self.loops.append(name)
-            body = self.statements(loop_body, parallel=parallel or name == "Parallel", nested=True)
-            self.loops.pop()
-            self.variables = old_vars
+            try:
+                with self.lexical_scope():
+                    for source_name, canonical in zip(source_names, names):
+                        self.values[source_name] = Expr("var", value=canonical)
+                        self.value_frames[source_name] = self.frames[-1]
+                    body = self.statements(loop_body, parallel=parallel or name == "Parallel", nested=True)
+            finally:
+                self.loops.pop()
             self.parallel_context = old_parallel
-            self.mutable = old_mutable
-            self.bindings = old_bindings
-            self.values = old_values
             controls = loop_controls(body)
             if name != "Parallel" and (not static_domain or not range(*extents) or controls):
                 self.initialized = old_initialized
@@ -1380,6 +1556,7 @@ class Parser:
             else:
                 parameter = ScalarParameter(param.arg, annotation)
                 self.variables.add(param.arg)
+            self.value_frames[param.arg] = self.frames[-1]
             parameters.append(parameter)
         parameters = tuple(parameters)
         body = fn.body
@@ -1417,6 +1594,7 @@ class Parser:
         ):
             self.fail(launch, "Duplicate or reserved block variable")
         self.variables.update(block_vars)
+        self.value_frames.update({name: self.frames[-1] for name in block_vars})
         statements = self.statements(launch.body)
         if not statements or not any(isinstance(p, Buffer) for p in parameters):
             self.fail(fn, "A kernel requires tensor parameters and statements")

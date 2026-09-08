@@ -35,17 +35,14 @@ def mixed_comparison():
     return ntilang.compile(kernel)
 
 
-def mixed_branch_join():
+def mixed_conditional_value():
     @T.prim_func
     def kernel(
         A: T.Tensor((33,), "float16"), Integers: T.Tensor((33,), "int64"), Output: T.Tensor((33,), "float64")
     ):
         with T.Kernel(2, threads=32) as bx:
             for i in T.Parallel(32):
-                if i % 2 == 0:
-                    value = A[bx * 32 + i]
-                else:
-                    value = Integers[bx * 32 + i]
+                value = T.if_then_else(i % 2 == 0, A[bx * 32 + i], Integers[bx * 32 + i])
                 Output[bx * 32 + i] = T.float64(value)
 
     return ntilang.compile(kernel)
@@ -95,11 +92,11 @@ def test_mixed_comparison_converts_before_comparing():
     np.testing.assert_array_equal(out, np.ones(33, dtype=np.bool_))
 
 
-def test_branch_join_preserves_the_selected_float_type():
+def test_conditional_value_preserves_the_selected_float_type():
     a = np.full(33, 2048, dtype=np.float16)
     i = np.full(33, 2049, dtype=np.int64)
     out = np.empty(33, dtype=np.float64)
-    reference(mixed_branch_join(), a, i, out)
+    reference(mixed_conditional_value(), a, i, out)
     np.testing.assert_array_equal(out, np.full(33, 2048.0))
 
 
@@ -145,7 +142,9 @@ def test_logical_operation_requires_boolean_operand():
 
 @pytest.mark.cuda
 @pytest.mark.skipif(importlib.util.find_spec("cutlass") is None, reason="CuTe DSL compiler is not installed")
-@pytest.mark.parametrize("factory", [mixed_arithmetic, mixed_comparison, mixed_branch_join, contextual_shift])
+@pytest.mark.parametrize(
+    "factory", [mixed_arithmetic, mixed_comparison, mixed_conditional_value, contextual_shift]
+)
 def test_scalar_semantic_compilation(factory):
     assert factory().build().has_gpu_module
 

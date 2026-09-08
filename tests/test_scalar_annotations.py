@@ -28,7 +28,7 @@ def test_eager_annotations_preserve_value_type(dtype):
     b = np.empty_like(a)
     reference(kernel, a, b)
     np.testing.assert_array_equal(b, a + np.float32(0.5))
-    binding = next(stmt for stmt in walk(kernel.ir.body) if stmt.op == "let" and stmt.args[0] == "value")
+    binding = next(stmt for stmt in walk(kernel.ir.body) if stmt.op == "let" and stmt.args[1].op == "+")
     assert dict(binding.annotations)["scalar_annotation"] == dtype
 
 
@@ -39,14 +39,15 @@ def annotated_branch():
             for i in T.Parallel(32):
                 if i < 16:
                     value: T.int32 = A[i] + 0.5
+                    B[i] = value
                 else:
                     value: T.float64 = A[i] * 2.5
-                B[i] = value
+                    B[i] = value
 
     return ntilang.compile(kernel)
 
 
-def test_annotated_branch_values_join():
+def test_annotated_branch_local_values():
     a = np.arange(32, dtype=np.float32)
     b = np.empty_like(a)
     reference(annotated_branch(), a, b)

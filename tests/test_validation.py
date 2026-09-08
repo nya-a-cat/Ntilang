@@ -63,16 +63,15 @@ def test_input_output_read_write_is_rejected():
         ntilang.compile(bad)
 
 
-def test_reassigned_loop_variable_is_rejected():
+def test_rebound_block_name_preserves_physical_launch_domain():
     @T.prim_func
-    def bad(A: T.Tensor((32,), "float32")):
+    def good(A: T.Tensor((32,), "float32")):
         with T.Kernel(1, threads=32) as _bx:
             _bx = 1
             for i in T.Parallel(32):
                 A[i] = 1.0
 
-    with pytest.raises(ntilang.CompileError, match="Cannot assign"):
-        ntilang.compile(bad)
+    assert ntilang.compile(good).ir.grid == (1,)
 
 
 def test_alias_indices_can_be_proved():
