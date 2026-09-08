@@ -37,6 +37,10 @@ scalar and buffer-element updates and capture region origins at macro entry.
 Expanded statements participate in the existing ownership and initialization
 checks. Scalar annotations on ordinary macro arguments preserve the argument's
 dtype, following the default eager builder.
+Scalar stores expand the target buffer and indices before the value expression.
+Tuple assignment captures scalar values before binding targets and preserves
+the order of target updates and any macro expansions within those targets.
+Element references capture their indices before updates in the called macro.
 
 Macro statements are emitted at the call's construction position. This includes
 expansion before a while loop and expansion of both macro arguments to a scalar

@@ -20,12 +20,12 @@ implemented or validated compatibility.
 
 ## Current baseline
 
-Implementation revision: `806a3ab3af7980b6cf49cebe5295caaad56a34d5`.
-[GitHub Actions run 34187693666](https://github.com/nya-a-cat/Ntilang/actions/runs/34187693666)
+Implementation revision: `446ff6e44435761500b69877f9075a1e6bf9b318`.
+[GitHub Actions run 34190311315](https://github.com/nya-a-cat/Ntilang/actions/runs/34190311315)
 passed with NVIDIA CuTe DSL 4.7.1 and TVM FFI 0.1.11:
 
-- Linux: 1,395 semantic, native compilation, and host FFI checks passed.
-- Windows: 863 checks passed; 532 compiler-dependent checks were skipped.
+- Linux: 1,430 semantic, native compilation, and host FFI checks passed.
+- Windows: 884 checks passed; 546 compiler-dependent checks were skipped.
 - Both jobs deselected 29 GPU tests. No GPU execution was performed.
 - Source and wheel distributions built successfully.
 
@@ -47,6 +47,9 @@ Implemented areas, within the restrictions in
   epilogues, and propagation of compatible fragment ownership layouts.
 - Conservative ownership, initialization, alias, index-range, and shared-memory
   checks, with a serial NumPy reference evaluator.
+- Hygienic source macros with scalar, buffer, region, and tuple values;
+  reference arguments; static recursive expansion; and ordered call/assignment
+  effects in the flattened IR.
 
 The reference evaluator does not model device scheduling or Tensor Core
 rounding. Native compilation establishes compiler acceptance and binary

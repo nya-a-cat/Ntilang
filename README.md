@@ -130,6 +130,24 @@ this TVM FFI conversion automatically.
 - Conditional statements, branch-defined scalar values, and branch-aware fragment initialization.
 - Mutable `T.alloc_var` scalars with typed initialization, loop accumulation, and conditional updates.
 - `T.Select` and lazy `T.if_then_else`, including guarded division and bounded conditional indices.
+- Source-based `@T.macro` expansion with definition closures, nested calls,
+  scalar/buffer/tuple results, and `T.Ref` scalar, element, and region arguments.
+
+Macros use the same source parser and checks as kernel bodies. Ordinary scalar
+arguments capture their value at macro entry. Annotating an argument with `T.Ref`
+lets its assignments update the caller's mutable scalar or tensor element:
+
+```python
+@T.macro
+def add_to(value: T.Ref, amount):
+    value += amount
+```
+
+Call `add_to(local, 2)` for a `T.alloc_var` scalar, or `add_to(tile[i], 2)` within
+the tile's matching parallel loop. Macros can allocate and return temporary
+buffers, use static branches, and call other macros. Returns inside runtime
+control flow and macro calls inside runtime Boolean branches retain upstream
+restrictions. Full parser and object compatibility remains in progress.
 
 Fragments support element assignment and augmented assignment inside a
 matching parallel tile. MMA layouts propagate through pointwise operations and
