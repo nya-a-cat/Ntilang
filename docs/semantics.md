@@ -406,6 +406,39 @@ rejected. A constant left shift can participate in the affine ownership proof.
 Masks can bound input indices, while general bitwise output permutations still
 require additional ownership analysis.
 
+`T.reinterpret(dtype, value, span=None)` preserves the scalar's storage bits and
+requires equal source and destination widths. The 13 basic dtypes form 43 legal
+same-width pairs, including identities and FP16/BF16 pairs. Generated helpers
+use LLVM bitcasts for floating representations and reuse integer SSA bits for
+signedness changes. The Boolean dtype has 8-bit source metadata and an i1 CuTe
+scalar representation; conversions use valid C++ Boolean bytes (0 or 1).
+An integer-to-Boolean reinterpretation requires one of those two byte values.
+The NumPy evaluator rejects invalid Boolean representations and preserves
+negative zero and NaN payloads through typed byte views. It currently rejects
+BF16 reinterpretation; generated BF16 helpers have separate native checks.
+Vector, sub-byte, pointer, and non-default span forms remain open.
+
+`T.popcount(x)` accepts uint32/uint64 and preserves the input dtype.
+`T.clz(x)` accepts int32/uint32/int64/uint64 and returns int32. These are the
+pinned CUDA intrinsic dispatch rules. Both accept the TileLang wrapper's
+keyword-only `dtype` argument, which is evaluated and discarded. Argument
+construction order, including macro effects in that keyword, is preserved.
+The generated code uses typed CuTe `arch.popc` and `arch.clz` operations.
+For this CUDA target, `clz(0)` returns 32 or 64; negative signed inputs have
+zero leading zeros. The generic TIR documentation leaves zero unspecified,
+whereas the [CUDA integer intrinsic contract](https://docs.nvidia.com/cuda/archive/12.9.1/cuda-math-api/cuda_math_api/group__CUDA__MATH__INTRINSIC__INT.html)
+defines the word-width result.
+
+Bit counts have bounds from zero through the operand width. They can index
+33/65-element lookup tables even when their input words span all 64 bits.
+Underlying buffer addresses still undergo the normal index checks. Integer
+reinterpretation tracks signedness changes modulo the word width; a conversion
+with a single constant offset preserves affine ownership. Counts of runtime
+data retain the general restriction on non-affine output ownership.
+CPU-only CuTe tests execute generated one-way FP16/FP32/FP64 helpers and
+FP16/BF16/FP32/FP64 roundtrips against raw bit patterns. These checks establish
+host execution behavior; GPU execution remains deferred.
+
 `T.maximum` and `T.minimum` propagate NaNs. Floating-point operations follow
 their explicit CUDA library or instruction path above, including the native
 low-precision approximations. Bitwise identity with NumPy is not specified.

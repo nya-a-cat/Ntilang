@@ -148,6 +148,19 @@ uses explicit common-type conversions. Static shift counts, unsigned index
 inversion, and narrow index overflow have dedicated checks. General bitwise
 output permutations and non-default source span objects remain open.
 
+Scalar `reinterpret(dtype, value, span=None)` supports the 43 equal-width pairs
+among the basic dtypes, preserving floating bit patterns and integer signedness
+interpretation. Boolean byte conversions require valid 0/1 representations.
+`popcount` accepts uint32/uint64 and retains the input dtype; `clz` accepts
+32/64-bit integers and returns int32, including the CUDA-defined word-width
+result at zero. Their evaluated/discarded `dtype` keyword follows the facade
+wrapper. Bounded counts support full-width input words used for table lookup.
+Constant aliases and affine integer reinterpretation participate in index
+analysis. Native tests cover all basic pairs and count paths; CPU-only generated
+helper tests inspect raw floating bit patterns, including BF16 roundtrips.
+The NumPy evaluator still lacks BF16 storage. Vector/sub-byte/pointer forms,
+remaining bit utilities, non-default spans, and GPU execution remain open.
+
 Numeric promotion follows the pinned TIR matching source across arithmetic,
 comparisons, and conditional expressions. Floating/integer pairs preserve the floating
 operand's dtype. Bitwise integer literals adopt the other operand's integer

@@ -20,12 +20,12 @@ implemented or validated compatibility.
 
 ## Current baseline
 
-Implementation revision: `965ea529c6eb02902b8d1967eaf139669d061727`.
-[GitHub Actions run 34199535154](https://github.com/nya-a-cat/Ntilang/actions/runs/34199535154)
+Implementation revision: `bc6fa70dd2ae2c525dd8dce289a32b306ec2d05a`.
+[GitHub Actions run 34201208555](https://github.com/nya-a-cat/Ntilang/actions/runs/34201208555)
 passed with NVIDIA CuTe DSL 4.7.1 and TVM FFI 0.1.11:
 
-- Linux: 1,926 semantic, native compilation, and host FFI checks passed.
-- Windows: 1,166 checks passed; 760 compiler-dependent checks were skipped.
+- Linux: 2,199 semantic, native compilation, and host FFI checks passed.
+- Windows: 1,373 checks passed; 826 compiler-dependent checks were skipped.
 - Both jobs deselected 29 GPU tests. No GPU execution was performed.
 - Source and wheel distributions built successfully.
 
@@ -42,7 +42,8 @@ Implemented areas, within the restrictions in
   with runtime start/stop and static steps; while, break, continue, conditionals,
   construction-time values, lexical rebinding, and typed mutable local scalars.
 - Basic integer, Boolean, and floating types; numeric promotion, bitwise
-  operations, integer division/remainder, conditional expressions, rounding,
+  operations, scalar reinterpretation, population/leading-zero counts,
+  integer division/remainder, conditional expressions, rounding,
   absolute value, classification, 23 transcendental operations, power, floating
   remainder, `atan2`, `copysign`, `hypot`, `nextafter`, `ldexp`, explicit scalar
   IEEE rounding, FMA, the explicit multiply boundary, and nine fast-math calls.
@@ -94,6 +95,12 @@ and header aliases. Sigmoid preserves the typed exponential/addition/division
 composition. Further work includes vector forms, remaining low-precision
 inverse functions, compiler flags, and hardware validation of these numerical
 contracts.
+Scalar reinterpretation now covers equal-width basic types; popcount/clz
+preserve the CUDA operand and result type rules. Bit-count bounds admit
+full-width source words in lookup indices, while affine integer reinterpretation
+retains checked output ownership. CPU-only generated helpers expose raw
+floating bit patterns and BF16 roundtrips through host output storage. Remaining
+work includes vector/sub-byte/pointer forms, other bit utilities, and GPU checks.
 Basic runtime scalar parameters now pass through mixed tensor/scalar signatures,
 typed CuTe arguments, host validation, and reference evaluation. Further argument
 work includes symbolic dimensions, defaults/keywords, vector types, and broader
