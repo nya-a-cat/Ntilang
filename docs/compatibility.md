@@ -187,6 +187,18 @@ checks and native/standalone compilation cover this path.
 General constant folding, power expressions in integer index analysis, other
 binary functions, and device-level numerical parity remain open.
 
+Scalar `ieee_add`, `ieee_sub`, `ieee_mul`, `ieee_fmaf`, `ieee_frcp`,
+`ieee_fsqrt`, and `ieee_fdiv` preserve four FP32/FP64 rounding modes and
+first-operand type conversion. `ieee_frsqrt` supplies its one-argument FP32
+rounded path. FP16/BF16 support `rn`, retaining CUDA's native arithmetic and
+approximate root/reciprocal/division instruction sequences. `fma` and `fmul`
+require matching operand types and preserve fused or explicit multiply
+boundaries. An exact arithmetic oracle checks single rounding and special
+values. For low-precision approximate operations the oracle gives ideal values;
+hardware approximation behavior and numerical parity remain unverified.
+See [scalar arithmetic](semantics.md#scalar-arithmetic) for the target rules,
+FTZ behavior, and reference limits. Vector forms and fast-math APIs remain open.
+
 Local scalar annotations preserve the expression dtype according to the default
 eager frontend, including branch-local values and captured specialization dtype names.
 Legacy TIR annotation semantics and buffer annotations remain open.

@@ -286,6 +286,43 @@ for [hypot](https://docs.nvidia.com/cuda/libdevice-users-guide/__nv_hypotf.html)
 and [ldexp](https://docs.nvidia.com/cuda/libdevice-users-guide/__nv_ldexpf.html).
 Reference checks cover these boundary cases; GPU numerical behavior remains unverified.
 
+`T.ieee_add(x, y)`, `ieee_sub`, `ieee_mul`, `ieee_fdiv`, `ieee_fmaf(x, y, z)`,
+`ieee_frcp(x)`, and `ieee_fsqrt(x)` accept a static `rounding_mode`, defaulting
+to `"rn"`. The modes are nearest with ties to even (`rn`), toward zero (`rz`),
+toward positive infinity (`ru`), and toward negative infinity (`rd`). FP32 and
+FP64 use the corresponding typed CUDA libdevice calls. Arguments convert to
+the first operand's dtype before the operation. `T.ieee_frsqrt(x)` accepts one
+argument and uses the correctly rounded FP32 reciprocal-square-root intrinsic;
+the pinned TileLang CUDA lowering rejects FP64 for this operation.
+`T.fma(x, y, z)` and `T.fmul(x, y)` require identical floating argument dtypes
+and use nearest rounding. FMA rounds its product-plus-sum once; fmul preserves
+an explicit multiply boundary. These signatures and restrictions follow
+[TileLang's scalar intrinsics](https://github.com/tile-ai/tilelang/blob/62bba8d20ddb232e29050770472cb2649dd3e718/tilelang/language/math_intrinsics.py)
+and [CUDA math extension](https://github.com/tile-ai/tilelang/blob/62bba8d20ddb232e29050770472cb2649dd3e718/tilelang/cuda/language/math.py).
+
+FP16/BF16 accept `rn` only for these interfaces. Generated standalone helpers
+use native half arithmetic and FMA instructions. On SM80 through SM89, BF16
+add/subtract/multiply use the CUDA header's BF16 FMA identities; SM90 and newer
+use direct BF16 instructions. FP16 reciprocal, square root, and reciprocal
+square root widen to FP32 approximate instructions with FTZ, then convert back.
+Their BF16 counterparts use FP32 approximate instructions without FTZ.
+FP16 division retains the approximate reciprocal and the two FMA corrections
+for a nonzero rounded result below half bit pattern `0x008f`. BF16 division
+scales denominators with magnitude at least `2**126`, performs approximate
+division, and rescales with FMA. These instruction choices follow the CUDA
+12.9 device headers; [PTX instruction semantics](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)
+define the approximation and rounding behavior. Half/BF16 root and division
+paths inherit those approximations. Their numerical results have not been
+measured on hardware.
+
+The reference evaluator uses exact rational arithmetic and integer square-root
+comparisons for explicit rounding. Its checks include FMA cancellation and
+intermediate overflow, rounding midpoints, directed underflow/overflow, signed
+zeros, infinities, and NaNs. For the approximate low-precision operations it
+supplies ideal mathematical reference values. It does not simulate approximate
+instruction results or NaN payloads. BF16 buffer evaluation remains unsupported;
+the internal scalar oracle can represent BF16 values for arithmetic checks.
+
 Integer expressions support `&`, `|`, `^`, `~`, `<<`, and `>>`, together with
 `T.bitwise_and`, `T.bitwise_or`, `T.bitwise_xor`, `T.bitwise_not`, `T.shift_left`,
 and `T.shift_right`. Function spellings accept their upstream operand keyword
