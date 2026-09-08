@@ -128,6 +128,7 @@ class Parser:
             n.id for n in ast.walk(self.node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
         } | {arg.arg for arg in self.node.args.args}
         self.name_counter = 0
+        self.source_names = {}
         self.used_names = set(self.constants) | {
             n.id if isinstance(n, ast.Name) else n.arg
             for n in ast.walk(self.node)
@@ -314,6 +315,10 @@ class Parser:
 
     def construction_call(self, node):
         target = self.macro_value(node.func)
+        if target is language.print or target is language.device_assert:
+            name = "print" if target is language.print else "device_assert"
+            self.pending.append(self.debug_statement(node, name, node, self.parse_context[0]))
+            return None
         if type(target) is language.DType:
             if len(node.args) != 1 or node.keywords:
                 self.fail(node, "Scalar dtype conversion requires one positional argument")
@@ -358,6 +363,7 @@ class Parser:
             name = f"_macro_{self.name_counter}_{label}"
             if name not in self.used_names:
                 self.used_names.add(name)
+                self.source_names[name] = self.source_names.get(label, label)
                 return name
 
     def macro_object(self, node):
@@ -622,7 +628,8 @@ class Parser:
         )
         self.pending = []
         self.frames.append(object())
-        self.macro_stack.append((macro, len(self.loops)))
+        call_location = SourceLocation(saved[0], saved[1] + call.lineno - 1, call.col_offset)
+        self.macro_stack.append((macro, len(self.loops), call_location))
         try:
             for name, value in bound.arguments.items():
                 formal = names[name]
@@ -1065,6 +1072,17 @@ class Parser:
             if value is not NO_CONSTRUCTION_CALL:
                 return self.scalar_value(value, node)
             name = self.call_name(node)
+            if name == "likely":
+                if len(node.args) > 2:
+                    self.fail(node, "T.likely takes at most two positional arguments")
+                args = self.bind_call(node, ["cond", "span", "dtype"], {"span": None, "dtype": None})
+                values = {
+                    key: self.expr(arg) if key == "cond" else self.macro_value(arg)
+                    for key, arg in args.items()
+                }
+                if values["span"] is not None:
+                    self.fail(node, "Explicit source span objects require further parser integration")
+                return Expr(name, (values["cond"],))
             if name == "reinterpret":
                 args = self.bind_call(node, ["dtype", "value", "span"], {"span": None})
                 values = {
@@ -1455,8 +1473,74 @@ class Parser:
         )
         return self.statement(assignment, parallel=parallel, nested=nested)
 
+    def debug_statement(self, call, name, node, parallel):
+        if self.before_launch:
+            self.fail(node, "Device diagnostics must appear inside T.Kernel")
+        defaults = (
+            {"obj": None, "msg": "", "warp_group_id": 0, "warp_id": 0}
+            if name == "print"
+            else {"msg": "", "no_stack_info": False}
+        )
+        parameters = list(defaults) if name == "print" else ["condition", *defaults]
+        arguments = self.bind_call(call, parameters, defaults)
+        values = {key: self.macro_value(value) for key, value in arguments.items()}
+        if type(values["msg"]) is not str:
+            self.fail(node, "Diagnostic messages must be construction-time strings")
+        message = values["msg"]
+        if name == "device_assert":
+            if type(values["no_stack_info"]) is not bool:
+                self.fail(node, "no_stack_info must be a construction-time Boolean")
+            condition = self.scalar_value(values["condition"], node)
+            if not values["no_stack_info"]:
+                message += "\n"
+                owner = self.macro_stack[-1][0].__name__ if self.macro_stack else self.node.name
+                frames = [(owner, self.location(node))]
+                for index in range(len(self.macro_stack) - 1, -1, -1):
+                    owner = self.macro_stack[index - 1][0].__name__ if index else self.node.name
+                    frames.append((owner, self.macro_stack[index][2]))
+                message += "".join(f"  at {loc.filename}:{loc.line} in {owner}\n" for owner, loc in frames)
+            return Statement(name, (Expr("cast", (condition,), "bool"), message), self.location(node))
+        obj = values["obj"]
+        if isinstance(obj, macros.ReferenceValue):
+            obj = self.scalar_value(obj, node)
+        if any(type(values[key]) is not int for key in ("warp_group_id", "warp_id")):
+            self.fail(node, "Print warp selectors must be construction-time integers")
+        main_lane = values["warp_group_id"] * 128 + values["warp_id"] * 32
+        if isinstance(obj, Buffer):
+            if obj.space != "global" and obj.name not in self.initialized:
+                self.fail(node, f"Buffer {obj.name} is read before initialization")
+            if obj.space == "fragment" and parallel:
+                self.fail(
+                    node, "Printing a full fragment requires uniform collective execution outside T.Parallel"
+                )
+            if not message and obj.space != "global":
+                message = f"buffer<{obj.source_name or obj.name}, {obj.type.dtype}>"
+        elif isinstance(obj, Expr):
+            if not message:
+                text = ast.unparse(arguments["obj"])
+                for canonical, original in self.source_names.items():
+                    text = text.replace(canonical, original)
+                message = f"expr<{text}>"
+        elif obj is None:
+            if not message:
+                self.fail(node, "Message-only T.print requires a nonempty message")
+        else:
+            self.fail(node, "T.print expects a buffer, scalar IR expression, or None")
+        return Statement("print", (obj, message, main_lane), self.location(node))
+
     def statement(self, node, *, parallel=False, nested=False):
         loc = self.location(node)
+        if isinstance(node, ast.Assert):
+            condition = self.macro_value(node.test)
+            message = self.macro_value(node.msg) if node.msg is not None else "Assertion failed"
+            if isinstance(condition, (Expr, macros.ReferenceValue)):
+                self.fail(
+                    node,
+                    "Runtime Python assert requires host error lowering; use T.device_assert inside T.Kernel",
+                )
+            if not condition:
+                raise AssertionError(message)
+            return Statement("pass", (), loc)
         if isinstance(node, ast.AnnAssign):
             if not isinstance(node.target, ast.Name):
                 self.fail(node, "Local scalar annotations require a name target")
@@ -1596,6 +1680,7 @@ class Parser:
                         typ,
                         "fragment" if scope == "local.fragment" else "shared",
                         source_scope=scope,
+                        source_name=self.source_names.get(target.id, target.id),
                     )
                     self.buffers[buf.name] = buf
                     self.allocated.append(buf)
@@ -1713,6 +1798,10 @@ class Parser:
                     return Statement("evaluate", (self.scalar_value(result, call),), loc)
                 return Statement("pass", (), loc)
             name = self.call_name(call)
+            if name in ("print", "device_assert"):
+                return self.debug_statement(call, name, node, parallel)
+            if name == "likely":
+                return Statement("evaluate", (self.expr(call),), loc)
             if name in ("loop_break", "break_loop", "continue_loop"):
                 parameters = [] if name == "loop_break" else ["span"]
                 arguments = self.bind_call(call, parameters, {} if not parameters else {"span": None})
@@ -1828,7 +1917,7 @@ class Parser:
         call = item.context_expr
         if self.call_name(call) != "Kernel":
             self.fail(call, "Expected T.Kernel")
-        grid = tuple(self.static(a) for a in call.args)
+        grid = tuple(self.static(a) for a in call.args) or (1,)
         if not 1 <= len(grid) <= 3 or any(type(x) is not int or x <= 0 for x in grid):
             self.fail(call, "Kernel grid needs one to three positive static dimensions")
         if grid[0] > 2**31 - 1 or any(x > 65535 for x in grid[1:]):
@@ -1840,6 +1929,8 @@ class Parser:
             if isinstance(item.optional_vars, (ast.Tuple, ast.List))
             else [item.optional_vars]
         )
+        if item.optional_vars is None:
+            targets = [ast.Name(id=self.fresh(f"block{axis}")) for axis in range(len(grid))]
         if len(targets) != len(grid) or any(not isinstance(t, ast.Name) for t in targets):
             self.fail(launch, "T.Kernel needs one block variable per grid dimension")
         source_names = tuple(t.id for t in targets)
@@ -1854,8 +1945,8 @@ class Parser:
                 self.values[name] = Expr("var", value=canonical)
                 self.value_frames[name] = self.frames[-1]
             statements = self.statements(launch.body)
-        if not statements or not any(isinstance(p, Buffer) for p in parameters):
-            self.fail(fn, "A kernel requires tensor parameters and statements")
+        if not statements:
+            self.fail(fn, "A kernel requires statements")
         shared_bytes = 0
         for buffer in self.allocated:
             if buffer.space == "shared":

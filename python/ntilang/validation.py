@@ -42,6 +42,8 @@ def resolved_dtype(expr, bounds, definitions, buffers, *, ignore_predicates=Fals
 def predicate_bounds(condition, truth, bounds, definitions, buffers=None):
     """Refine an integer interval for a necessary single-variable predicate."""
     buffers = {} if buffers is None else buffers
+    if condition.op == "likely":
+        return predicate_bounds(condition.args[0], truth, bounds, definitions, buffers)
     if condition.op == "const" and type(condition.value) is bool:
         return bounds.copy() if condition.value == truth else None
     if condition.op == "var" and condition.value in definitions:
@@ -112,6 +114,8 @@ def predicate_bounds(condition, truth, bounds, definitions, buffers=None):
 def interval(expr, bounds, definitions, buffers=None):
     """Bound every intermediate operation in an integer index expression."""
     buffers = {} if buffers is None else buffers
+    if expr.op == "likely":
+        return interval(expr.args[0], bounds, definitions, buffers)
     if expr.op == "const" and type(expr.value) is int:
         result = (expr.value, expr.value)
     elif expr.op in BIT_COUNT_OPS:
@@ -285,6 +289,8 @@ def interval(expr, bounds, definitions, buffers=None):
 
 def affine(expr, definitions, bounds=None, buffers=None):
     """Return constant and integer coefficients, or reject a non-affine expression."""
+    if expr.op == "likely":
+        return affine(expr.args[0], definitions, bounds, buffers)
     if expr.op == "const" and type(expr.value) is int:
         return expr.value, {}
     if expr.op in BIT_COUNT_OPS | {"reinterpret"}:
@@ -516,6 +522,13 @@ def validate(kernel: Kernel):
                     definitions[args[0]] = args[1]
                 elif op == "evaluate":
                     expression(args[0], bounds, definitions)
+                elif op in ("print", "device_assert"):
+                    if isinstance(args[0], Expr):
+                        before_reads = reads.copy()
+                        expression(args[0], bounds, definitions)
+                        # Diagnostic observations do not feed numeric output.
+                        # Their inter-thread order remains unspecified.
+                        reads.intersection_update(before_reads)
                 elif op == "declare":
                     expression(args[2], bounds, definitions)
                     definitions[args[0]] = Expr("mutable", value=args[1])
@@ -611,5 +624,3 @@ def validate(kernel: Kernel):
             "Global parameters cannot be both read and written in this version: "
             + ", ".join(sorted(reads & writes.keys()))
         )
-    if not writes:
-        raise CompileError("A kernel must write at least one global output")

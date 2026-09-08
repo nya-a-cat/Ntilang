@@ -79,6 +79,7 @@ class Buffer:
     space: str = "global"
     strides: tuple[int, ...] = ()
     source_scope: str | None = None
+    source_name: str | None = None
 
 
 @dataclass(frozen=True)

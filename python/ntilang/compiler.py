@@ -100,7 +100,7 @@ class CompiledKernel:
                 if pointer < end and start < pointer + size:
                     raise ValueError(f"Tensor arguments {name} and {param.name} must have disjoint storage")
             ranges.append((pointer, pointer + size, param.name))
-        if len(devices) != 1:
+        if len(devices) > 1:
             raise ValueError("All tensor arguments must be on the same CUDA device")
         return self.build()(*ffi_arguments)
 

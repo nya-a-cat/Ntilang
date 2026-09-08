@@ -7,7 +7,18 @@ import re
 from math import isfinite, isnan, prod
 
 from .cuda_math import low_precision_asm
-from .ir import DTYPES, CompileError, Expr, Kernel, Partition, ScalarParameter, integer_limits, loop_controls
+from .debug import c_literal, print_format
+from .ir import (
+    DTYPES,
+    Buffer,
+    CompileError,
+    Expr,
+    Kernel,
+    Partition,
+    ScalarParameter,
+    integer_limits,
+    loop_controls,
+)
 from .scalar import (
     BINARY_MATH_OPS,
     BINARY_NUMERIC_OPS,
@@ -85,6 +96,8 @@ class Emitter:
         self.math_externs = {}
         self.math_ptx = {}
         self.bitcasts = {}
+        self.debug_prints = {}
+        self.device_asserts = False
         self.math_header = any(requests_math_header(stmt.args) for stmt in walk(kernel.body))
         self.parallel = None
         self.control = None
@@ -137,7 +150,10 @@ class Emitter:
         self.snapshots = set()
         self.reduction_workspaces = {}
         for stmt in walk(kernel.body):
-            if stmt.op == "parallel":
+            if stmt.op == "print" and isinstance(stmt.args[0], Buffer):
+                if stmt.args[0].space == "fragment":
+                    self.snapshots.add(stmt.args[0].name)
+            elif stmt.op == "parallel":
                 _, snapshots, _ = self.parallel_accesses(stmt)
                 self.snapshots.update(snapshots)
             elif stmt.op == "copy":
@@ -185,6 +201,9 @@ class Emitter:
 
         for inner in walk(body):
             loads(inner.args)
+            if inner.op == "print" and isinstance(inner.args[0], Buffer) and inner.args[0].space == "shared":
+                shared_used.add(inner.args[0].name)
+                shared_cross_reads.add(inner.args[0].name)
             if inner.op == "store" and self.buffers[inner.args[0]].space == "fragment":
                 written.add(inner.args[0])
             elif inner.op == "store" and self.buffers[inner.args[0]].space == "shared":
@@ -308,6 +327,10 @@ class Emitter:
 
     def expression(self, expr: Expr):
         op = expr.op
+        if op == "likely":
+            # The hint preserves its operand and dtype. Branch/range checks
+            # also look through it; device branch weighting is not forced.
+            return self.expression(expr.args[0])
         if op in CHOICE_OPS:
             return self.conditional_expression(expr)
         if op == "const":
@@ -775,6 +798,20 @@ class Emitter:
         elif op == "evaluate":
             value = self.expression(args[0])
             self.emit(f"{self.unique('evaluate')} = {value}")
+        elif op == "print":
+            self.debug_print(*args)
+        elif op == "device_assert":
+            self.device_asserts = True
+            value = self.expression(args[0])
+            condition = self.unique("assert_condition")
+            self.emit(f"{condition} = cutlass.Boolean({value})")
+            if args[1]:
+                self.emit(f"if not {condition}:")
+                self.depth += 1
+                fmt = self.printf_literal(f"Device assert failed: {c_literal(args[1])}\n")
+                self.emit(f"cute.printf({fmt!r}, end='')")
+                self.depth -= 1
+            self.emit(f"_nt_device_assert({condition}, 'Device assertion failed')")
         elif op in ("break", "continue"):
             alive, skip = self.control
             self.emit(f"{skip} = cutlass.Boolean(True)")
@@ -941,6 +978,99 @@ class Emitter:
         else:
             raise CompileError(f"Unsupported IR operation {op}", stmt.location)
 
+    @staticmethod
+    def printf_literal(text):
+        # CuTe accepts both C specifiers and brace placeholders. User text has
+        # already escaped percent signs before it joins the numeric format.
+        return text.replace("{", "{{").replace("}", "}}")
+
+    def debug_call(self, message, dtype=None, value=None, buffer=None, index=None):
+        key = (message, dtype, buffer)
+        if key not in self.debug_prints:
+            self.debug_prints[key] = f"_nt_debug_print_{len(self.debug_prints)}"
+        coords = [self.var(name) for name in self.kernel.block_vars]
+        coords += ["0"] * (3 - len(coords))
+        arguments = [f"cutlass.Int32({coord})" for coord in (*coords, "_nt_tid")]
+        if buffer is not None:
+            arguments.append(f"cutlass.Int32({index})")
+        if dtype is not None:
+            arguments.append(f"cutlass.{CUTLASS_TYPES[dtype]}({value})")
+        self.emit(f"{self.debug_prints[key]}({', '.join(arguments)})")
+
+    def debug_print(self, obj, message, main_lane):
+        if isinstance(obj, Expr):
+            self.debug_call(
+                message, expression_dtype(obj, self.buffers, self.scalar_types), self.expression(obj)
+            )
+            return
+        if obj is None:
+            self.debug_call(message)
+            return
+        if obj.space == "fragment":
+            self.materialize_fragment(obj.name)
+        elif obj.space == "shared" and self.parallel is None:
+            self.emit("cute.arch.sync_threads()")
+        if obj.space != "global":
+            # No matching lane means no output, including out-of-range selectors.
+            self.emit(f"if _nt_tid == {main_lane}:")
+            self.depth += 1
+        index = self.unique("print_index")
+        self.emit(f"for {index} in cutlass.range({prod(obj.type.shape)}):")
+        self.depth += 1
+        coords = self.coordinates(index, obj.type.shape)
+        value = (
+            f"_nt_snapshot_{obj.name}[{', '.join(coords)}]"
+            if obj.space == "fragment"
+            else self.access(obj.name, coords)
+        )
+        self.debug_call(message, obj.type.dtype, value, obj.source_name or obj.name, index)
+        self.depth -= 1
+        if obj.space != "global":
+            self.depth -= 1
+            if self.parallel is None:
+                self.emit("cute.arch.sync_threads()")
+
+    def emit_debug_helpers(self):
+        if self.device_asserts:
+            self.emit("from cutlass.cute.testing import assert_ as _nt_device_assert")
+            self.emit()
+        for (message, dtype, buffer), helper in self.debug_prints.items():
+            arguments = [f"{name}: cutlass.Int32" for name in ("bx", "by", "bz", "tx")]
+            values = ["bx", "by", "bz", "tx"]
+            if buffer is not None:
+                arguments.append("index: cutlass.Int32")
+                values.append("index")
+            if dtype is not None:
+                arguments.append(f"value: cutlass.{CUTLASS_TYPES[dtype]}")
+            self.emit("@cute.jit")
+            self.emit(f"def {helper}({', '.join(arguments)}):")
+            self.depth = 1
+            if dtype == "bool":
+                self.emit("if value:")
+                self.depth += 1
+                fmt = self.printf_literal(print_format(message, dtype, buffer, boolean=True))
+                self.emit(f"cute.printf({fmt!r}, {', '.join(values)}, end='')")
+                self.depth -= 1
+                self.emit("else:")
+                self.depth += 1
+                fmt = self.printf_literal(print_format(message, dtype, buffer, boolean=False))
+            else:
+                if dtype is not None:
+                    typ = (
+                        "Float32"
+                        if dtype in ("float16", "bfloat16")
+                        else "Int32"
+                        if dtype in ("int8", "int16")
+                        else "Uint32"
+                        if dtype in ("uint8", "uint16")
+                        else CUTLASS_TYPES[dtype]
+                    )
+                    values.append(f"cutlass.{typ}(value)")
+                fmt = self.printf_literal(print_format(message, dtype, buffer))
+            self.emit(f"cute.printf({fmt!r}, {', '.join(values)}, end='')")
+            self.depth = 0
+            self.emit()
+
     def math_external(self, symbol, dtype, values, dtypes):
         self.math_externs[symbol] = (dtype, dtypes)
         arguments = ", ".join(f"cutlass.{CUTLASS_TYPES[typ]}({value})" for typ, value in zip(dtypes, values))
@@ -1044,6 +1174,7 @@ class Emitter:
         self.statements(self.kernel.body)
         self.depth = 0
         self.emit()
+        self.emit_debug_helpers()
         if self.math_ptx or self.bitcasts:
             self.emit("from cutlass.cutlass_dsl import dsl_user_op")
             self.emit("from cutlass._mlir.dialects import llvm")
@@ -1112,9 +1243,8 @@ class Emitter:
             self.emit(
                 f"{name} = make_fake_compact_tensor({self.dtype(p.name)}, {p.type.shape}, stride_order={order}, assumed_align=16)"
             )
-        self.emit(
-            f'return cute.compile(run, {", ".join(names)}, options="--enable-tvm-ffi --gpu-arch={self.target}")'
-        )
+        arguments = ", ".join(["run", *names, f'options="--enable-tvm-ffi --gpu-arch={self.target}"'])
+        self.emit(f"return cute.compile({arguments})")
         result = "\n".join(self.lines) + "\n"
         ast.parse(result)
         return result

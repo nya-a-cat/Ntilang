@@ -11,8 +11,9 @@ import math
 import operator
 
 from .compiler import CompiledKernel
+from .debug import reference_print
 from .floating import evaluate as evaluate_floating
-from .ir import DTYPES, Expr, ScalarParameter, integer_limits
+from .ir import DTYPES, Buffer, Expr, ScalarParameter, integer_limits
 from .runtime import normalize_scalar
 from .scalar import (
     BINARY_MATH_OPS,
@@ -54,6 +55,7 @@ def reference(kernel: CompiledKernel, *arrays):
         buffers[param.name] = array
     variables = {}
     variable_types = {}
+    parallel_thread = None
     buffer_types = kernel.ir.buffer_map
     ops = {
         "+": operator.add,
@@ -140,6 +142,8 @@ def reference(kernel: CompiledKernel, *arrays):
             data[indices] = cast(value, data.dtype)
 
     def expr(e):
+        if e.op == "likely":
+            return expr(e.args[0])
         if e.op == "const":
             return e.value
         if e.op == "var":
@@ -237,7 +241,7 @@ def reference(kernel: CompiledKernel, *arrays):
         return cast(ops[e.op](*args), dtype)
 
     def statements(body):
-        nonlocal variable_types
+        nonlocal variable_types, parallel_thread
         for stmt in body:
             op, args = stmt.op, stmt.args
             if op == "alloc":
@@ -247,6 +251,33 @@ def reference(kernel: CompiledKernel, *arrays):
                 continue
             elif op == "evaluate":
                 expr(args[0])
+            elif op == "device_assert":
+                if not expr(args[0]):
+                    raise AssertionError("Device assert failed: " + args[1])
+            elif op == "print":
+                obj, message, main_lane = args
+                block = tuple(variables[name] for name in kernel.ir.block_vars)
+                block += (0,) * (3 - len(block))
+                threads = range(kernel.ir.threads) if parallel_thread is None else (parallel_thread,)
+                if isinstance(obj, Buffer):
+                    if obj.space != "global":
+                        threads = (main_lane,) if main_lane in threads else ()
+                    for thread in threads:
+                        for index, value in enumerate(buffers[obj.name].flat):
+                            reference_print(
+                                message,
+                                block,
+                                thread,
+                                value,
+                                obj.type.dtype,
+                                obj.source_name or obj.name,
+                                index,
+                            )
+                else:
+                    value = expr(obj) if obj is not None else None
+                    dtype = expression_dtype(obj, buffer_types, variable_types) if obj is not None else None
+                    for thread in threads:
+                        reference_print(message, block, thread, value, dtype)
             elif op == "break":
                 raise LoopBreak
             elif op == "continue":
@@ -339,11 +370,14 @@ def reference(kernel: CompiledKernel, *arrays):
             elif op == "parallel":
                 names, shape, inner = args
                 before_types = variable_types.copy()
-                for coord in np.ndindex(shape):
+                before_thread = parallel_thread
+                for ordinal, coord in enumerate(np.ndindex(shape)):
+                    parallel_thread = ordinal % kernel.ir.threads
                     variable_types = {**before_types, **{name: "int32" for name in names}}
                     variables.update(zip(names, coord))
                     statements(inner)
                 variable_types = before_types
+                parallel_thread = before_thread
             elif op in ("serial", "unroll"):
                 names, extent, inner = args
                 before_types = variable_types.copy()

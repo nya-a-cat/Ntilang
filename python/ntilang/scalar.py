@@ -114,6 +114,8 @@ def expression_dtype(expr, buffers, variables):
         return buffers[expr.value].type.dtype
     if expr.op in ("cast", "mutable", "parameter"):
         return expr.value
+    if expr.op == "likely":
+        return expression_dtype(expr.args[0], buffers, variables)
     if expr.op == "reinterpret":
         source = expression_dtype(expr.args[0], buffers, variables)
         if DTYPES[source] != DTYPES[expr.value]:
@@ -206,6 +208,8 @@ def constant_integer(expr, bindings):
     """Resolve integer literals and immutable aliases without reading runtime state."""
 
     def resolve(value):
+        if value.op == "likely":
+            return resolve(value.args[0])
         if value.op == "var":
             return resolve(bindings[value.value]) if value.value in bindings else None
         if value.op == "const" and type(value.value) in (int, bool):
