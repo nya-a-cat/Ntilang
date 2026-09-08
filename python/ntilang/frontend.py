@@ -1057,7 +1057,11 @@ class Parser:
                 return self.scalar_value(value, node)
             name = self.call_name(node)
             if name in BINARY_MATH_OPS:
-                parameters = ["x1", "x2"] if name in ("atan2", "copysign") else ["x", "y"]
+                parameters = (
+                    ["x1", "x2"]
+                    if name in ("atan2", "copysign", "hypot", "nextafter", "ldexp")
+                    else ["x", "y"]
+                )
                 defaults = {"span": None} if name == "pow" else {}
                 args = self.bind_call(node, [*parameters, *defaults], defaults)
                 if defaults and self.static(args["span"]) is not None:

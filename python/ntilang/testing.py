@@ -80,6 +80,9 @@ def reference(kernel: CompiledKernel, *arrays):
         "fmod": np.fmod,
         "atan2": np.arctan2,
         "copysign": np.copysign,
+        "hypot": np.hypot,
+        "nextafter": np.nextafter,
+        "ldexp": np.ldexp,
         "exp10": lambda x: np.power(type(x)(10), x),
         "log": np.log,
         "log2": np.log2,
@@ -154,6 +157,9 @@ def reference(kernel: CompiledKernel, *arrays):
         if e.op == "or":
             return any(args)
         dtype = expression_dtype(e, buffer_types, variable_types)
+        if e.op == "ldexp":
+            # CUDA's exponent parameter is int32, independently of x1's dtype.
+            return cast(np.ldexp(cast(args[0], dtype), cast(args[1], "int32")), dtype)
         arg_dtype = operand_dtype(e, buffer_types, variable_types)
         args = [cast(value, arg_dtype) for value in args]
         if e.op == "pow_integer":

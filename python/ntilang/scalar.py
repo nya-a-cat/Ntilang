@@ -35,7 +35,7 @@ TRANSCENDENTAL_OPS = frozenset(
     )
 )
 UNARY_MATH_OPS = ROUNDING_OPS | CLASSIFICATION_OPS | TRANSCENDENTAL_OPS | {"abs"}
-BINARY_MATH_OPS = frozenset(("pow", "fmod", "atan2", "copysign"))
+BINARY_MATH_OPS = frozenset(("pow", "fmod", "atan2", "copysign", "hypot", "nextafter", "ldexp"))
 BINARY_NUMERIC_OPS = (
     frozenset(("+", "-", "*", "/", "<", "<=", ">", ">=", "==", "!=", "maximum", "minimum", "max", "min"))
     | INTEGER_DIVISION_OPS
@@ -102,6 +102,10 @@ def expression_dtype(expr, buffers, variables):
         return expression_dtype(expr.args[0], buffers, variables)
     if expr.op in BINARY_MATH_OPS:
         dtype = operand_dtype(expr, buffers, variables)
+        if expr.op in ("hypot", "nextafter", "ldexp") and dtype not in ("float32", "float64"):
+            raise CompileError(
+                f"T.{expr.op} requires a float32 or float64 first operand in the pinned CUDA lowering"
+            )
         if not dtype.startswith("float") and not (dtype == "bfloat16" and expr.op != "pow"):
             raise CompileError(f"T.{expr.op} requires a floating result dtype")
         return dtype
