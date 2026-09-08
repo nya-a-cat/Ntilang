@@ -245,6 +245,7 @@ def test_native_scalar_control_math_and_index_compilation(factory):
 def test_actual_scalar_ffi_with_cpu_only_function(dtype_name):
     import cutlass
     import cutlass.cute as cute
+    from cutlass.cute.runtime import make_fake_compact_tensor
 
     dtype = getattr(cutlass, CUTLASS_TYPES[dtype_name])
     if dtype_name == "bool":
@@ -255,14 +256,22 @@ def test_actual_scalar_ffi_with_cpu_only_function(dtype_name):
         expected = 1 + 2**-40 if dtype_name == "float64" else 1.5
 
     @cute.jit
-    def check(value: dtype):
-        return value == dtype(expected)
+    def check(value: dtype, output: cute.Tensor):
+        output[0] = cutlass.Int32(value == dtype(expected))
 
     # This function contains only host scalar arithmetic and never launches a kernel.
-    executable = cute.compile(check, dtype(0), options="--enable-tvm-ffi --gpu-arch=sm_80")
+    # Compiled CuTe entrypoints expose results through arguments, not Python return values.
+    fake_output = make_fake_compact_tensor(
+        cutlass.Int32, (1,), memspace=cute.AddressSpace.generic, assumed_align=4
+    )
+    executable = cute.compile(check, dtype(0), fake_output, options="--enable-tvm-ffi --gpu-arch=sm_80")
+    assert not executable.has_gpu_module
+    output = np.empty(1, dtype=np.int32)
     parameter = ScalarParameter("value", dtype_name)
-    assert executable(scalar_ffi_argument(expected, parameter))
-    assert not executable(scalar_ffi_argument(False if dtype_name == "bool" else 0, parameter))
+    executable(scalar_ffi_argument(expected, parameter), output)
+    assert output[0] == 1
+    executable(scalar_ffi_argument(False if dtype_name == "bool" else 0, parameter), output)
+    assert output[0] == 0
 
 
 @pytest.mark.cuda
