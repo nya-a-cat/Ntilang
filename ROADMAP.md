@@ -1,8 +1,8 @@
 # Roadmap
 
-Status: development paused at the user's request on 2026-09-08.
-Resume implementation only after an explicit request. The stages below describe
-remaining work and dependencies; they do not schedule background work.
+Status: development resumed at the user's request on 2026-09-08.
+Work continues from stage 1. The stages below describe remaining work and
+dependencies; they do not schedule recurring background jobs.
 
 ## Objective
 

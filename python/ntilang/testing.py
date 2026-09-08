@@ -13,6 +13,7 @@ import operator
 from .compiler import CompiledKernel
 from .ir import Expr, integer_limits
 from .scalar import (
+    BINARY_MATH_OPS,
     CHOICE_OPS,
     INTEGER_DIVISION_OPS,
     ROUNDING_OPS,
@@ -64,6 +65,10 @@ def reference(kernel: CompiledKernel, *arrays):
         "exp": np.exp,
         "exp2": np.exp2,
         "sqrt": np.sqrt,
+        "pow": np.power,
+        "fmod": np.fmod,
+        "atan2": np.arctan2,
+        "copysign": np.copysign,
         "exp10": lambda x: np.power(type(x)(10), x),
         "log": np.log,
         "log2": np.log2,
@@ -140,6 +145,14 @@ def reference(kernel: CompiledKernel, *arrays):
         dtype = expression_dtype(e, buffer_types, variable_types)
         arg_dtype = operand_dtype(e, buffer_types, variable_types)
         args = [cast(value, arg_dtype) for value in args]
+        if e.op == "pow_integer":
+            result = cast(1, dtype) if e.value == 0 else args[0]
+            for _ in range(1, e.value):
+                result = cast(result * args[0], dtype)
+            return result
+        if e.op in BINARY_MATH_OPS:
+            compute_dtype = "float32" if dtype in ("float16", "bfloat16") else dtype
+            return cast(ops[e.op](*(cast(value, compute_dtype) for value in args)), dtype)
         if e.op in TRANSCENDENTAL_OPS:
             value = cast(args[0], "float32" if dtype in ("float16", "bfloat16") else dtype)
             if e.op == "sigmoid":

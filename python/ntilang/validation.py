@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .ir import DTYPES, CompileError, Expr, Kernel, integer_limits
 from .scalar import (
+    BINARY_MATH_OPS,
     BINARY_NUMERIC_OPS,
     BITWISE_OPS,
     CHOICE_OPS,
@@ -350,7 +351,12 @@ def validate(kernel: Kernel):
         return any(runtime_value(arg, definitions) for arg in expr.args)
 
     def expression(expr, bounds, definitions):
-        if expr.op in BITWISE_OPS | BINARY_NUMERIC_OPS | CHOICE_OPS | UNARY_MATH_OPS | {"and", "or", "not"}:
+        if expr.op in BITWISE_OPS | BINARY_NUMERIC_OPS | BINARY_MATH_OPS | CHOICE_OPS | UNARY_MATH_OPS | {
+            "and",
+            "or",
+            "not",
+            "pow_integer",
+        }:
             dtype = resolved_dtype(expr, bounds, definitions, buffers)
             if expr.op in ("<<", ">>"):
                 try:

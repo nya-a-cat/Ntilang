@@ -35,6 +35,7 @@ TRANSCENDENTAL_OPS = frozenset(
     )
 )
 UNARY_MATH_OPS = ROUNDING_OPS | CLASSIFICATION_OPS | TRANSCENDENTAL_OPS | {"abs"}
+BINARY_MATH_OPS = frozenset(("pow", "fmod", "atan2", "copysign"))
 BINARY_NUMERIC_OPS = (
     frozenset(("+", "-", "*", "/", "<", "<=", ">", ">=", "==", "!=", "maximum", "minimum", "max", "min"))
     | INTEGER_DIVISION_OPS
@@ -64,6 +65,8 @@ def promote(left, right):
 def operand_dtype(expr, buffers, variables):
     """Match TIR numeric operands, including context-typed bitwise literals."""
     types = [expression_dtype(arg, buffers, variables) for arg in expr.args]
+    if expr.op in BINARY_MATH_OPS - {"pow"}:
+        return types[0]
     if expr.op in BITWISE_OPS and len(types) == 2:
         # The upstream bit-operation FFI creates a Python integer literal in
         # the other operand's dtype before BinaryOpMatchTypes runs.
@@ -95,6 +98,13 @@ def expression_dtype(expr, buffers, variables):
         return buffers[expr.value].type.dtype
     if expr.op in ("cast", "mutable"):
         return expr.value
+    if expr.op == "pow_integer":
+        return expression_dtype(expr.args[0], buffers, variables)
+    if expr.op in BINARY_MATH_OPS:
+        dtype = operand_dtype(expr, buffers, variables)
+        if not dtype.startswith("float") and not (dtype == "bfloat16" and expr.op != "pow"):
+            raise CompileError(f"T.{expr.op} requires a floating result dtype")
+        return dtype
     if expr.op in UNARY_MATH_OPS:
         dtype = expression_dtype(expr.args[0], buffers, variables)
         if expr.op in TRANSCENDENTAL_OPS:
@@ -140,6 +150,37 @@ def expression_dtype(expr, buffers, variables):
             "Integer '/' is ambiguous; use explicit integer division or cast to a floating dtype"
         )
     return result
+
+
+def constant_integer(expr, bindings):
+    """Resolve integer literals and immutable aliases without reading runtime state."""
+
+    def resolve(value):
+        if value.op == "var":
+            return resolve(bindings[value.value]) if value.value in bindings else None
+        if value.op == "const" and type(value.value) in (int, bool):
+            return int(value.value), expression_dtype(value, {}, {})
+        if value.op == "cast" and value.value.startswith(("int", "uint")):
+            item = resolve(value.args[0])
+            if item is None:
+                return None
+            result, dtype = item[0], value.value
+        elif value.op in ("+", "-", "*"):
+            parts = [resolve(arg) for arg in value.args]
+            if any(part is None for part in parts):
+                return None
+            (left, lt), (right, rt) = parts
+            dtype = promote(lt, rt)
+            if dtype == "bool":
+                return None
+            result = left + right if value.op == "+" else left - right if value.op == "-" else left * right
+        else:
+            return None
+        low, high = integer_limits(dtype)
+        return (result - low) % (high - low + 1) + low, dtype
+
+    result = resolve(expr)
+    return None if result is None else result[0]
 
 
 def body_types(body, types, buffers):

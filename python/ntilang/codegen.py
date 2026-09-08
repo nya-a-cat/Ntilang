@@ -8,6 +8,7 @@ from math import isfinite, isnan, prod
 
 from .ir import DTYPES, CompileError, Expr, Kernel, Partition, integer_limits, loop_controls
 from .scalar import (
+    BINARY_MATH_OPS,
     BINARY_NUMERIC_OPS,
     BITWISE_OPS,
     CHOICE_OPS,
@@ -322,6 +323,29 @@ class Emitter:
             self.depth -= 1
             return temp
         values = [self.expression(x) for x in expr.args]
+        if op == "pow_integer":
+            dtype = expression_dtype(expr, self.buffers, self.scalar_types)
+            type_name = f"cutlass.{CUTLASS_TYPES[dtype]}"
+            if expr.value == 0:
+                return f"{type_name}(1)"
+            base, result = self.unique("pow_base"), self.unique("pow_result")
+            self.emit(f"{base} = {type_name}({values[0]})")
+            self.emit(f"{result} = {base}")
+            if expr.value > 1:
+                index = self.unique("pow_step")
+                self.emit(f"for {index} in cutlass.range({expr.value - 1}):")
+                self.depth += 1
+                self.emit(f"{result} = {type_name}({result} * {base})")
+                self.depth -= 1
+            return result
+        if op in BINARY_MATH_OPS:
+            dtype = expression_dtype(expr, self.buffers, self.scalar_types)
+            type_name = f"cutlass.{CUTLASS_TYPES[dtype]}"
+            values = [f"{type_name}({value})" for value in values]
+            if dtype in ("float16", "bfloat16"):
+                values = [f"cutlass.Float32({value})" for value in values]
+            function = "rem" if op == "fmod" else op
+            return f"{type_name}(cute.math.{function}({', '.join(values)}))"
         if op in UNARY_MATH_OPS:
             result_dtype = expression_dtype(expr, self.buffers, self.scalar_types)
             dtype = (

@@ -112,6 +112,15 @@ types. `exp10` currently uses CuTe's power operation with base ten. Mathematical
 reference comparisons and native compilation cover these paths; hardware ULP
 accuracy and equivalence to upstream CUDA library implementations remain unverified.
 
+Binary scalar math includes `pow`, `fmod`, `atan2`, and `copysign`. Constant
+nonnegative integer powers retain the base dtype and sequential multiplication;
+zero powers produce a typed one. Immutable integer aliases and basic constant
+integer arithmetic participate in selecting that path. Dynamic and negative
+exponents use the promoted floating power contract. The remaining binary
+intrinsics convert operands according to the first argument's result dtype.
+General constant folding, power expressions in integer index analysis, other
+binary functions, and device-level numerical parity remain open.
+
 Local scalar annotations preserve the expression dtype according to the default
 eager frontend, including branch joins and captured specialization dtype names.
 Legacy TIR annotation semantics and buffer annotations remain open.

@@ -23,7 +23,7 @@ from .ir import (
     TensorType,
     loop_controls,
 )
-from .scalar import TRANSCENDENTAL_OPS, UNARY_MATH_OPS
+from .scalar import BINARY_MATH_OPS, TRANSCENDENTAL_OPS, UNARY_MATH_OPS, constant_integer
 from .validation import affine
 
 BINOPS = {
@@ -90,6 +90,7 @@ class Parser:
         self.threads = 0
         self.parallel_context = None
         self.mutable = {}
+        self.bindings = {}
         self.loops = []
 
     def location(self, node):
@@ -391,6 +392,22 @@ class Parser:
             )
         if isinstance(node, ast.Call):
             name = self.call_name(node)
+            if name in BINARY_MATH_OPS:
+                parameters = ["x1", "x2"] if name in ("atan2", "copysign") else ["x", "y"]
+                defaults = {"span": None} if name == "pow" else {}
+                args = self.bind_call(node, [*parameters, *defaults], defaults)
+                if defaults and self.static(args["span"]) is not None:
+                    self.fail(node, "Explicit source span objects require further parser integration")
+                values = tuple(self.expr(args[key]) for key in parameters)
+                if name == "pow":
+                    exponent = constant_integer(values[1], self.bindings)
+                    if exponent is not None and exponent >= 0:
+                        if exponent > 2**31 - 1:
+                            self.fail(
+                                node, "A constant integer power must fit the upstream int template parameter"
+                            )
+                        return Expr("pow_integer", (values[0],), exponent)
+                return Expr(name, values)
             if name in TRANSCENDENTAL_OPS:
                 args = self.bind_call(node, ["x"], {})
                 return Expr(name, (self.expr(args["x"]),))
@@ -633,12 +650,15 @@ class Parser:
             before_vars = self.variables.copy()
             before_initialized = self.initialized.copy()
             before_mutable = self.mutable.copy()
+            before_bindings = self.bindings.copy()
             then_body = self.statements(node.body, parallel=parallel, nested=True)
             then_vars, then_initialized = self.variables.copy(), self.initialized.copy()
             then_mutable = self.mutable.copy()
+            then_bindings = self.bindings.copy()
             self.variables = before_vars
             self.initialized = before_initialized
             self.mutable = before_mutable
+            self.bindings = before_bindings
             else_body = self.statements(node.orelse, parallel=parallel, nested=True)
             self.variables.intersection_update(then_vars)
             self.initialized.intersection_update(then_initialized)
@@ -646,6 +666,11 @@ class Parser:
                 if self.mutable.get(name) != then_mutable.get(name):
                     self.fail(node, "Conditional scalar declarations must agree in kind, dtype, and scope")
             self.mutable = {name: info for name, info in self.mutable.items() if name in self.variables}
+            self.bindings = {
+                name: value
+                for name, value in self.bindings.items()
+                if name in self.variables and then_bindings.get(name) == value
+            }
             return Statement("if", (condition, then_body, else_body), loc)
         if isinstance(node, ast.Pass):
             return Statement("pass", (), loc)
@@ -664,12 +689,14 @@ class Parser:
             before_vars = self.variables.copy()
             before_initialized = self.initialized.copy()
             before_mutable = self.mutable.copy()
+            before_bindings = self.bindings.copy()
             self.loops.append("while")
             body = self.statements(node.body, parallel=parallel, nested=True)
             self.loops.pop()
             self.variables = before_vars
             self.initialized = before_initialized
             self.mutable = before_mutable
+            self.bindings = before_bindings
             return Statement("while", (condition, body), loc)
         if isinstance(node, ast.AugAssign):
             mutable_target = isinstance(node.target, ast.Name) and node.target.id in self.mutable
@@ -713,6 +740,7 @@ class Parser:
                 if target.id in self.variables or target.id in self.buffers or target.id.startswith("_nt_"):
                     self.fail(node, f"Cannot assign to {target.id}")
                 self.variables.add(target.id)
+                self.bindings[target.id] = value
                 return Statement("let", (target.id, value), loc)
             if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
                 name = self.buffer_name(target.value)
@@ -792,6 +820,7 @@ class Parser:
             old_initialized = self.initialized.copy()
             old_parallel = self.parallel_context
             old_mutable = self.mutable.copy()
+            old_bindings = self.bindings.copy()
             self.variables.update(names)
             if name == "Parallel":
                 self.parallel_context = (extents, names)
@@ -801,6 +830,7 @@ class Parser:
             self.variables = old_vars
             self.parallel_context = old_parallel
             self.mutable = old_mutable
+            self.bindings = old_bindings
             controls = loop_controls(body)
             if name != "Parallel" and (not static_domain or not range(*extents) or controls):
                 self.initialized = old_initialized
