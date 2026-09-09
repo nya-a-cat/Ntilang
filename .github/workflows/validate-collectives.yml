@@ -1,0 +1,41 @@
+name: Validate collective syntax
+on:
+  push:
+    branches: [feat/collective-syntax-lowering]
+    paths: [.github/workflows/validate-collectives.yml]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
+        with:
+          version: "0.9.6"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --frozen --extra cuda
+      - name: Apply and format checked integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -n '/^          set -euo pipefail/,/^      - name: Validate/p' .github/workflows/apply-syntax-patch.yml | sed '$d;s/^          //' | sed 's|HEAD:refs/heads/feat/tilelang-syntax-coverage|HEAD:refs/heads/feat/collective-syntax-lowering|' > /tmp/apply.sh
+          bash /tmp/apply.sh
+      - name: Verify compiler dependencies
+        run: uv run --frozen --extra cuda python -c "import cutlass; from importlib.metadata import version; from tvm_ffi.utils import kwargs_wrapper; assert version('nvidia-cutlass-dsl') == '4.7.1'; assert version('apache-tvm-ffi') == '0.1.11'"
+      - name: Full semantic and native compilation tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          uv run --frozen --extra cuda pytest -q -m 'not gpu' --junitxml=test-results/collectives.xml 2>&1 | tee test-results/pytest.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: collectives-test-results
+          path: test-results/
+          retention-days: 7
