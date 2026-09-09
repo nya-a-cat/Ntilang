@@ -117,6 +117,7 @@ multiplication.
 | [Matrix multiplication + ReLU](examples/matmul_relu.py) | Scale, bias, and activation in the accumulator layout |
 | [Softmax](examples/softmax.py) | Maximum and sum reductions with fragment broadcasts |
 | [Cumulative sum](examples/cumsum.py) | Inclusive row scans, reverse traversal, and tail tiles |
+| [Runtime window sum](examples/window_sum.py) | Runtime grid bounds, integer clamping, and tail batches |
 | [Tiled transpose](examples/transpose.py) | Sliced copies and shared-memory communication |
 | [Fragment affine transform](examples/fragment_affine.py) | Elementwise operations on register fragments |
 | [Piecewise transform](examples/piecewise.py) | Data-dependent branches and guarded stores |

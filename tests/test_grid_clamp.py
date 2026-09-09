@@ -55,7 +55,7 @@ def test_grid_captures_extents_before_rebinding():
 
 @pytest.mark.parametrize("shape", [(-1, 3), (True, 3), (2.5, 3)])
 def test_grid_rejects_invalid_extents(shape):
-    with pytest.raises(CompileError, match="nonnegative static"):
+    with pytest.raises(CompileError, match="nonnegative static|requires integer"):
         grid_kernel(shape)
 
 

@@ -260,12 +260,7 @@ def interval(expr, bounds, definitions, buffers=None):
             magnitude = max(abs(b[0]), abs(b[1])) - 1
             result = (max(a[0], -magnitude) if a[0] < 0 else 0, min(a[1], magnitude) if a[1] > 0 else 0)
     elif expr.op in ("min", "max", "minimum", "maximum"):
-        a, b = (interval(x, bounds, definitions, buffers) for x in expr.args)
-        dtype = resolved_dtype(expr, bounds, definitions, buffers, ignore_predicates=True)
-        if dtype.startswith("uint") and (a[0] < 0 or b[0] < 0):
-            raise CompileError("An unsigned index operand conversion can change the represented value")
-        operation = min if expr.op in ("min", "minimum") else max
-        result = tuple(operation(left, right) for left, right in zip(a, b))
+        result = comparison_interval(expr, bounds, definitions, buffers)
     elif expr.op in ("+", "-", "*"):
         a, b = (interval(x, bounds, definitions, buffers) for x in expr.args)
         if expr.op == "+":
@@ -285,6 +280,33 @@ def interval(expr, bounds, definitions, buffers=None):
         if result[0] < low or result[1] > high:
             raise CompileError("An index expression can overflow its integer dtype")
     return result
+
+
+def comparison_interval(expr, bounds, definitions, buffers):
+    """Bound clipping of full-width integer data without relaxing index arithmetic.
+
+    Min/max only select an operand. Wide data leaves can therefore be clipped
+    before entering the checked int32 index domain. Arithmetic, narrowing casts,
+    and all load indices retain the existing checks in interval/expression.
+    """
+    if expr.op == "var" and expr.value in definitions:
+        return comparison_interval(definitions[expr.value], bounds, definitions, buffers)
+    if expr.op in ("load", "parameter", "mutable"):
+        if expr.op == "load" and expr.value not in buffers:
+            raise CompileError("Integer data bounds require buffer dtype information")
+        dtype = buffers[expr.value].type.dtype if expr.op == "load" else expr.value
+        if not dtype.startswith(("int", "uint")):
+            raise CompileError("Data-dependent indices require an integer dtype")
+        return integer_limits(dtype)
+    if expr.op in ("min", "max", "minimum", "maximum"):
+        a, b = (comparison_interval(arg, bounds, definitions, buffers) for arg in expr.args)
+        dtype = resolved_dtype(expr, bounds, definitions, buffers, ignore_predicates=True)
+        low, high = integer_limits(dtype)
+        if any(start < low or stop > high for start, stop in (a, b)):
+            raise CompileError("An index min/max operand conversion can change the represented value")
+        operation = min if expr.op in ("min", "minimum") else max
+        return tuple(operation(left, right) for left, right in zip(a, b))
+    return interval(expr, bounds, definitions, buffers)
 
 
 def affine(expr, definitions, bounds=None, buffers=None):

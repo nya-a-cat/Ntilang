@@ -652,11 +652,15 @@ the source before writes. Nonempty annotations and other memory scopes remain
 unsupported. These collectives may appear in uniform branches or serial loops;
 placing them inside a `T.Parallel` body is rejected.
 
-`T.grid(*extents)` constructs nested serial loops in argument order. This version
-accepts nonnegative static integer extents, captures all extents before binding
-induction variables, and requires a distinct variable per dimension. Zero extents
-produce empty domains. Existing serial-loop scope, initialization, and early-exit
-rules apply. Dynamic grid extents remain unsupported.
+`T.grid(*extents)` constructs nested serial loops in argument order. Extents
+may be nonnegative static integers or runtime integer expressions; starred tuple
+and list arguments are accepted, including tensor shape metadata. Construction-time
+macro arguments expand once, in call-site order, before the induction names are
+rebound. Each runtime extent is captured when its corresponding nested loop is
+entered. Mutable inner extents can therefore change between outer iterations.
+Empty runtime domains execute no body. Existing serial-loop scope, initialization,
+index-range, and early-exit rules apply; an empty-capable loop cannot establish
+new buffer initialization. Tensor shapes and launch grids remain static.
 
 `T.clamp(dst, min_val, max_val)` composes `T.min(T.max(dst, min_val), max_val)`.
 Operands are evaluated once in argument order and follow existing promotion and
@@ -668,3 +672,38 @@ The scan reference oracle uses the same documented ordering independently
 of NumPy SIMD operand tie-breaking. Tests retain signed-zero assertions and
 separately exercise NaN-propagating and non-NaN-preferring variants. Device
 execution tests are provided; hardware validation remains outstanding.
+
+## Coordinate conversion and bounded integer iteration
+
+`T.index_to_coordinates(index, shape)` converts a flat integer into row-major
+coordinates by repeated floor remainder and division from the last axis. It
+accepts static or runtime integer expressions and a tuple/list of integer
+extents, including `A.shape`. The returned values support unpacking, indexed
+access, macro results, and guarded gathers. For positive extents, negative and
+oversized indices wrap by the shape's element count. An empty shape yields an
+empty sequence. The host helper accepts Python integers and returns a list;
+parsed construction results use immutable tuples internally. Container mutation
+is outside the current frontend contract.
+
+Static extents must be positive. Runtime extents must be positive whenever
+evaluated; division by zero remains a caller precondition for data arithmetic.
+When the resulting coordinates are used as memory indices, existing interval
+validation requires provably nonzero divisors and checked index intermediates.
+Shapes such as `(T.max(1, T.min(rows, 3)), 7)` satisfy those checks. This helper
+does not introduce dynamic tensor declarations or change the tensor ABI.
+
+Integer min/max index bounds can select and clip full-width integer data
+before it enters the checked signed-32-bit index domain. This permits bounds
+such as `T.max(0, T.min(n, 3))` for an int64/uint64 scalar argument. The checker
+validates min/max operand conversions, arithmetic intermediates, narrowing
+casts, and memory addresses separately. A clipped expression containing an
+unchecked overflow or value-changing conversion still fails compilation.
+
+`examples/window_sum.py` demonstrates runtime window dimensions within static
+tensor batches, combined with clamping and masked tail rows. Regression tests
+cover scalar/tensor bounds, mutable inner bounds, starred macros, source-order
+keyword evaluation, full-width clipping, rejected conversions, and isolated
+compilation of generated modules. GPU execution and performance are unverified.
+
+The construction follows the pinned [TIR Grid builder](https://github.com/tile-ai/tvm/blob/907a88c8791ccf33b9874821bc875e7abf624367/src/tirx/script/builder/ir.cc)
+and [TileLang coordinate helper](https://github.com/tile-ai/tilelang/blob/62bba8d20ddb232e29050770472cb2649dd3e718/tilelang/language/utils.py).

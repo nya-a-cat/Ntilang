@@ -29,8 +29,15 @@ Both upstream spellings are now implemented with their non-NaN preference.
 
 ## Current work
 
+`T.grid` accepts bounded runtime integer extents and starred tuples/lists.
+`T.index_to_coordinates` composes floor arithmetic with static/runtime dimensions
+and guarded gathers. Full-width integer data can be clipped by min/max before
+entering the checked index domain; arithmetic and conversion checks remain active.
+See [coordinate and iteration semantics](semantics.md#coordinate-conversion-and-bounded-integer-iteration).
+
+
 Shared `transpose` supports batch/singleton axes, rectangular shared regions,
-dtype conversion, and overlapping-source snapshots. Static `grid` and scalar
+dtype conversion, and overlapping-source snapshots. Runtime `grid` and scalar
 `clamp` compose with the canonical scan lowering. Scalar extrema references
 explicitly preserve PTX signed-zero ordering. See [semantics](semantics.md).
 

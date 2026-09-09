@@ -10,7 +10,7 @@ import textwrap
 from contextlib import contextmanager
 from math import prod
 
-from . import language, macros, metadata, scan, tile_ops
+from . import iteration, language, macros, metadata, scan, tile_ops
 from .ir import (
     DTYPES,
     Buffer,
@@ -315,6 +315,8 @@ class Parser:
 
     def construction_call(self, node):
         target = self.macro_value(node.func)
+        if target is language.index_to_coordinates:
+            return iteration.coordinates(self, node)
         if target is language.print or target is language.device_assert:
             name = "print" if target is language.print else "device_assert"
             self.pending.append(self.debug_statement(node, name, node, self.parse_context[0]))
@@ -1717,38 +1719,7 @@ class Parser:
                 self.fail(node, "Loops before T.Kernel require further construction-time lowering")
             name = self.call_name(node.iter)
             if name == "grid":
-                self.keywords(node.iter, set())
-                if node.orelse:
-                    self.fail(node, "Loop else clauses are not supported")
-                targets = (
-                    node.target.elts if isinstance(node.target, (ast.Tuple, ast.List)) else [node.target]
-                )
-                extents = tuple(self.static(arg) for arg in node.iter.args)
-                if (
-                    not extents
-                    or len(targets) != len(extents)
-                    or any(not isinstance(t, ast.Name) for t in targets)
-                ):
-                    self.fail(node, "T.grid requires one named variable per extent")
-                if len({t.id for t in targets}) != len(targets):
-                    self.fail(node, "T.grid variables must have unique names")
-                if any(type(size) is not int or size < 0 for size in extents):
-                    self.fail(node, "T.grid extents must be nonnegative static integers")
-                # Capture every extent before rebinding any grid induction variable.
-                serial_name = self.fresh("grid_serial")
-                self.constants[serial_name] = language.serial
-                body = node.body
-                for target, extent in reversed(tuple(zip(targets, extents))):
-                    call = ast.Call(
-                        func=ast.Name(id=serial_name, ctx=ast.Load()),
-                        args=[ast.Constant(extent)],
-                        keywords=[],
-                    )
-                    loop = ast.For(target=target, iter=call, body=body, orelse=[])
-                    ast.copy_location(loop, node)
-                    ast.fix_missing_locations(loop)
-                    body = [loop]
-                return self.statement(body[0], parallel=parallel, nested=nested)
+                return iteration.grid(self, node, parallel=parallel, nested=nested)
             if name not in ("Parallel", "serial", "Serial", "Pipelined", "unroll", "Unroll"):
                 self.fail(node, f"Unsupported loop {name}")
             if parallel and name == "Parallel":
