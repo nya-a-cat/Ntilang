@@ -92,6 +92,21 @@ def align_up(x: int, y: int) -> int:
     return ceildiv(x, y) * y
 
 
+def index_to_coordinates(index, shape):
+    """Convert an integer index to row-major coordinates using floor arithmetic."""
+    if type(index) is not builtins.int:
+        raise TypeError("index_to_coordinates requires an integer index")
+    if type(shape) not in (tuple, list):
+        raise TypeError("Coordinate shape requires a tuple or list")
+    if any(type(size) is not builtins.int or size <= 0 for size in shape):
+        raise ValueError("Coordinate extents must be positive integers")
+    result = []
+    for size in reversed(shape):
+        result.append(index % size)
+        index //= size
+    return list(reversed(result))
+
+
 @dataclass(frozen=True)
 class PrimFunc:
     function: Callable

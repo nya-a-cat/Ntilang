@@ -36,6 +36,7 @@ def coordinate_kernel(dtype="int32", dynamic=False, target="sm_80"):
                 x, y = T.index_to_coordinates(Index[i], shape)
                 B[i, 0] = x
                 B[i, 1] = y
+
     return ntilang.compile(kernel, target=target)
 
 
@@ -53,12 +54,16 @@ def test_runtime_index_and_dynamic_shape(dtype, dynamic, rows, columns):
 
 def gather_coordinates():
     convert = T.index_to_coordinates
+
     @T.prim_func
-    def kernel(A: T.Tensor((3, 7), "float32"), Index: T.Tensor((19,), "int32"), B: T.Tensor((19,), "float32")):
+    def kernel(
+        A: T.Tensor((3, 7), "float32"), Index: T.Tensor((19,), "int32"), B: T.Tensor((19,), "float32")
+    ):
         with T.Kernel(1, threads=32):
             for i in T.Parallel(32):
                 coordinates = convert(shape=A.shape, index=Index[i])
                 B[i] = A[coordinates[0], coordinates[1]]
+
     return ntilang.compile(kernel)
 
 
@@ -75,10 +80,12 @@ def macro_coordinates():
     def get_shape(counter: T.Ref):
         counter += 1
         return (2, 3)
+
     @T.macro
     def get_index(counter: T.Ref):
         counter += 1
         return counter
+
     @T.prim_func
     def kernel(B: T.Tensor((1,), "int32")):
         with T.Kernel(1):
@@ -86,6 +93,7 @@ def macro_coordinates():
                 counter = T.alloc_var("int32", init=0)
                 row, col = T.index_to_coordinates(shape=get_shape(counter), index=get_index(counter))
                 B[i] = row * 3 + col + 100 * counter
+
     return ntilang.compile(kernel)
 
 
@@ -101,6 +109,7 @@ def test_clamp_keyword_macro_order():
         counter += 1
         snapshot = counter + 0
         return snapshot
+
     @T.prim_func
     def kernel(B: T.Tensor((1,), "int32")):
         with T.Kernel(1):
@@ -108,12 +117,22 @@ def test_clamp_keyword_macro_order():
                 count = T.alloc_var("int32", init=0)
                 value = T.clamp(max_val=next_value(count), dst=next_value(count), min_val=next_value(count))
                 B[i] = value + count * 100
+
     b = np.empty(1, dtype=np.int32)
     reference(ntilang.compile(kernel), b)
     assert b[0] == 301
 
 
-@pytest.mark.parametrize("shape,match", [((0, 3), "positive"), ((-1, 3), "positive"), ((True, 3), "integer"), ((2.5, 3), "integer"), (3, "tuple or list")])
+@pytest.mark.parametrize(
+    "shape,match",
+    [
+        ((0, 3), "positive"),
+        ((-1, 3), "positive"),
+        ((True, 3), "integer"),
+        ((2.5, 3), "integer"),
+        (3, "tuple or list"),
+    ],
+)
 def test_coordinate_invalid_shapes(shape, match):
     @T.prim_func
     def kernel(B: T.Tensor((1,), "int32")):
@@ -121,6 +140,7 @@ def test_coordinate_invalid_shapes(shape, match):
             for i in T.Parallel(1):
                 coordinates = T.index_to_coordinates(1, shape)
                 B[i] = coordinates[0]
+
     with pytest.raises(CompileError, match=match):
         ntilang.compile(kernel)
 
@@ -132,6 +152,7 @@ def test_zero_dynamic_divisor_is_rejected():
             for i in T.Parallel(1):
                 coordinates = T.index_to_coordinates(i, (T.min(n, 3),))
                 B[i] = A[coordinates[0]]
+
     with pytest.raises(CompileError, match="zero|nonzero"):
         ntilang.compile(kernel)
 

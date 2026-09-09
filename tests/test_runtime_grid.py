@@ -25,6 +25,7 @@ def runtime_grid(dtype="int32", splat=False, target="sm_80"):
                     for i, j in T.grid(T.max(0, T.min(n, 3)), T.max(0, T.min(m, 5))):
                         total += A[row, i, j]
                 B[row] = total
+
     return ntilang.compile(kernel, target=target)
 
 
@@ -35,12 +36,14 @@ def test_runtime_scalar_grid(dtype, splat, n, m):
     a = np.arange(60, dtype=np.float32).reshape(4, 3, 5)
     b = np.empty(4, dtype=np.float32)
     reference(runtime_grid(dtype, splat), a, b, n, m)
-    np.testing.assert_array_equal(b, a[:, :min(n, 3), :min(m, 5)].sum(axis=(1, 2)))
+    np.testing.assert_array_equal(b, a[:, : min(n, 3), : min(m, 5)].sum(axis=(1, 2)))
 
 
 def ragged_grid():
     @T.prim_func
-    def kernel(A: T.Tensor((7, 3, 5), "int32"), Length: T.Tensor((7, 2), "int32"), B: T.Tensor((7,), "int32")):
+    def kernel(
+        A: T.Tensor((7, 3, 5), "int32"), Length: T.Tensor((7, 2), "int32"), B: T.Tensor((7,), "int32")
+    ):
         with T.Kernel(1, threads=32):
             for row in T.Parallel(8):
                 total = T.alloc_var("int32", init=0)
@@ -51,6 +54,7 @@ def ragged_grid():
                         continue
                     total += A[row, i, j]
                 B[row] = total
+
     return ntilang.compile(kernel)
 
 
@@ -59,7 +63,10 @@ def test_ragged_grid_and_innermost_early_exits():
     lengths = np.array([[-1, 5], [3, 0], [2, 4], [3, 5], [9, 9], [1, 2], [0, -1]], dtype=np.int32)
     b = np.empty(7, dtype=np.int32)
     reference(ragged_grid(), a, lengths, b)
-    expected = [sum(a[row, i, j] for i in range(max(0, min(n, 3))) for j in range(max(0, min(m, 3))) if i != 1) for row, (n, m) in enumerate(lengths)]
+    expected = [
+        sum(a[row, i, j] for i in range(max(0, min(n, 3))) for j in range(max(0, min(m, 3))) if i != 1)
+        for row, (n, m) in enumerate(lengths)
+    ]
     np.testing.assert_array_equal(b, expected)
 
 
@@ -74,6 +81,7 @@ def mutable_grid():
                     n = 0
                     total += 1
                 B[row] = total
+
     return ntilang.compile(kernel)
 
 
@@ -88,6 +96,7 @@ def macro_grid():
     def dimensions(counter: T.Ref):
         counter += 1
         return (2, 3)
+
     @T.prim_func
     def kernel(B: T.Tensor((1,), "int32")):
         with T.Kernel(1):
@@ -97,6 +106,7 @@ def macro_grid():
                 for i, j in T.grid(*dimensions(counter)):
                     total += 1
                 B[row] = total + counter * 100
+
     return ntilang.compile(kernel)
 
 
@@ -115,6 +125,7 @@ def metadata_grid():
                 for i, j in T.grid(*A.shape):
                     total += A[i, j]
                 B[row] = total
+
     return ntilang.compile(kernel)
 
 
@@ -133,6 +144,7 @@ def test_runtime_grid_does_not_establish_initialization():
             for i in T.grid(T.max(0, T.min(n, 2))):
                 T.fill(tile, 1)
             T.copy(tile, B)
+
     with pytest.raises(CompileError, match="initializ"):
         ntilang.compile(kernel)
 
@@ -147,6 +159,7 @@ def test_runtime_grid_rejects_noninteger_bounds(dtype):
                 for i in T.grid(n):
                     total += 1
                 B[row] = total
+
     with pytest.raises(CompileError, match="integer"):
         ntilang.compile(kernel)
 
@@ -185,12 +198,15 @@ def test_runtime_grid_device():
     torch.testing.assert_close(b, a[:, :2, :4].sum(dim=(1, 2)), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("dtype,n,m", [("int64", -(2**63), 2**63-1), ("uint64", 2**64-1, 2**64-1), ("uint32", 2**32-1, 2**32-1)])
+@pytest.mark.parametrize(
+    "dtype,n,m",
+    [("int64", -(2**63), 2**63 - 1), ("uint64", 2**64 - 1, 2**64 - 1), ("uint32", 2**32 - 1, 2**32 - 1)],
+)
 def test_full_width_data_can_be_clipped_before_indexing(dtype, n, m):
     a = np.arange(60, dtype=np.float32).reshape(4, 3, 5)
     b = np.empty(4, dtype=np.float32)
     reference(runtime_grid(dtype), a, b, n, m)
-    np.testing.assert_array_equal(b, a[:, :max(0, min(n, 3)), :max(0, min(m, 5))].sum(axis=(1, 2)))
+    np.testing.assert_array_equal(b, a[:, : max(0, min(n, 3)), : max(0, min(m, 5))].sum(axis=(1, 2)))
 
 
 @pytest.mark.parametrize("case", ["arithmetic", "narrowing", "signedness"])
@@ -209,6 +225,7 @@ def test_clipping_keeps_arithmetic_and_conversion_checks(case):
                 for i in T.grid(bound):
                     total += 1
                 B[row] = total
+
     with pytest.raises(CompileError, match="overflow|conversion|cast"):
         ntilang.compile(kernel)
 
@@ -216,14 +233,16 @@ def test_clipping_keeps_arithmetic_and_conversion_checks(case):
 @pytest.mark.parametrize("rows,columns", [(-1, 5), (0, 0), (2, 4), (10, 10)])
 def test_window_sum_example(rows, columns):
     from examples.window_sum import window_sum
+
     a = np.arange(105, dtype=np.float32).reshape(7, 3, 5)
     b = np.empty(7, dtype=np.float32)
     reference(window_sum(), a, b, rows, columns)
-    np.testing.assert_array_equal(b, a[:, :max(0, min(rows, 3)), :max(0, min(columns, 5))].sum(axis=(1, 2)))
+    np.testing.assert_array_equal(b, a[:, : max(0, min(rows, 3)), : max(0, min(columns, 5))].sum(axis=(1, 2)))
 
 
 @CUDA
 @pytest.mark.cuda
 def test_window_sum_native():
     from examples.window_sum import window_sum
+
     assert window_sum().build().has_gpu_module
