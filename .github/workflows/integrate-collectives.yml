@@ -1,0 +1,131 @@
+name: Integrate collective syntax
+on:
+  push:
+    branches: [feat/collective-syntax-lowering]
+    paths: [.github/workflows/integrate-collectives.yml]
+permissions:
+  contents: read
+jobs:
+  integrate:
+    if: github.repository == 'nya-a-cat/Ntilang' && github.ref == 'refs/heads/feat/collective-syntax-lowering'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
+        with:
+          version: "0.9.6"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --frozen --extra cuda
+      - name: Reconcile the reviewed source revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=c0a5860192bc225456d2d08a2cf377732ccacead
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$base"
+          cp tests/test_scans.py /tmp/composition.py
+          cp python/ntilang/frontend.py /tmp/frontend.py
+          cp python/ntilang/testing.py /tmp/testing.py
+          sed -n '/^`T.transpose(src, dst, annotations=None)`/,$p' docs/semantics.md > /tmp/semantics-extra.md
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' merge --no-commit --no-ff "$base" || test "$(git rev-parse MERGE_HEAD)" = "$base"
+          git restore --source="$base" --staged --worktree python/ntilang/frontend.py python/ntilang/language.py python/ntilang/codegen.py python/ntilang/validation.py python/ntilang/scan.py python/ntilang/testing.py tests/test_scans.py docs/semantics.md docs/compatibility.md
+          cp /tmp/frontend.py python/ntilang/frontend.py
+          sed -i 's/from \. import language, macros, metadata, tile_ops/from . import language, macros, metadata, scan, tile_ops/; /self.prologue: list\[Statement\] = \[\]/d; /self.scan_workspaces = {}/d; s/("cumsum", "cummax")/("cumsum", "cummax", "cumsum_fragment", "cummax_fragment")/; s/return tile_ops.scan(self, call, node, name)/return scan.parse(self, call, name, loc)/; s/(\*self.prologue, \*statements)/statements/' python/ntilang/frontend.py
+          sed -i '/value, lower, upper = (self.expr(args\[key\])/c\                values = {key: self.expr(arg) for key, arg in args.items()}\n                value, lower, upper = (values[key] for key in ("dst", "min_val", "max_val"))' python/ntilang/frontend.py
+          sed -i '/    "Parallel",/a\    "grid",' python/ntilang/language.py
+          sed -i '/    "copy",/a\    "transpose",\n    "clamp",' python/ntilang/language.py
+          sed -n '/        if e.op in ("maximum", "minimum", "max", "min") and arg_dtype.startswith("float"):/,/        if e.op == "pow_integer":/p' /tmp/testing.py | sed '$d' > /tmp/zeros.txt
+          sed -i '/        args = \[cast(value, arg_dtype) for value in args\]/r /tmp/zeros.txt' python/ntilang/testing.py
+          cat > python/ntilang/tile_ops.py <<'SOURCE'
+          """Shared transpose lowering through the existing copy IR."""
+
+          from __future__ import annotations
+
+          from .ir import Partition, Region, Statement
+          from .macros import ValueNode
+
+
+          def _region(parser, node):
+              name, origin, shape = parser.region_spec(node)
+              if shape is None:
+                  parser.fail(node, "This operation requires a buffer or an explicitly sized region")
+              return Region(name, origin, shape)
+
+
+          def transpose(parser, call, node):
+              args = parser.bind_call(call, ["src", "dst", "annotations"], {"annotations": None})
+              values = {key: ValueNode(parser.macro_value(value), value) for key, value in args.items()}
+              src, dst = (_region(parser, values[name]) for name in ("src", "dst"))
+              annotations = parser.static(values["annotations"])
+              if annotations is not None and type(annotations) is not dict:
+                  parser.fail(call, "Tile annotations must be a static dictionary")
+              if annotations:
+                  parser.fail(call, "Nonempty transpose annotations require further lowering")
+              rank = len(src.shape)
+              if rank < 2 or len(dst.shape) != rank:
+                  parser.fail(call, "Transpose requires matching ranks of at least two")
+              permutation = (*range(rank - 2), rank - 1, rank - 2)
+              if dst.shape != tuple(src.shape[axis] for axis in permutation):
+                  parser.fail(call, "Transpose destination must swap the source's final two dimensions")
+              if any(parser.buffers[r.buffer].space != "shared" for r in (src, dst)):
+                  parser.fail(call, "Transpose requires shared-memory source and destination regions")
+              Partition(src.shape, parser.threads)
+              if src.buffer not in parser.initialized:
+                  parser.fail(call, f"Buffer {src.buffer} is read before initialization")
+              if dst.is_full(parser.buffers[dst.buffer].type.shape):
+                  parser.initialized.add(dst.buffer)
+              elif dst.buffer not in parser.initialized:
+                  parser.fail(call, "Partial temporary writes require an initialized destination")
+              # Copy handles conversions, source snapshots, barriers and ownership.
+              destination = Region(dst.buffer, dst.origin, src.shape, permutation)
+              return Statement("copy", (src, destination), parser.location(node))
+          SOURCE
+          cp /tmp/composition.py tests/test_scan_composition.py
+          sed -i '/({"shape": (2, 2, 2)}, "dimensional"),/d; /({"threads": 48}, "threads"),/d; /({"dtype": "bool"}, "Boolean"),/d' tests/test_scan_composition.py
+          sed -i '/    # Every call reinitializes its workspace;/,+1c\    # Canonical scan lowering pools two workspaces outside control flow.\n    for bank in ("a", "b"):\n        assert kernel.source.count(f"_nt_scan_workspace_0_{bank} = _nt_smem.allocate_tensor(") == 1\n    assert "_nt_scan_workspace_1_a" not in kernel.source' tests/test_scan_composition.py
+          cat >> tests/test_scan_composition.py <<'TEST'
+
+
+          @pytest.mark.parametrize("kwargs", [{"shape": (2, 2, 2)}, {"threads": 48}, {"dtype": "bool"}])
+          def test_scan_extensions_remain_available(kwargs):
+              shape, dtype = kwargs.get("shape", (3, 37)), kwargs.get("dtype", "float32")
+              a = (np.arange(np.prod(shape)).reshape(shape) % 3).astype(dtype)
+              b = np.empty_like(a)
+              reference(scan_kernel(**kwargs), a, b)
+              np.testing.assert_array_equal(b, segmented_reference(a, -1, False, "cumsum"))
+          TEST
+          printf '\n## Shared transpose, grid, and clamp\n\n' >> docs/semantics.md
+          cat /tmp/semantics-extra.md >> docs/semantics.md
+          sed -i '/^## Current work/a\
+          \nShared `transpose` supports batch/singleton axes, rectangular shared regions,\ndtype conversion, and overlapping-source snapshots. Static `grid` and scalar\n`clamp` compose with the canonical scan lowering. Scalar extrema references\nexplicitly preserve PTX signed-zero ordering. See [semantics](semantics.md).\n' docs/compatibility.md
+          uv run --frozen ruff check --fix python examples tests
+          uv run --frozen ruff format python examples tests
+          git add README.md docs python examples tests .github/workflows/ci.yml
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git diff --cached --check
+      - name: Validate reconciled source before committing
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          uv run --frozen --extra cuda python -c "from importlib.metadata import version; assert version('nvidia-cutlass-dsl') == '4.7.1'; assert version('apache-tvm-ffi') == '0.1.11'"
+          uv run --frozen --extra cuda pytest -q -m 'not gpu' --junitxml=test-results/integration.xml 2>&1 | tee test-results/pytest.txt
+          git diff --cached --stat > test-results/diffstat.txt
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Merge canonical scans and preserve transpose, grid, clamp and regression coverage'
+          git rev-parse HEAD | tee test-results/head-sha.txt
+          git push origin HEAD:refs/heads/feat/collective-syntax-lowering
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: integration-results
+          path: test-results/
+          retention-days: 7
