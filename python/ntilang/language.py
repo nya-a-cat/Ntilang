@@ -182,6 +182,7 @@ _MARKER_NAMES = {}
 for _name in (
     "Kernel",
     "Parallel",
+    "grid",
     "serial",
     "Serial",
     "Pipelined",
@@ -197,6 +198,8 @@ for _name in (
     "device_assert",
     "likely",
     "copy",
+    "transpose",
+    "clamp",
     "clear",
     "fill",
     "gemm",

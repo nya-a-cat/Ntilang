@@ -29,6 +29,12 @@ Both upstream spellings are now implemented with their non-NaN preference.
 
 ## Current work
 
+Shared `transpose` supports batch/singleton axes, rectangular shared regions,
+dtype conversion, and overlapping-source snapshots. Static `grid` and scalar
+`clamp` compose with the canonical scan lowering. Scalar extrema references
+explicitly preserve PTX signed-zero ordering. See [semantics](semantics.md).
+
+
 Inclusive `cumsum`/`cummax` and their explicit fragment helpers now bind source,
 destination, axis, direction, and empty annotation forms. Shared/fragment staging
 preserves pitched subregions, nonzero origins, overlap, source-dtype arithmetic,

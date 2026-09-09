@@ -196,6 +196,15 @@ def reference(kernel: CompiledKernel, *arrays):
             return cast(np.ldexp(cast(args[0], dtype), cast(args[1], "int32")), dtype)
         arg_dtype = operand_dtype(e, buffer_types, variable_types)
         args = [cast(value, arg_dtype) for value in args]
+        if e.op in ("maximum", "minimum", "max", "min") and arg_dtype.startswith("float"):
+            # PTX min/max order +0 above -0. Host NumPy scalar and SIMD
+            # implementations can choose different operands for equal zeros.
+            if args[0] == 0 and args[1] == 0:
+                a_negative, b_negative = (bool(np.signbit(value)) for value in args)
+                negative = (
+                    a_negative and b_negative if e.op in ("maximum", "max") else a_negative or b_negative
+                )
+                return cast(np.copysign(0.0, -1.0 if negative else 1.0), dtype)
         if e.op == "pow_integer":
             result = cast(1, dtype) if e.value == 0 else args[0]
             for _ in range(1, e.value):

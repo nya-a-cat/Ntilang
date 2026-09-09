@@ -641,3 +641,30 @@ the basic numeric and Boolean buffer types except BF16, and uses FP32 matrix mul
 does not simulate physical lane scheduling, register allocation, Tensor Core
 rounding, or performance. GPU tests are the next validation layer for executable
 behavior.
+
+## Shared transpose, grid, and clamp
+
+`T.transpose(src, dst, annotations=None)` swaps the final two axes of shared
+buffers or explicit regions, preserving batch axes and singleton dimensions.
+The destination shape must match the permutation. Copies apply destination dtype
+conversion and guard tensor bounds. Aliased/overlapping temporary regions capture
+the source before writes. Nonempty annotations and other memory scopes remain
+unsupported. These collectives may appear in uniform branches or serial loops;
+placing them inside a `T.Parallel` body is rejected.
+
+`T.grid(*extents)` constructs nested serial loops in argument order. This version
+accepts nonnegative static integer extents, captures all extents before binding
+induction variables, and requires a distinct variable per dimension. Zero extents
+produce empty domains. Existing serial-loop scope, initialization, and early-exit
+rules apply. Dynamic grid extents remain unsupported.
+
+`T.clamp(dst, min_val, max_val)` composes `T.min(T.max(dst, min_val), max_val)`.
+Operands are evaluated once in argument order and follow existing promotion and
+non-NaN preference rules; reversed bounds retain the same composition.
+
+Scalar `max`/`maximum` and `min`/`minimum` explicitly order positive zero
+above negative zero in the CPU reference, matching the PTX min/max contract.
+The scan reference oracle uses the same documented ordering independently
+of NumPy SIMD operand tie-breaking. Tests retain signed-zero assertions and
+separately exercise NaN-propagating and non-NaN-preferring variants. Device
+execution tests are provided; hardware validation remains outstanding.
