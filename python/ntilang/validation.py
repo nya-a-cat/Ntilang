@@ -553,8 +553,8 @@ def validate(kernel: Kernel):
                         interval(index, bounds, definitions, buffers)
                     if buffers[name].space == "global":
                         record_write(name, indices, bounds, definitions, in_serial, path)
-                elif op == "copy":
-                    src, dst = args
+                elif op in ("copy", "scan"):
+                    src, dst = args[:2]
                     if buffers[src.buffer].space == "global":
                         reads.add(src.buffer)
                     tile_names = tuple(f"_nt_copy_coordinate_{i}" for i in range(len(src.shape)))
@@ -572,9 +572,12 @@ def validate(kernel: Kernel):
                             )
                             for origin, axis in zip(region.origin, region.axes)
                         )
-                        for index in indices:
+                        for index, size in zip(indices, buffers[region.buffer].type.shape):
                             expression(index, tile_bounds, definitions)
-                            interval(index, tile_bounds, definitions, buffers)
+                            low, high = interval(index, tile_bounds, definitions, buffers)
+                            if op == "scan" and buffers[region.buffer].space != "global":
+                                if low < 0 or high >= size:
+                                    raise CompileError("Scan temporary regions must be provably in bounds")
                         if region is dst and buffers[dst.buffer].space == "global":
                             record_write(dst.buffer, indices, tile_bounds, definitions, in_serial, path)
                 elif op == "fill":

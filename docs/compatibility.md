@@ -29,6 +29,15 @@ Both upstream spellings are now implemented with their non-NaN preference.
 
 ## Current work
 
+Inclusive `cumsum`/`cummax` and their explicit fragment helpers now bind source,
+destination, axis, direction, and empty annotation forms. Shared/fragment staging
+preserves pitched subregions, nonzero origins, overlap, source-dtype arithmetic,
+and MMA ownership. The reference and lowering follow the pinned 32-lane segment
+tree and carry order, including FP64's ordered-comparison maximum. Static ranks
+above two and non-power-of-two block sizes are Ntilang extensions. Nonempty scan
+annotations, optimized warp communication, and GPU execution remain open. See
+[inclusive scans](semantics.md#inclusive-scans) for scope and boundary rules.
+
 CUDA diagnostic calls support `T.print` for scalar IR values, messages and the
 existing global/shared/fragment buffer types, plus `T.device_assert` with optional
 source/macro stack information. Print thread selection and fragment materialization
@@ -284,7 +293,7 @@ loop lowering require further implementation.
   vectorization, persistent scheduling, pipeline stages/order/group/sync metadata,
   swizzles, and warp-specialization schedules.
 - Tile operations: complete copy signatures, transpose, im2col, all reduction
-  types and reducer epochs, scan/cumulative operations, fragment broadcasting,
+  types and reducer epochs, remaining scan annotations/schedules, fragment broadcasting,
   layout conversion, GEMM policies, sparse GEMM, and MMA layout propagation.
 - Scalar intrinsics: the full arithmetic, math, comparison, logical, bitwise,
   conversion, random, assertion, and printing surfaces.
