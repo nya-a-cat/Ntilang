@@ -29,17 +29,20 @@ Both upstream spellings are now implemented with their non-NaN preference.
 
 ## Current work
 
-Inclusive `cumsum`/`cummax` support one-/two-dimensional shared and fragment
-regions, negative axes, reverse scans, in-place updates, and fragment-output
-conversion. Their shared lowering preserves the pinned CUDA 32-element segment
-tree, source-dtype rounding, and sequential carries. Workspaces are reused and
-included in the block memory budget. `transpose` supports shared regions,
-batch/singleton axes, dtype conversion, and overlapping temporary snapshots.
-Static `grid` nests and scalar `clamp` are implemented. See
-[semantics.md](semantics.md#inclusive-scans-and-shared-transpose) for signatures,
-scope restrictions, annotations, and numerical verification limits. Wider scan
-ranks, Boolean scans, dynamic grid extents, additional layouts, hardware numerical
-parity, and device performance remain open.
+Shared `transpose` supports batch/singleton axes, rectangular shared regions,
+dtype conversion, and overlapping-source snapshots. Static `grid` and scalar
+`clamp` compose with the canonical scan lowering. Scalar extrema references
+explicitly preserve PTX signed-zero ordering. See [semantics](semantics.md).
+
+
+Inclusive `cumsum`/`cummax` and their explicit fragment helpers now bind source,
+destination, axis, direction, and empty annotation forms. Shared/fragment staging
+preserves pitched subregions, nonzero origins, overlap, source-dtype arithmetic,
+and MMA ownership. The reference and lowering follow the pinned 32-lane segment
+tree and carry order, including FP64's ordered-comparison maximum. Static ranks
+above two and non-power-of-two block sizes are Ntilang extensions. Nonempty scan
+annotations, optimized warp communication, and GPU execution remain open. See
+[inclusive scans](semantics.md#inclusive-scans) for scope and boundary rules.
 
 CUDA diagnostic calls support `T.print` for scalar IR values, messages and the
 existing global/shared/fragment buffer types, plus `T.device_assert` with optional
@@ -296,7 +299,7 @@ loop lowering require further implementation.
   vectorization, persistent scheduling, pipeline stages/order/group/sync metadata,
   swizzles, and warp-specialization schedules.
 - Tile operations: complete copy signatures, transpose, im2col, all reduction
-  types and reducer epochs, scan/cumulative operations, fragment broadcasting,
+  types and reducer epochs, remaining scan annotations/schedules, fragment broadcasting,
   layout conversion, GEMM policies, sparse GEMM, and MMA layout propagation.
 - Scalar intrinsics: the full arithmetic, math, comparison, logical, bitwise,
   conversion, random, assertion, and printing surfaces.

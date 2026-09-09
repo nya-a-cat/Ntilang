@@ -10,7 +10,7 @@ import textwrap
 from contextlib import contextmanager
 from math import prod
 
-from . import language, macros, metadata, tile_ops
+from . import language, macros, metadata, scan, tile_ops
 from .ir import (
     DTYPES,
     Buffer,
@@ -110,8 +110,6 @@ class Parser:
         self.variables: set[str] = set()
         self.initialized: set[str] = set()
         self.allocated: list[Buffer] = []
-        self.prologue: list[Statement] = []
-        self.scan_workspaces = {}
         self.threads = 0
         self.parallel_context = None
         self.mutable = {}
@@ -1076,7 +1074,8 @@ class Parser:
             name = self.call_name(node)
             if name == "clamp":
                 args = self.bind_call(node, ["dst", "min_val", "max_val"], {})
-                value, lower, upper = (self.expr(args[key]) for key in ("dst", "min_val", "max_val"))
+                values = {key: self.expr(arg) for key, arg in args.items()}
+                value, lower, upper = (values[key] for key in ("dst", "min_val", "max_val"))
                 return Expr("min", (Expr("max", (value, lower)), upper))
             if name == "likely":
                 if len(node.args) > 2:
@@ -1855,8 +1854,8 @@ class Parser:
                 self.fail(node, "Collective tile operations cannot appear inside T.Parallel")
             if name == "transpose":
                 return tile_ops.transpose(self, call, node)
-            if name in ("cumsum", "cummax"):
-                return tile_ops.scan(self, call, node, name)
+            if name in ("cumsum", "cummax", "cumsum_fragment", "cummax_fragment"):
+                return scan.parse(self, call, name, loc)
             if name == "reduce" or name.startswith("reduce_"):
                 return self.reduction(call, name, loc)
             if name in ("clear", "fill"):
@@ -2004,7 +2003,7 @@ class Parser:
             grid,
             block_vars,
             self.threads,
-            (*self.prologue, *statements),
+            statements,
             self.source,
         )
 

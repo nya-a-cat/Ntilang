@@ -586,6 +586,48 @@ implementations. `batch=1` and empty lowering annotations are supported; batched
 AllReduce scheduling, packed arithmetic controls, and reducer epochs remain open.
 Reduction workspace counts toward the shared-memory limit.
 
+## Inclusive scans
+
+`T.cumsum(src, dst=None, dim=0, reverse=False, annotations=None)` and
+`T.cummax` compute inclusive prefix sums and maxima. Omitting `dst` updates
+`src` in place. Negative axes are normalized against the source region's rank;
+unit dimensions, including scalar-indexed dimensions, remain present. Source
+and destination shapes must match exactly. Basic scalar dtypes are supported.
+
+Direct shared scans require shared destinations with the same dtype. Fragment
+sources stage through shared memory and can write shared, fragment, or global
+destinations; conversion to the destination dtype happens after accumulation.
+The explicit `cumsum_fragment(src, dst, dim, reverse, annotations=None)` and
+`cummax_fragment` helpers use the same staging for global or shared inputs too.
+Their first four arguments are required. `annotations=None` and empty static
+dictionaries are accepted; nonempty lowering annotations produce an error.
+
+Whole buffers, positive unit-stride regions, nonzero row/column origins, and
+overlapping source/destination regions are supported. The entire source region
+is captured before writing the destination. Temporary regions must be provably
+in bounds, their sources must be initialized, and partial temporary writes
+require initialized destinations. Global helper loads use zero for out-of-bounds
+elements and global stores are masked, following the copy contract. Global
+read/write aliasing and unique output ownership retain the existing restrictions.
+
+The arithmetic follows the pinned CUDA `InclusiveScanLine` template: padded
+32-element segments, tree offsets 1/2/4/8/16, and ordered segment carries. Every
+combine rounds to the source dtype. FP16/BF16/FP32 maxima prefer non-NaN operands;
+an all-NaN prefix combines with the negative-infinity identity. The pinned
+FP64 `fast_max` template uses `a < b ? b : a`, retaining the left operand on
+ties and unordered comparisons. This dtype-specific NaN/signed-zero behavior is
+preserved. NaN payloads, device rounding details, and instruction-level numerical
+equivalence still require GPU verification.
+
+Lowering uses two dense shared workspaces and uniform block barriers. Workspaces
+are reused for scans with the same padded shape and source dtype, and both count
+toward the 48 KiB shared-memory limit. Source and destination fragments retain
+their own physical ownership, including MMA accumulators. Scans work in uniform
+branches, serial/while loops, and macros; collective scans inside `T.Parallel`
+are rejected. Higher-rank static regions and arbitrary valid block sizes are
+Ntilang extensions to the pinned CUDA scan template's 1D/2D, power-of-two-block
+implementation. Warp-shuffle lowering and performance tuning remain future work.
+
 ## Scope of verification
 
 The compiler checks a restricted source contract, then delegates instruction
@@ -600,25 +642,7 @@ does not simulate physical lane scheduling, register allocation, Tensor Core
 rounding, or performance. GPU tests are the next validation layer for executable
 behavior.
 
-## Inclusive scans and shared transpose
-
-`T.cumsum(src, dst=None, dim=0, reverse=False, annotations=None)` and
-`T.cummax` accept one- or two-dimensional shared/fragment buffers and explicit
-unit-stride regions. Negative axes are normalized; omitted destinations update
-the source in place. Shapes must match. Shared sources require shared destinations
-of the same dtype. Fragment sources stage through shared storage and permit final
-copy dtype conversion. Boolean scans and nonempty annotations remain unsupported.
-The launch uses 32, 64, 128, 256, 512, or 1024 threads.
-
-The lowering preserves the pinned CUDA `InclusiveScanLine` arithmetic schedule:
-32-element segments, shuffle distances 1/2/4/8/16, identity-padded tail lanes,
-source-dtype rounding after each combine, and sequential segment carries. Reverse
-scans traverse segments backwards and combine with higher-index neighbors.
-`cummax` uses non-NaN-preferring maximum, including the identity carry. The CPU
-reference executes this schedule; NVIDIA device numerical parity and performance
-remain unverified. Two shared ping-pong tiles, padded to 32 along the scan axis,
-and a per-line carry tile implement communication with block barriers. Workspace
-is reused by compatible calls and counted in the 48 KiB block memory limit.
+## Shared transpose, grid, and clamp
 
 `T.transpose(src, dst, annotations=None)` swaps the final two axes of shared
 buffers or explicit regions, preserving batch axes and singleton dimensions.

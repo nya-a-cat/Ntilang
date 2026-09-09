@@ -10,6 +10,7 @@ import itertools
 import math
 import operator
 
+from . import scan
 from .compiler import CompiledKernel
 from .debug import reference_print
 from .floating import evaluate as evaluate_floating
@@ -324,8 +325,8 @@ def reference(kernel: CompiledKernel, *arrays):
                         variable_types = before_types.copy()
             elif op == "store":
                 write(args[0], tuple(expr(x) for x in args[1]), expr(args[2]))
-            elif op == "copy":
-                src, dst = args
+            elif op in ("copy", "scan"):
+                src, dst = args[:2]
                 src_origin, dst_origin = (tuple(expr(x) for x in r.origin) for r in (src, dst))
 
                 def indices(origin, axes, coord):
@@ -336,6 +337,10 @@ def reference(kernel: CompiledKernel, *arrays):
                     (coord, read(src.buffer, indices(src_origin, src.axes, coord)))
                     for coord in np.ndindex(src.shape)
                 ]
+                if op == "scan":
+                    tile = np.asarray([value for _, value in values], dtype=buffers[src.buffer].dtype)
+                    tile = scan.evaluate(tile.reshape(src.shape), *args[2:])
+                    values = [(coord, tile[coord]) for coord in np.ndindex(src.shape)]
                 for coord, value in values:
                     write(dst.buffer, indices(dst_origin, dst.axes, coord), value)
             elif op == "gemm":

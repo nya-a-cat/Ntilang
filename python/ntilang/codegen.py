@@ -7,6 +7,7 @@ import re
 from hashlib import sha256
 from math import isfinite, isnan, prod
 
+from . import scan
 from .cuda_math import low_precision_asm
 from .debug import print_format
 from .ir import (
@@ -150,6 +151,7 @@ class Emitter:
         self.fragment_layouts = self.infer_fragment_layouts()
         self.snapshots = set()
         self.reduction_workspaces = {}
+        self.scan_workspaces = {}
         for stmt in walk(kernel.body):
             if stmt.op == "print" and isinstance(stmt.args[0], Buffer):
                 if stmt.args[0].space == "fragment":
@@ -164,6 +166,11 @@ class Emitter:
                 key = (src, self.buffers[dst].type.dtype)
                 if key not in self.reduction_workspaces:
                     self.reduction_workspaces[key] = f"_nt_reduce_workspace_{len(self.reduction_workspaces)}"
+            elif stmt.op == "scan":
+                key = scan.workspace_key(stmt.args, self.buffers)
+                if key not in self.scan_workspaces:
+                    label = f"_nt_scan_workspace_{len(self.scan_workspaces)}"
+                    self.scan_workspaces[key] = (label + "_a", label + "_b")
         shared_bytes = 0
         for buffer in kernel.buffers:
             for needed in (buffer.name in self.snapshots, buffer.space == "shared"):
@@ -174,6 +181,10 @@ class Emitter:
         for src, dtype in self.reduction_workspaces:
             shared_bytes = (shared_bytes + 15) // 16 * 16
             shared_bytes += prod(self.buffers[src].type.shape) * DTYPES[dtype]
+        for (shape, dtype), workspaces in self.scan_workspaces.items():
+            for _ in workspaces:
+                shared_bytes = (shared_bytes + 15) // 16 * 16
+                shared_bytes += prod(shape) * DTYPES[dtype]
         if shared_bytes > 48 * 1024:
             raise CompileError("Shared buffers and fragment communication exceed 48 KiB per block")
 
@@ -875,6 +886,8 @@ class Emitter:
             self.gemm(*args)
         elif op == "reduce":
             self.reduction(*args)
+        elif op == "scan":
+            scan.emit(self, *args)
         elif op == "let":
             value = self.expression(args[1])
             dtype = self.scalar_types.get(args[0]) or expression_dtype(
@@ -1164,6 +1177,7 @@ class Emitter:
         if (
             self.snapshots
             or self.reduction_workspaces
+            or self.scan_workspaces
             or any(b.space == "shared" for b in self.kernel.buffers)
         ):
             self.emit("_nt_smem = utils.SmemAllocator()")
@@ -1205,6 +1219,12 @@ class Emitter:
             self.emit(
                 f"{workspace} = _nt_smem.allocate_tensor(cutlass.{CUTLASS_TYPES[dtype]}, cute.make_layout({shape}, stride={strides}), byte_alignment=16)"
             )
+        for (shape, dtype), workspaces in self.scan_workspaces.items():
+            strides = tuple(prod(shape[i + 1 :]) for i in range(len(shape)))
+            for workspace in workspaces:
+                self.emit(
+                    f"{workspace} = _nt_smem.allocate_tensor(cutlass.{CUTLASS_TYPES[dtype]}, cute.make_layout({shape}, stride={strides}), byte_alignment=16)"
+                )
         self.statements(self.kernel.body)
         self.depth = 0
         self.emit()
