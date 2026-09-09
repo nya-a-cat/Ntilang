@@ -14,6 +14,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  package:
+    name: Build distributions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: "0.9.6"
+          python-version: "3.12"
+      - run: uv build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
   python:
     name: Windows Python checks
     runs-on: windows-latest
@@ -28,7 +46,13 @@ jobs:
       - run: uv sync --frozen
       - run: uv run --frozen ruff check python examples tests
       - run: uv run --frozen ruff format --check python examples tests
-      - run: uv run --frozen pytest -q -m "not gpu"
+      - run: uv run --frozen pytest -q -m "not gpu" --junitxml=test-results/windows.xml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: test-results-windows
+          path: test-results/
+          retention-days: 7
 
   cute:
     name: Linux CuTe compilation checks
@@ -46,5 +70,10 @@ jobs:
       - run: uv sync --frozen --extra cuda
       - name: Require the pinned compiler
         run: uv run --frozen --extra cuda python -c "import cutlass; from importlib.metadata import version; from tvm_ffi.utils import kwargs_wrapper; assert version('nvidia-cutlass-dsl') == '4.7.1'; assert version('apache-tvm-ffi') == '0.1.11'"
-      - run: uv run --frozen --extra cuda pytest -q -m "not gpu"
-      - run: uv build
+      - run: uv run --frozen --extra cuda pytest -q -m "not gpu" --junitxml=test-results/cute.xml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: test-results-cute
+          path: test-results/
+          retention-days: 7

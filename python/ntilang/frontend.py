@@ -10,7 +10,7 @@ import textwrap
 from contextlib import contextmanager
 from math import prod
 
-from . import language, macros, metadata
+from . import language, macros, metadata, scan
 from .ir import (
     DTYPES,
     Buffer,
@@ -1814,6 +1814,8 @@ class Parser:
                 return self.copy_statement(call, node, parallel, nested)
             if parallel:
                 self.fail(node, "Collective tile operations cannot appear inside T.Parallel")
+            if name in ("cumsum", "cummax", "cumsum_fragment", "cummax_fragment"):
+                return scan.parse(self, call, name, loc)
             if name == "reduce" or name.startswith("reduce_"):
                 return self.reduction(call, name, loc)
             if name in ("clear", "fill"):
