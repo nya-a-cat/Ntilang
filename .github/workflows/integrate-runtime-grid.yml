@@ -1,0 +1,249 @@
+name: Integrate runtime iteration
+on:
+  push:
+    branches: [feat/runtime-grid-coordinates]
+    paths: [.github/workflows/integrate-runtime-grid.yml]
+permissions:
+  contents: read
+jobs:
+  integrate:
+    if: github.repository == 'nya-a-cat/Ntilang' && github.ref == 'refs/heads/feat/runtime-grid-coordinates'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
+        with:
+          version: "0.9.6"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --frozen --extra cuda
+      - name: Apply the reviewed integration patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          cat > /tmp/runtime.patch <<'PATCH'
+          diff --git a/python/ntilang/frontend.py b/python/ntilang/frontend.py
+          --- a/python/ntilang/frontend.py
+          +++ b/python/ntilang/frontend.py
+          @@ -10,7 +10,7 @@
+           from contextlib import contextmanager
+           from math import prod
+           
+          -from . import language, macros, metadata, scan, tile_ops
+          +from . import iteration, language, macros, metadata, scan, tile_ops
+           from .ir import (
+               DTYPES,
+               Buffer,
+          @@ -315,6 +315,8 @@
+           
+               def construction_call(self, node):
+                   target = self.macro_value(node.func)
+          +        if target is language.index_to_coordinates:
+          +            return iteration.coordinates(self, node)
+                   if target is language.print or target is language.device_assert:
+                       name = "print" if target is language.print else "device_assert"
+                       self.pending.append(self.debug_statement(node, name, node, self.parse_context[0]))
+          @@ -1717,38 +1719,7 @@
+                           self.fail(node, "Loops before T.Kernel require further construction-time lowering")
+                       name = self.call_name(node.iter)
+                       if name == "grid":
+          -                self.keywords(node.iter, set())
+          -                if node.orelse:
+          -                    self.fail(node, "Loop else clauses are not supported")
+          -                targets = (
+          -                    node.target.elts if isinstance(node.target, (ast.Tuple, ast.List)) else [node.target]
+          -                )
+          -                extents = tuple(self.static(arg) for arg in node.iter.args)
+          -                if (
+          -                    not extents
+          -                    or len(targets) != len(extents)
+          -                    or any(not isinstance(t, ast.Name) for t in targets)
+          -                ):
+          -                    self.fail(node, "T.grid requires one named variable per extent")
+          -                if len({t.id for t in targets}) != len(targets):
+          -                    self.fail(node, "T.grid variables must have unique names")
+          -                if any(type(size) is not int or size < 0 for size in extents):
+          -                    self.fail(node, "T.grid extents must be nonnegative static integers")
+          -                # Capture every extent before rebinding any grid induction variable.
+          -                serial_name = self.fresh("grid_serial")
+          -                self.constants[serial_name] = language.serial
+          -                body = node.body
+          -                for target, extent in reversed(tuple(zip(targets, extents))):
+          -                    call = ast.Call(
+          -                        func=ast.Name(id=serial_name, ctx=ast.Load()),
+          -                        args=[ast.Constant(extent)],
+          -                        keywords=[],
+          -                    )
+          -                    loop = ast.For(target=target, iter=call, body=body, orelse=[])
+          -                    ast.copy_location(loop, node)
+          -                    ast.fix_missing_locations(loop)
+          -                    body = [loop]
+          -                return self.statement(body[0], parallel=parallel, nested=nested)
+          +                return iteration.grid(self, node, parallel=parallel, nested=nested)
+                       if name not in ("Parallel", "serial", "Serial", "Pipelined", "unroll", "Unroll"):
+                           self.fail(node, f"Unsupported loop {name}")
+                       if parallel and name == "Parallel":
+          diff --git a/python/ntilang/language.py b/python/ntilang/language.py
+          --- a/python/ntilang/language.py
+          +++ b/python/ntilang/language.py
+          @@ -92,6 +92,21 @@
+               return ceildiv(x, y) * y
+           
+           
+          +def index_to_coordinates(index, shape):
+          +    """Convert an integer index to row-major coordinates using floor arithmetic."""
+          +    if type(index) is not builtins.int:
+          +        raise TypeError("index_to_coordinates requires an integer index")
+          +    if type(shape) not in (tuple, list):
+          +        raise TypeError("Coordinate shape requires a tuple or list")
+          +    if any(type(size) is not builtins.int or size <= 0 for size in shape):
+          +        raise ValueError("Coordinate extents must be positive integers")
+          +    result = []
+          +    for size in reversed(shape):
+          +        result.append(index % size)
+          +        index //= size
+          +    return list(reversed(result))
+          +
+          +
+           @dataclass(frozen=True)
+           class PrimFunc:
+               function: Callable
+          diff --git a/python/ntilang/validation.py b/python/ntilang/validation.py
+          --- a/python/ntilang/validation.py
+          +++ b/python/ntilang/validation.py
+          @@ -260,12 +260,7 @@
+                       magnitude = max(abs(b[0]), abs(b[1])) - 1
+                       result = (max(a[0], -magnitude) if a[0] < 0 else 0, min(a[1], magnitude) if a[1] > 0 else 0)
+               elif expr.op in ("min", "max", "minimum", "maximum"):
+          -        a, b = (interval(x, bounds, definitions, buffers) for x in expr.args)
+          -        dtype = resolved_dtype(expr, bounds, definitions, buffers, ignore_predicates=True)
+          -        if dtype.startswith("uint") and (a[0] < 0 or b[0] < 0):
+          -            raise CompileError("An unsigned index operand conversion can change the represented value")
+          -        operation = min if expr.op in ("min", "minimum") else max
+          -        result = tuple(operation(left, right) for left, right in zip(a, b))
+          +        result = comparison_interval(expr, bounds, definitions, buffers)
+               elif expr.op in ("+", "-", "*"):
+                   a, b = (interval(x, bounds, definitions, buffers) for x in expr.args)
+                   if expr.op == "+":
+          @@ -287,6 +282,33 @@
+               return result
+           
+           
+          +def comparison_interval(expr, bounds, definitions, buffers):
+          +    """Bound clipping of full-width integer data without relaxing index arithmetic.
+          +
+          +    Min/max only select an operand. Wide data leaves can therefore be clipped
+          +    before entering the checked int32 index domain. Arithmetic, narrowing casts,
+          +    and all load indices retain the existing checks in interval/expression.
+          +    """
+          +    if expr.op == "var" and expr.value in definitions:
+          +        return comparison_interval(definitions[expr.value], bounds, definitions, buffers)
+          +    if expr.op in ("load", "parameter", "mutable"):
+          +        if expr.op == "load" and expr.value not in buffers:
+          +            raise CompileError("Integer data bounds require buffer dtype information")
+          +        dtype = buffers[expr.value].type.dtype if expr.op == "load" else expr.value
+          +        if not dtype.startswith(("int", "uint")):
+          +            raise CompileError("Data-dependent indices require an integer dtype")
+          +        return integer_limits(dtype)
+          +    if expr.op in ("min", "max", "minimum", "maximum"):
+          +        a, b = (comparison_interval(arg, bounds, definitions, buffers) for arg in expr.args)
+          +        dtype = resolved_dtype(expr, bounds, definitions, buffers, ignore_predicates=True)
+          +        low, high = integer_limits(dtype)
+          +        if any(start < low or stop > high for start, stop in (a, b)):
+          +            raise CompileError("An index min/max operand conversion can change the represented value")
+          +        operation = min if expr.op in ("min", "minimum") else max
+          +        return tuple(operation(left, right) for left, right in zip(a, b))
+          +    return interval(expr, bounds, definitions, buffers)
+          +
+          +
+           def affine(expr, definitions, bounds=None, buffers=None):
+               """Return constant and integer coefficients, or reject a non-affine expression."""
+               if expr.op == "likely":
+          diff --git a/tests/test_grid_clamp.py b/tests/test_grid_clamp.py
+          --- a/tests/test_grid_clamp.py
+          +++ b/tests/test_grid_clamp.py
+          @@ -55,7 +55,7 @@
+           
+           @pytest.mark.parametrize("shape", [(-1, 3), (True, 3), (2.5, 3)])
+           def test_grid_rejects_invalid_extents(shape):
+          -    with pytest.raises(CompileError, match="nonnegative static"):
+          +    with pytest.raises(CompileError, match="nonnegative static|requires integer"):
+                   grid_kernel(shape)
+           
+           
+          PATCH
+          git apply --check /tmp/runtime.patch
+          git apply /tmp/runtime.patch
+          sed -i '/^`T.grid(\*extents)` constructs/,/^rules apply\. Dynamic grid extents remain unsupported\./c\`T.grid(*extents)` constructs nested serial loops in argument order. Extents\nmay be nonnegative static integers or runtime integer expressions; starred tuple\nand list arguments are accepted, including tensor shape metadata. Construction-time\nmacro arguments expand once, in call-site order, before the induction names are\nrebound. Each runtime extent is captured when its corresponding nested loop is\nentered. Mutable inner extents can therefore change between outer iterations.\nEmpty runtime domains execute no body. Existing serial-loop scope, initialization,\nindex-range, and early-exit rules apply; an empty-capable loop cannot establish\nnew buffer initialization. Tensor shapes and launch grids remain static.' docs/semantics.md
+          sed -i 's/Static `grid` and scalar/Runtime `grid` and scalar/' docs/compatibility.md
+          cat >> docs/semantics.md <<'DOC'
+          
+          ## Coordinate conversion and bounded integer iteration
+          
+          `T.index_to_coordinates(index, shape)` converts a flat integer into row-major
+          coordinates by repeated floor remainder and division from the last axis. It
+          accepts static or runtime integer expressions and a tuple/list of integer
+          extents, including `A.shape`. The returned values support unpacking, indexed
+          access, macro results, and guarded gathers. For positive extents, negative and
+          oversized indices wrap by the shape's element count. An empty shape yields an
+          empty sequence. The host helper accepts Python integers and returns a list;
+          parsed construction results use immutable tuples internally. Container mutation
+          is outside the current frontend contract.
+          
+          Static extents must be positive. Runtime extents must be positive whenever
+          evaluated; division by zero remains a caller precondition for data arithmetic.
+          When the resulting coordinates are used as memory indices, existing interval
+          validation requires provably nonzero divisors and checked index intermediates.
+          Shapes such as `(T.max(1, T.min(rows, 3)), 7)` satisfy those checks. This helper
+          does not introduce dynamic tensor declarations or change the tensor ABI.
+          
+          Integer min/max index bounds can select and clip full-width integer data
+          before it enters the checked signed-32-bit index domain. This permits bounds
+          such as `T.max(0, T.min(n, 3))` for an int64/uint64 scalar argument. The checker
+          validates min/max operand conversions, arithmetic intermediates, narrowing
+          casts, and memory addresses separately. A clipped expression containing an
+          unchecked overflow or value-changing conversion still fails compilation.
+          
+          `examples/window_sum.py` demonstrates runtime window dimensions within static
+          tensor batches, combined with clamping and masked tail rows. Regression tests
+          cover scalar/tensor bounds, mutable inner bounds, starred macros, source-order
+          keyword evaluation, full-width clipping, rejected conversions, and isolated
+          compilation of generated modules. GPU execution and performance are unverified.
+          
+          The construction follows the pinned [TIR Grid builder](https://github.com/tile-ai/tvm/blob/907a88c8791ccf33b9874821bc875e7abf624367/src/tirx/script/builder/ir.cc)
+          and [TileLang coordinate helper](https://github.com/tile-ai/tilelang/blob/62bba8d20ddb232e29050770472cb2649dd3e718/tilelang/language/utils.py).
+          DOC
+          sed -i '/^## Current work/a\
+          \n`T.grid` accepts bounded runtime integer extents and starred tuples/lists.\n`T.index_to_coordinates` composes floor arithmetic with static/runtime dimensions\nand guarded gathers. Full-width integer data can be clipped by min/max before\nentering the checked index domain; arithmetic and conversion checks remain active.\nSee [coordinate and iteration semantics](semantics.md#coordinate-conversion-and-bounded-integer-iteration).\n' docs/compatibility.md
+          sed -i '/| \[Cumulative sum\]/a\| [Runtime window sum](examples/window_sum.py) | Runtime grid bounds, integer clamping, and tail batches |' README.md
+          uv run --frozen ruff check --fix python examples tests
+          uv run --frozen ruff format python examples tests
+          uv run --frozen ruff check python examples tests
+          git diff --check
+      - name: Validate source before committing
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          uv pip freeze > test-results/environment.txt
+          git rev-parse HEAD > test-results/base-sha.txt
+          uv run --frozen --extra cuda python -c "from importlib.metadata import version; assert version('nvidia-cutlass-dsl') == '4.7.1'; assert version('apache-tvm-ffi') == '0.1.11'"
+          uv run --frozen --extra cuda pytest -q -m 'not gpu' --junitxml=test-results/runtime.xml 2>&1 | tee test-results/pytest.txt
+          git add README.md docs/semantics.md docs/compatibility.md python/ntilang/frontend.py python/ntilang/language.py python/ntilang/validation.py python/ntilang/iteration.py tests/test_grid_clamp.py tests/test_runtime_grid.py tests/test_coordinates.py examples/window_sum.py
+          git diff --cached --check
+          git diff --cached --stat > test-results/diffstat.txt
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'feat: integrate runtime grid and row-major coordinate conversion'
+          git rev-parse HEAD | tee test-results/head-sha.txt
+          git push origin HEAD:refs/heads/feat/runtime-grid-coordinates
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: runtime-iteration-results
+          path: test-results/
+          retention-days: 7
