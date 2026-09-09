@@ -53,7 +53,19 @@ def segmented_reference(a, dim, reverse, kind):
         if a.dtype.kind == "i"
         else -np.inf
     )
-    operation = np.add if kind == "cumsum" else np.fmax
+
+    def operation(x, y):
+        if kind == "cumsum":
+            return np.add(x, y)
+        result = np.fmax(x, y)
+        if a.dtype.kind == "f":
+            # The device max instruction ranks +0 above -0 independently
+            # of host SIMD tie-breaking. Both negative inputs preserve -0.
+            both_zero = (x == 0) & (y == 0)
+            zero = np.where(np.signbit(x) & np.signbit(y), -0.0, 0.0)
+            result = np.where(both_zero, zero, result).astype(a.dtype)
+        return result
+
     for index in np.ndindex(values.shape[:-1]):
         row = values[index]
         carry = a.dtype.type(identity)

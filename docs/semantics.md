@@ -637,3 +637,10 @@ rules apply. Dynamic grid extents remain unsupported.
 `T.clamp(dst, min_val, max_val)` composes `T.min(T.max(dst, min_val), max_val)`.
 Operands are evaluated once in argument order and follow existing promotion and
 non-NaN preference rules; reversed bounds retain the same composition.
+
+Scalar `max`/`maximum` and `min`/`minimum` explicitly order positive zero
+above negative zero in the CPU reference, matching the PTX min/max contract.
+The scan reference oracle uses the same documented ordering independently
+of NumPy SIMD operand tie-breaking. Tests retain signed-zero assertions and
+separately exercise NaN-propagating and non-NaN-preferring variants. Device
+execution tests are provided; hardware validation remains outstanding.
