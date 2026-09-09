@@ -599,3 +599,41 @@ the basic numeric and Boolean buffer types except BF16, and uses FP32 matrix mul
 does not simulate physical lane scheduling, register allocation, Tensor Core
 rounding, or performance. GPU tests are the next validation layer for executable
 behavior.
+
+## Inclusive scans and shared transpose
+
+`T.cumsum(src, dst=None, dim=0, reverse=False, annotations=None)` and
+`T.cummax` accept one- or two-dimensional shared/fragment buffers and explicit
+unit-stride regions. Negative axes are normalized; omitted destinations update
+the source in place. Shapes must match. Shared sources require shared destinations
+of the same dtype. Fragment sources stage through shared storage and permit final
+copy dtype conversion. Boolean scans and nonempty annotations remain unsupported.
+The launch uses 32, 64, 128, 256, 512, or 1024 threads.
+
+The lowering preserves the pinned CUDA `InclusiveScanLine` arithmetic schedule:
+32-element segments, shuffle distances 1/2/4/8/16, identity-padded tail lanes,
+source-dtype rounding after each combine, and sequential segment carries. Reverse
+scans traverse segments backwards and combine with higher-index neighbors.
+`cummax` uses non-NaN-preferring maximum, including the identity carry. The CPU
+reference executes this schedule; NVIDIA device numerical parity and performance
+remain unverified. Two shared ping-pong tiles, padded to 32 along the scan axis,
+and a per-line carry tile implement communication with block barriers. Workspace
+is reused by compatible calls and counted in the 48 KiB block memory limit.
+
+`T.transpose(src, dst, annotations=None)` swaps the final two axes of shared
+buffers or explicit regions, preserving batch axes and singleton dimensions.
+The destination shape must match the permutation. Copies apply destination dtype
+conversion and guard tensor bounds. Aliased/overlapping temporary regions capture
+the source before writes. Nonempty annotations and other memory scopes remain
+unsupported. These collectives may appear in uniform branches or serial loops;
+placing them inside a `T.Parallel` body is rejected.
+
+`T.grid(*extents)` constructs nested serial loops in argument order. This version
+accepts nonnegative static integer extents, captures all extents before binding
+induction variables, and requires a distinct variable per dimension. Zero extents
+produce empty domains. Existing serial-loop scope, initialization, and early-exit
+rules apply. Dynamic grid extents remain unsupported.
+
+`T.clamp(dst, min_val, max_val)` composes `T.min(T.max(dst, min_val), max_val)`.
+Operands are evaluated once in argument order and follow existing promotion and
+non-NaN preference rules; reversed bounds retain the same composition.

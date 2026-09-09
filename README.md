@@ -116,6 +116,7 @@ multiplication.
 | [Tiled matrix multiplication](examples/matmul.py) | Shared-memory tiles and warp-level Tensor Core GEMM |
 | [Matrix multiplication + ReLU](examples/matmul_relu.py) | Scale, bias, and activation in the accumulator layout |
 | [Softmax](examples/softmax.py) | Maximum and sum reductions with fragment broadcasts |
+| [Cumulative sum](examples/cumsum.py) | Inclusive row scans, reverse traversal, and tail tiles |
 | [Tiled transpose](examples/transpose.py) | Sliced copies and shared-memory communication |
 | [Fragment affine transform](examples/fragment_affine.py) | Elementwise operations on register fragments |
 | [Piecewise transform](examples/piecewise.py) | Data-dependent branches and guarded stores |

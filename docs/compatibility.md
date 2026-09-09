@@ -29,6 +29,18 @@ Both upstream spellings are now implemented with their non-NaN preference.
 
 ## Current work
 
+Inclusive `cumsum`/`cummax` support one-/two-dimensional shared and fragment
+regions, negative axes, reverse scans, in-place updates, and fragment-output
+conversion. Their shared lowering preserves the pinned CUDA 32-element segment
+tree, source-dtype rounding, and sequential carries. Workspaces are reused and
+included in the block memory budget. `transpose` supports shared regions,
+batch/singleton axes, dtype conversion, and overlapping temporary snapshots.
+Static `grid` nests and scalar `clamp` are implemented. See
+[semantics.md](semantics.md#inclusive-scans-and-shared-transpose) for signatures,
+scope restrictions, annotations, and numerical verification limits. Wider scan
+ranks, Boolean scans, dynamic grid extents, additional layouts, hardware numerical
+parity, and device performance remain open.
+
 CUDA diagnostic calls support `T.print` for scalar IR values, messages and the
 existing global/shared/fragment buffer types, plus `T.device_assert` with optional
 source/macro stack information. Print thread selection and fragment materialization

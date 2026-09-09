@@ -87,7 +87,11 @@ def scan(parser, call, node, kind):
     )
     src = _region(parser, args["src"])
     destination_value = parser.macro_value(args["dst"])
-    dst = src if destination_value is None else _region(parser, macros.ValueNode(destination_value, args["dst"]))
+    dst = (
+        src
+        if destination_value is None
+        else _region(parser, macros.ValueNode(destination_value, args["dst"]))
+    )
     dim, reverse = (parser.static(args[name]) for name in ("dim", "reverse"))
     _annotations(parser, args["annotations"])
     rank = len(src.shape)
@@ -103,7 +107,9 @@ def scan(parser, call, node, kind):
     source, destination = (parser.buffers[r.buffer] for r in (src, dst))
     if source.space not in ("shared", "fragment"):
         parser.fail(call, "Scan sources must be shared or fragment regions")
-    if source.space == "shared" and (destination.space != "shared" or source.type.dtype != destination.type.dtype):
+    if source.space == "shared" and (
+        destination.space != "shared" or source.type.dtype != destination.type.dtype
+    ):
         parser.fail(call, "A shared scan requires a shared destination with the same dtype")
     dtype = source.type.dtype
     if dtype == "bool":
@@ -159,7 +165,9 @@ def scan(parser, call, node, kind):
     line_shape = tuple(32 if i == dim else size for i, size in enumerate(padded))
     names = tuple(parser.fresh("scan_lane") for _ in padded)
     coords = tuple(Expr("var", value=name) for name in names)
-    indices = tuple(Expr("+", (segment_offset, value)) if i == dim else value for i, value in enumerate(coords))
+    indices = tuple(
+        Expr("+", (segment_offset, value)) if i == dim else value for i, value in enumerate(coords)
+    )
     carry_indices = tuple(_const(0) if i == dim else value for i, value in enumerate(coords))
     value = combine(Expr("load", indices, left), Expr("load", carry_indices, carry))
     body = (Statement("store", (right, indices, value), loc),)
@@ -168,10 +176,16 @@ def scan(parser, call, node, kind):
         Expr("+", (segment_offset, _const(0 if reverse else 31))) if i == dim else _const(0)
         for i in range(rank)
     )
-    update = Statement("copy", (Region(right, edge_origin, carry_shape), Region(carry, zeros, carry_shape)), loc)
+    update = Statement(
+        "copy", (Region(right, edge_origin, carry_shape), Region(carry, zeros, carry_shape)), loc
+    )
     bounds = (segments - 1, -1, -1) if reverse else (0, segments, 1)
     result.append(
-        Statement("serial", ((segment_name,), bounds, (Statement("parallel", (names, line_shape, body), loc), update)), loc)
+        Statement(
+            "serial",
+            ((segment_name,), bounds, (Statement("parallel", (names, line_shape, body), loc), update)),
+            loc,
+        )
     )
     result.append(Statement("copy", (Region(right, zeros, src.shape), dst), loc))
     return tuple(result)

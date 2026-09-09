@@ -10,7 +10,18 @@ from ntilang.ir import CompileError
 from ntilang.testing import reference
 
 
-def scan_kernel(shape=(3, 37), dim=-1, reverse=False, kind="cumsum", dtype="float32", scope="shared", inplace=True, threads=64, out_dtype=None, target="sm_80"):
+def scan_kernel(
+    shape=(3, 37),
+    dim=-1,
+    reverse=False,
+    kind="cumsum",
+    dtype="float32",
+    scope="shared",
+    inplace=True,
+    threads=64,
+    out_dtype=None,
+    target="sm_80",
+):
     operation = getattr(T, kind)
     allocate = T.alloc_shared if scope == "shared" else T.alloc_fragment
     out_dtype = dtype if out_dtype is None else out_dtype
@@ -35,7 +46,13 @@ def segmented_reference(a, dim, reverse, kind):
     """Independent transcription of pinned CUDA InclusiveScanLine arithmetic."""
     values = np.moveaxis(a, dim, -1)
     output = np.empty_like(values)
-    identity = 0 if kind == "cumsum" or a.dtype.kind == "u" else np.iinfo(a.dtype).min if a.dtype.kind == "i" else -np.inf
+    identity = (
+        0
+        if kind == "cumsum" or a.dtype.kind == "u"
+        else np.iinfo(a.dtype).min
+        if a.dtype.kind == "i"
+        else -np.inf
+    )
     operation = np.add if kind == "cumsum" else np.fmax
     for index in np.ndindex(values.shape[:-1]):
         row = values[index]
@@ -58,9 +75,24 @@ def segmented_reference(a, dim, reverse, kind):
 
 
 @pytest.mark.parametrize("kind", ["cumsum", "cummax"])
-@pytest.mark.parametrize("shape,dim", [((1,), 0), ((31,), -1), ((32,), 0), ((33,), 0), ((65,), 0), ((3, 37), -1), ((37, 3), 0), ((1, 7), 0), ((7, 1), 1)])
+@pytest.mark.parametrize(
+    "shape,dim",
+    [
+        ((1,), 0),
+        ((31,), -1),
+        ((32,), 0),
+        ((33,), 0),
+        ((65,), 0),
+        ((3, 37), -1),
+        ((37, 3), 0),
+        ((1, 7), 0),
+        ((7, 1), 1),
+    ],
+)
 @pytest.mark.parametrize("reverse", [False, True])
-@pytest.mark.parametrize("scope,inplace", [("shared", True), ("shared", False), ("fragment", True), ("fragment", False)])
+@pytest.mark.parametrize(
+    "scope,inplace", [("shared", True), ("shared", False), ("fragment", True), ("fragment", False)]
+)
 def test_scan_reference(shape, dim, reverse, kind, scope, inplace):
     a = (np.arange(np.prod(shape)).reshape(shape) % 19 - 9).astype(np.float32)
     b = np.empty_like(a)
@@ -73,7 +105,22 @@ def test_scan_reference(shape, dim, reverse, kind, scope, inplace):
 
 
 @pytest.mark.parametrize("kind", ["cumsum", "cummax"])
-@pytest.mark.parametrize("dtype", ["float16", "float32", "float64", "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64"])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        "float16",
+        "float32",
+        "float64",
+        "int8",
+        "uint8",
+        "int16",
+        "uint16",
+        "int32",
+        "uint32",
+        "int64",
+        "uint64",
+    ],
+)
 @pytest.mark.parametrize("reverse", [False, True])
 def test_scan_typed_rounding(dtype, reverse, kind):
     a = np.random.default_rng(13).uniform(-2, 2, (2, 65)).astype(dtype)
@@ -87,7 +134,7 @@ def test_scan_typed_rounding(dtype, reverse, kind):
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("kind", ["cumsum", "cummax"])
 def test_scan_special_values(reverse, kind):
-    a = np.resize(np.array([-0., 0., np.nan, -np.inf, np.inf, 1.], dtype=np.float32), 65)
+    a = np.resize(np.array([-0.0, 0.0, np.nan, -np.inf, np.inf, 1.0], dtype=np.float32), 65)
     b = np.empty_like(a)
     with np.errstate(invalid="ignore"):
         reference(scan_kernel(a.shape, 0, reverse, kind), a, b)
@@ -96,7 +143,17 @@ def test_scan_special_values(reverse, kind):
     np.testing.assert_array_equal(np.signbit(b[b == 0]), np.signbit(expected[expected == 0]))
 
 
-@pytest.mark.parametrize("kwargs,match", [({"dim": 2}, "dim"), ({"dim": True}, "dim"), ({"reverse": 1}, "reverse"), ({"shape": (2, 2, 2)}, "dimensional"), ({"threads": 48}, "threads"), ({"dtype": "bool"}, "Boolean")])
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"dim": 2}, "dim"),
+        ({"dim": True}, "dim"),
+        ({"reverse": 1}, "reverse"),
+        ({"shape": (2, 2, 2)}, "dimensional"),
+        ({"threads": 48}, "threads"),
+        ({"dtype": "bool"}, "Boolean"),
+    ],
+)
 def test_scan_invalid_arguments(kwargs, match):
     with pytest.raises(CompileError, match=match):
         scan_kernel(**kwargs)
@@ -105,7 +162,23 @@ def test_scan_invalid_arguments(kwargs, match):
 @pytest.mark.cuda
 @pytest.mark.skipif(importlib.util.find_spec("cutlass") is None, reason="CuTe DSL compiler is not installed")
 @pytest.mark.parametrize("kind", ["cumsum", "cummax"])
-@pytest.mark.parametrize("dtype", ["float16", "bfloat16", "float32", "float64", "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64"])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        "float16",
+        "bfloat16",
+        "float32",
+        "float64",
+        "int8",
+        "uint8",
+        "int16",
+        "uint16",
+        "int32",
+        "uint32",
+        "int64",
+        "uint64",
+    ],
+)
 @pytest.mark.parametrize("dim,reverse,scope", [(0, False, "shared"), (1, True, "fragment")])
 def test_scan_cute_compilation(kind, dtype, dim, reverse, scope):
     assert scan_kernel((3, 37), dim, reverse, kind, dtype, scope).build().has_gpu_module
@@ -113,9 +186,11 @@ def test_scan_cute_compilation(kind, dtype, dim, reverse, scope):
 
 def context_kernel(context="serial", kind="cumsum"):
     operation = getattr(T, kind)
+
     @T.macro
     def apply(tile):
         operation(tile, dim=-1)
+
     @T.prim_func
     def kernel(A: T.Tensor((3, 37), "float32"), B: T.Tensor((3, 37), "float32"), flag: T.int32):
         with T.Kernel(1):
@@ -138,6 +213,7 @@ def context_kernel(context="serial", kind="cumsum"):
                 apply(src)
                 apply(src)
             T.copy(src, B)
+
     return ntilang.compile(kernel)
 
 
@@ -159,6 +235,7 @@ def test_scan_control_flow_workspace_reuse(context, flag, kind):
 
 def scan_region_kernel(kind="cumsum", reverse=False, partial_init=True):
     operation = getattr(T, kind)
+
     @T.prim_func
     def kernel(A: T.Tensor((4, 72), "float32"), B: T.Tensor((4, 72), "float32")):
         with T.Kernel(1):
@@ -169,6 +246,7 @@ def scan_region_kernel(kind="cumsum", reverse=False, partial_init=True):
                 T.fill(dst, -5)
             operation(src[1:3, 2:67], dst[0:2, 4:69], dim=1, reverse=reverse)
             T.copy(dst, B)
+
     return ntilang.compile(kernel)
 
 
@@ -215,7 +293,9 @@ def test_scan_regions_cute_compilation():
 
 def mma_scan_kernel():
     @T.prim_func
-    def kernel(A: T.Tensor((32, 32), "float16"), B: T.Tensor((32, 32), "float16"), C: T.Tensor((32, 32), "float32")):
+    def kernel(
+        A: T.Tensor((32, 32), "float16"), B: T.Tensor((32, 32), "float16"), C: T.Tensor((32, 32), "float32")
+    ):
         with T.Kernel(1, threads=128):
             a = T.alloc_shared((32, 32), "float16")
             b = T.alloc_shared((32, 32), "float16")
@@ -226,6 +306,7 @@ def mma_scan_kernel():
             T.gemm(a, b, acc)
             T.cumsum(acc, dim=-1)
             T.copy(acc, C)
+
     return ntilang.compile(kernel)
 
 
@@ -258,6 +339,7 @@ def test_scan_generated_module_is_standalone(kind, tmp_path):
 
 def test_cumsum_example_tail_rows():
     from examples.cumsum import cumsum
+
     a = np.arange(7 * 65, dtype=np.float32).reshape(7, 65) % 11 - 5
     for reverse in (False, True):
         b = np.empty_like(a)
