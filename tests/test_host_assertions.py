@@ -310,7 +310,8 @@ def framed_check():
             with T.Assert(shifted > 2, "inner", error_kind="ValueError"):
                 result = shifted * 2
         with T.Kernel(threads=1):
-            B[0] = result
+            for i in T.Parallel(1):
+                B[i] = result
 
     return ntilang.compile(kernel)
 
@@ -390,6 +391,11 @@ HOST_UNARY_CASES = [
     for dtype in ("float32", "float64")
     for operation, value, expected in (*ROUNDING_CASES, *CLASSIFICATION_CASES)
 ] + [(operation, "float16", value, expected) for operation, value, expected in ROUNDING_CASES]
+HOST_UNARY_CASES += [
+    ("isinf", dtype, value, expected)
+    for dtype in ("float16", "float32", "float64")
+    for value, expected in ((float("inf"), True), (float("nan"), False), (-0.0, False), (65504.0, False))
+] + [("isinf", "float16", float("-inf"), True)]
 
 
 def unary_math_check(operation, dtype):
@@ -532,6 +538,36 @@ def test_native_checker_output_pointer_needs_no_cuda_module():
     assert output.value == 1
     executable(0, pointer)
     assert output.value == 0
+
+
+@pytest.mark.cuda
+@requires_cute
+@pytest.mark.parametrize("condition", [False, True])
+def test_native_zero_scalar_input_checker(condition):
+    @T.prim_func
+    def kernel():
+        T.Assert(condition, "zero argument check", error_kind="ValueError")
+        with T.Kernel(threads=1):
+            pass
+
+    executable = ntilang.compile(kernel).build()
+    assert not executable._checker.has_gpu_module
+    if condition:
+        executable._check_arguments()
+    else:
+        with pytest.raises(ValueError, match="zero argument check"):
+            executable()
+
+
+@pytest.mark.cuda
+@requires_cute
+def test_native_assert_frame_bindings_and_prelaunch_failure():
+    executable = framed_check().build()
+    with pytest.raises(RuntimeError, match="outer"):
+        executable(0, object())
+    with pytest.raises(ValueError, match="inner"):
+        executable(1, object())
+    executable._check_arguments(3, object())
 
 
 @pytest.mark.cuda

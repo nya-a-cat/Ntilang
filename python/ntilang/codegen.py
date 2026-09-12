@@ -101,6 +101,7 @@ class Emitter:
         self.bitcasts = {}
         self.debug_prints = {}
         self.device_asserts = False
+        self.emitting_host_checks = False
         self.math_header = any(requests_math_header(stmt.args) for stmt in walk(kernel.body))
         self.parallel = None
         self.control = None
@@ -503,6 +504,15 @@ class Emitter:
                 ):
                     return self.low_precision_unary(op, dtype, value)
                 value = f"cutlass.Float32({value})"
+            if op == "isinf" and self.emitting_host_checks:
+                # The pinned CPU pipeline leaves math.isinf untranslated.
+                # Ordered comparisons preserve both infinity signs and reject NaN.
+                saved = self.unique("host_isinf")
+                self.emit(f"{saved} = {value}")
+                compare_type = "cutlass.Float32" if dtype in ("float16", "bfloat16") else type_name
+                positive = f"{compare_type}(float('inf'))"
+                negative = f"{compare_type}(float('-inf'))"
+                return f"cutlass.Boolean(({saved} == {positive}) | ({saved} == {negative}))"
             if op == "exp10":
                 symbol = "__nv_exp10f" if dtype == "float32" else "__nv_exp10"
                 return self.math_external(symbol, dtype, [value], (dtype,))
@@ -1147,6 +1157,7 @@ class Emitter:
         self.emit(f"def _nt_check_preconditions({', '.join(parameters)}):")
         self.depth = 1
         self.emit("_nt_failed = cutlass.Int32(0)")
+        self.emitting_host_checks = True
         for index, check in enumerate(self.kernel.host_checks, 1):
             # A failed assertion stops evaluation of all following predicates.
             self.emit("if _nt_failed == 0:")
@@ -1156,6 +1167,7 @@ class Emitter:
             self.depth += 1
             self.emit(f"_nt_failed = cutlass.Int32({index})")
             self.depth -= 2
+        self.emitting_host_checks = False
         self.emit("_nt_output[0] = _nt_failed")
         self.depth = 0
         self.emit()
