@@ -20,13 +20,13 @@ implemented or validated compatibility.
 
 ## Current baseline
 
-Implementation revision: `1e04fa5e4b03c5a82582414a0b8e44eb25605d70`.
-[GitHub Actions run 34204909253](https://github.com/nya-a-cat/Ntilang/actions/runs/34204909253)
+Implementation revision: `0c0fa4d3dd1c2751ebc21a4b0dd3a52a0d894097`.
+[GitHub Actions run 34674793463](https://github.com/nya-a-cat/Ntilang/actions/runs/34674793463)
 passed with NVIDIA CuTe DSL 4.7.1 and TVM FFI 0.1.11:
 
-- Linux: 2,332 semantic, native compilation, and host FFI checks passed.
-- Windows: 1,433 checks passed; 899 compiler-dependent checks were skipped.
-- Both jobs deselected 29 GPU tests. No GPU execution was performed.
+- Linux: 3,451 semantic, native compilation, and host FFI checks passed.
+- Windows: 2,344 checks passed; 1,107 compiler-dependent checks were skipped.
+- Both jobs deselected 51 GPU tests. No GPU execution was performed.
 - Source and wheel distributions built successfully.
 
 Implemented areas, within the restrictions in
@@ -36,6 +36,8 @@ Implemented areas, within the restrictions in
   fake-tensor compilation, and standalone generated modules.
 - Scalar/message/buffer printing, device assertions with source stacks,
   construction-time Python assertions, likely hints and diagnostic-only kernels.
+- Pre-launch scalar Python assertions and `T.Assert`, ordered CPU checks,
+  literal error messages and exception kinds, including standalone modules.
 - Buffer/scalar metadata, basic dtype descriptors and conversions, and pure
   construction bindings before the final Kernel frame.
 - Shared/register fragments, guarded global accesses, sliced synchronous copies,
@@ -51,6 +53,9 @@ Implemented areas, within the restrictions in
   IEEE rounding, FMA, the explicit multiply boundary, and nine fast-math calls.
 - Eight basic reduction kinds, broadcast reads, warp MMA GEMM, accumulator
   epilogues, and propagation of compatible fragment ownership layouts.
+- Inclusive `cumsum`/`cummax` with canonical segment-tree and carry order,
+  shared transpose, bounded runtime `T.grid`, coordinate conversion, and
+  scalar clamp composition.
 - Conservative ownership, initialization, alias, index-range, and shared-memory
   checks, with a serial NumPy reference evaluator.
 - Hygienic source macros with scalar, buffer, region, and tuple values;
@@ -61,7 +66,10 @@ The reference evaluator does not model device scheduling or Tensor Core
 rounding. Native compilation establishes compiler acceptance and binary
 generation. CPU-only native FFI checks observe scalar conversions through CPU
 output storage. They cover Boolean and all basic integer/floating argument types,
-including full-width unsigned inputs. Hardware numerical accuracy, concurrency behavior, performance,
+including full-width unsigned inputs. Native CPU assertion checks cover typed
+arithmetic, rounding and classification, ordered failure handling, standalone
+modules, and composition with runtime grid launches.
+Hardware numerical accuracy, concurrency behavior, performance,
 and full compilation-chain formal verification remain unverified.
 
 ## 1. Complete scalar semantics and the source frontend
