@@ -1535,19 +1535,50 @@ class Parser:
             self.fail(node, "T.print expects a buffer, scalar IR expression, or None")
         return Statement("print", (obj, message, main_lane), self.location(node))
 
+    def host_assertion(self, condition, message, error_kind, node):
+        if not self.before_launch:
+            self.fail(
+                node,
+                "Runtime Python assert and T.Assert require host error lowering before T.Kernel; "
+                "use T.device_assert inside T.Kernel",
+            )
+        condition = self.scalar_value(condition, node)
+        self.check_prelude_expr(condition, node)
+        parts = (message,) if type(message) is str else tuple(message) if type(message) is list else message
+        if type(parts) is not tuple or not parts or any(type(part) is not str for part in parts):
+            self.fail(node, "Host assertion messages require a string or nonempty list/tuple of strings")
+        if type(error_kind) is not str:
+            self.fail(node, "Host assertion error_kind must be a construction-time string")
+        return Statement("host_assert", (condition, parts, error_kind), self.location(node))
+
+    def assert_call(self, call, node):
+        arguments = self.bind_call(
+            call, ["condition", "message", "error_kind"], {"error_kind": "RuntimeError"}
+        )
+        values = {name: self.macro_value(value) for name, value in arguments.items()}
+        return self.host_assertion(values["condition"], values["message"], values["error_kind"], node)
+
     def statement(self, node, *, parallel=False, nested=False):
         loc = self.location(node)
         if isinstance(node, ast.Assert):
             condition = self.macro_value(node.test)
             message = self.macro_value(node.msg) if node.msg is not None else "Assertion failed"
+            if message is None:
+                message = "Assertion failed"
             if isinstance(condition, (Expr, macros.ReferenceValue)):
-                self.fail(
-                    node,
-                    "Runtime Python assert requires host error lowering; use T.device_assert inside T.Kernel",
-                )
+                return self.host_assertion(condition, message, "RuntimeError", node)
             if not condition:
                 raise AssertionError(message)
             return Statement("pass", (), loc)
+        if isinstance(node, ast.With):
+            if len(node.items) != 1 or node.items[0].optional_vars is not None:
+                self.fail(node, "Host T.Assert frames require one context without an as binding")
+            call = node.items[0].context_expr
+            if self.call_name(call) != "Assert":
+                self.fail(node, "Only T.Assert frames are supported before the final T.Kernel")
+            check = self.assert_call(call, node)
+            # AssertFrame is a sequential statement container, not a lexical scope.
+            return (check, *self.statements(node.body, parallel=parallel, nested=nested))
         if isinstance(node, ast.AnnAssign):
             if not isinstance(node.target, ast.Name):
                 self.fail(node, "Local scalar annotations require a name target")
@@ -1807,6 +1838,8 @@ class Parser:
                     return Statement("evaluate", (self.scalar_value(result, call),), loc)
                 return Statement("pass", (), loc)
             name = self.call_name(call)
+            if name == "Assert":
+                return self.assert_call(call, node)
             if name in ("print", "device_assert"):
                 return self.debug_statement(call, name, node, parallel)
             if name == "likely":
@@ -1910,18 +1943,16 @@ class Parser:
             and isinstance(body[0].value.value, str)
         ):
             body = body[1:]
-        if (
-            not body
-            or not isinstance(body[-1], ast.With)
-            or len(body[-1].items) != 1
-            or any(isinstance(node, ast.With) for node in body[:-1])
-        ):
+        if not body or not isinstance(body[-1], ast.With) or len(body[-1].items) != 1:
             self.fail(fn, "A kernel must end with one top-level with T.Kernel(...) block")
         self.before_launch = True
         prefix = self.statements(body[:-1])
+        host_checks = []
         for statement in prefix:
             if statement.op == "evaluate":
                 self.check_prelude_expr(statement.args[0], fn)
+            elif statement.op == "host_assert":
+                host_checks.append(statement)
             elif statement.op != "pass":
                 self.fail(fn, "Statements before T.Kernel require pure construction-time bindings")
         self.before_launch = False
@@ -1976,6 +2007,7 @@ class Parser:
             self.threads,
             statements,
             self.source,
+            tuple(host_checks),
         )
 
 

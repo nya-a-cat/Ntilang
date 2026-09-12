@@ -15,7 +15,7 @@ from .compiler import CompiledKernel
 from .debug import reference_print
 from .floating import evaluate as evaluate_floating
 from .ir import DTYPES, Buffer, Expr, ScalarParameter, integer_limits
-from .runtime import normalize_scalar
+from .runtime import host_assertion_error, normalize_scalar
 from .scalar import (
     BINARY_MATH_OPS,
     BIT_COUNT_OPS,
@@ -408,6 +408,13 @@ def reference(kernel: CompiledKernel, *arrays):
                 variable_types = before_types
             else:
                 raise ValueError(f"Unknown IR operation {op}")
+
+    variables.update(scalar_values)
+    variable_types = scalar_types.copy()
+    for check in kernel.ir.host_checks:
+        condition, parts, error_kind = check.args
+        if not expr(condition):
+            raise host_assertion_error(error_kind, parts)
 
     for block in itertools.product(*(range(n) for n in kernel.ir.grid)):
         variables.clear()

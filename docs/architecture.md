@@ -73,6 +73,20 @@ lower-level compiler caches.
 an explicit architecture and the TVM FFI ABI. TVM FFI is a separate ABI package;
 the Ntilang frontend and lowering pipeline do not use the TVM compiler or TileLang.
 
+Pre-launch assertions are stored separately in `Kernel.host_checks`. Validation
+restricts their conditions to Boolean expressions over scalar parameters and
+operations with CPU lowering. Code generation compiles an additional host
+function with a generic output pointer and only the scalar inputs used by those
+conditions. It writes the first failing check's index into per-call `ctypes`
+storage. A Python callable raises the corresponding exception before calling
+the CUDA entry point; generated modules retain this mechanism independently.
+
+This wrapper exposes compiled-module metadata through a fixed property list.
+Native callable conversion and export need separate integration to preserve
+the host checks. The serial NumPy evaluator executes the same checks before
+entering the block loop. Host predicates do not relax device index or ownership
+validation.
+
 ## Validation layers
 
 The test suite separates Python/frontend checks, serial IR reference evaluation,

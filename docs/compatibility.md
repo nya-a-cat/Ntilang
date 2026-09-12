@@ -59,9 +59,17 @@ literal message text and full-width numeric formatting. Zero-argument and scalar
 kernels can launch without block-variable bindings and can emit diagnostics
 without a tensor output. A default launch uses one block. Reference diagnostics
 use linear row-major logical ownership; physical MMA lanes and device output
-ordering remain unmodeled. Python construction-time assertions are supported;
-runtime Python assertions, `T.Assert`, host exception checks, assumption forms,
-local/vector/pointer diagnostics and GPU execution remain open.
+ordering remain unmodeled. Python construction-time assertions are supported.
+Before the final launch, runtime Python assertions and bare/with `T.Assert`
+support pure Boolean scalar conditions, message fragments, and host exceptions.
+A native CPU checker enforces the first failure before the CUDA callable runs;
+the standalone `compile_kernel()` entry point retains those checks without an
+array-library dependency. Scalar type conversions, error-kind fallback and
+per-fragment C-string termination follow the pinned FFI contract. Tensor-based
+conditions, assertion frames around a launch, device-internal runtime Python
+assertions, custom error registrations and low-level export integration remain
+open. See [diagnostics](semantics.md#diagnostics-and-hints) for the supported host operations.
+Assumption forms, local/vector/pointer diagnostics and GPU execution remain open.
 `T.likely` preserves its operand/dtype and participates in index and lazy-predicate
 analysis. Backend branch weights are currently left to the compiler.
 

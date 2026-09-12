@@ -21,6 +21,7 @@ from .ir import (
     integer_limits,
     loop_controls,
 )
+from .runtime import HOST_ERROR_TYPES
 from .scalar import (
     BINARY_MATH_OPS,
     BINARY_NUMERIC_OPS,
@@ -106,6 +107,19 @@ class Emitter:
         self.scalar_types = {name: "int32" for name in kernel.block_vars}
         self.scalar_types.update(
             {p.name: p.dtype for p in kernel.parameters if isinstance(p, ScalarParameter)}
+        )
+
+        def host_names(value):
+            names = {value.value} if value.op == "var" else set()
+            for child in value.args:
+                names.update(host_names(child))
+            return names
+
+        host_inputs = set().union(*(host_names(check.args[0]) for check in kernel.host_checks))
+        self.host_parameters = tuple(
+            (index, p)
+            for index, p in enumerate(kernel.parameters)
+            if isinstance(p, ScalarParameter) and p.name in host_inputs
         )
         self.active_snapshots = set()
         for stmt in walk(kernel.body):
@@ -1123,6 +1137,82 @@ class Emitter:
         arguments = ", ".join(f"cutlass.{CUTLASS_TYPES[typ]}({value})" for typ, value in zip(dtypes, values))
         return f"cutlass.{CUTLASS_TYPES[dtype]}(_nt_math{symbol}({arguments}))"
 
+    def emit_host_checks(self, names):
+        """Compile typed scalar predicates on CPU and retain Python error propagation."""
+        parameters = ["_nt_output: cute.Pointer"]
+        parameters.extend(
+            f"{self.var(p.name)}: cutlass.{CUTLASS_TYPES[p.dtype]}" for _, p in self.host_parameters
+        )
+        self.emit("@cute.jit")
+        self.emit(f"def _nt_check_preconditions({', '.join(parameters)}):")
+        self.depth = 1
+        self.emit("_nt_failed = cutlass.Int32(0)")
+        for index, check in enumerate(self.kernel.host_checks, 1):
+            # A failed assertion stops evaluation of all following predicates.
+            self.emit("if _nt_failed == 0:")
+            self.depth += 1
+            condition = self.expression(check.args[0])
+            self.emit(f"if not ({condition}):")
+            self.depth += 1
+            self.emit(f"_nt_failed = cutlass.Int32({index})")
+            self.depth -= 2
+        self.emit("_nt_output[0] = _nt_failed")
+        self.depth = 0
+        self.emit()
+        errors = tuple(
+            (kind.split("\0", 1)[0], "".join(part.split("\0", 1)[0] for part in parts))
+            for _, parts, kind in (check.args for check in self.kernel.host_checks)
+        )
+        self.emit(f"_nt_host_errors = {errors!r}")
+        self.emit(
+            "_nt_host_error_types = {" + ", ".join(f"{name!r}: {name}" for name in HOST_ERROR_TYPES) + "}"
+        )
+        self.emit()
+        self.emit("class _nt_CheckedExecutable:")
+        self.depth = 1
+        self.emit("def __init__(self, executable, checker):")
+        self.depth = 2
+        self.emit("self._executable = executable")
+        self.emit("self._checker = checker")
+        self.depth = 1
+        self.emit()
+        self.emit("def __getattr__(self, name):")
+        self.depth = 2
+        self.emit(
+            "if name not in ('artifacts', 'function_name', 'has_gpu_module', '__ptx__', '__cubin__', '__sass__', '__mlir__'):"
+        )
+        self.depth += 1
+        self.emit(
+            "raise TypeError('Native callable conversion and export require separate host-check integration')"
+        )
+        self.depth -= 1
+        self.emit("return getattr(self._executable, name)")
+        self.depth = 1
+        self.emit()
+        signature = ", ".join(["self", *names])
+        self.emit(f"def _check_arguments({signature}):")
+        self.depth = 2
+        self.emit("import ctypes")
+        self.emit("from cutlass.cute.runtime import make_ptr")
+        self.emit("_nt_status = ctypes.c_int32(0)")
+        self.emit(
+            "_nt_pointer = make_ptr(cutlass.Int32, ctypes.addressof(_nt_status), cute.AddressSpace.generic, assumed_align=4)"
+        )
+        checked = ["_nt_pointer", *(names[index] for index, _ in self.host_parameters)]
+        self.emit(f"self._checker({', '.join(checked)})")
+        self.emit("if _nt_status.value:")
+        self.depth += 1
+        self.emit("kind, message = _nt_host_errors[_nt_status.value - 1]")
+        self.emit("raise _nt_host_error_types.get(kind, RuntimeError)(message)")
+        self.depth = 1
+        self.emit()
+        self.emit(f"def __call__({signature}):")
+        self.depth = 2
+        self.emit(f"self._check_arguments({', '.join(names)})")
+        self.emit(f"return self._executable({', '.join(names)})")
+        self.depth = 0
+        self.emit()
+
     def math_low_precision(self, operation, dtype, values):
         helper = f"_nt_{operation}_{dtype}"
         self.math_ptx[helper] = (operation, dtype, len(values))
@@ -1286,6 +1376,9 @@ class Emitter:
         )
         self.depth = 0
         self.emit()
+        parameter_names = [parameter_name(p) for p in self.kernel.parameters]
+        if self.kernel.host_checks:
+            self.emit_host_checks(parameter_names)
         self.emit("def compile_kernel():")
         self.depth = 1
         self.emit("from cutlass.cute.runtime import make_fake_compact_tensor")
@@ -1301,7 +1394,22 @@ class Emitter:
                 f"{name} = make_fake_compact_tensor({self.dtype(p.name)}, {p.type.shape}, stride_order={order}, assumed_align=16)"
             )
         arguments = ", ".join(["run", *names, f'options="--enable-tvm-ffi --gpu-arch={self.target}"'])
-        self.emit(f"return cute.compile({arguments})")
+        if self.kernel.host_checks:
+            self.emit(f"executable = cute.compile({arguments})")
+            self.emit("from cutlass.cute.runtime import nullptr")
+            self.emit("_nt_output = nullptr(cutlass.Int32, cute.AddressSpace.generic, assumed_align=4)")
+            check_arguments = ", ".join(
+                [
+                    "_nt_check_preconditions",
+                    "_nt_output",
+                    *(names[index] for index, _ in self.host_parameters),
+                    f'options="--enable-tvm-ffi --gpu-arch={self.target}"',
+                ]
+            )
+            self.emit(f"checker = cute.compile({check_arguments})")
+            self.emit("return _nt_CheckedExecutable(executable, checker)")
+        else:
+            self.emit(f"return cute.compile({arguments})")
         result = "\n".join(self.lines) + "\n"
         ast.parse(result)
         return result

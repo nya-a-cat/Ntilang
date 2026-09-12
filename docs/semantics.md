@@ -19,8 +19,9 @@ than `None` or `"global"` require further lowering.
 `@T.prim_func` captures a function whose source is available in a Python file.
 The body ends with one `with T.Kernel(..., threads=...)` block. Pure construction
 bindings may precede it, including buffer aliases, shape/type queries, static
-Python conditionals, and scalar parameter expressions. These scalar expressions
-are inlined into their device uses. Host buffer reads, allocations, loops, and
+Python conditionals, and scalar parameter expressions. Host assertions over
+scalar parameters may also precede the launch. Pure scalar bindings are inlined
+into their uses. Host buffer reads, allocations, loops, and
 runtime control flow preceding the launch remain unsupported. Grid dimensions
 are positive static integers within CUDA limits. Runtime scalar definitions,
 local allocations, and loop variables receive distinct internal identities.
@@ -533,8 +534,53 @@ synchronization or deterministic ordering.
 
 Ordinary Python assertions with construction-time conditions execute during
 parsing, including before `T.Kernel`. A false condition raises `AssertionError`.
-Runtime Python assertions, `T.Assert` frames and host exception lowering remain
-open; use `T.device_assert` for the implemented device-side check.
+Before the final `T.Kernel` block, runtime Python assertions become host checks
+with the default error kind `RuntimeError`. An omitted or `None` Python assertion
+message becomes `"Assertion failed"`. The explicit form is
+`T.Assert(condition, message, error_kind="RuntimeError")`; it supports both a
+standalone statement and a `with T.Assert(...):` frame. Frame contents follow
+the check in source order, and their bindings remain visible afterward.
+An explicit `T.Assert(False, ...)` is checked when the compiled callable runs.
+
+```python
+@T.prim_func
+def checked_scale(A: T.Tensor((128,), "float32"), B: T.Tensor((128,), "float32"), scale: T.float32):
+    T.Assert(scale > 0, "scale must be positive", error_kind="ValueError")
+    with T.Kernel(threads=128):
+        for i in T.Parallel(128):
+            B[i] = A[i] * scale
+```
+
+Host conditions must be Boolean scalar expressions over parameters and pure
+construction-time bindings. Supported operations include basic typed arithmetic,
+comparisons, bitwise operations, casts, min/max, absolute value, rounding and
+classification, conditional expressions and likely hints. Tensor reads,
+CUDA-specific intrinsics, dynamic control flow before the launch, `as` bindings
+on assertion frames, and frames containing the launch require further lowering.
+General macro-local bindings and constant folding retain their existing limits.
+Checks do not add assumptions to the device's ownership or index analysis.
+
+Messages accept a string or a nonempty list/tuple of string fragments, joined
+without separators. Each fragment ends at its first NUL, following the pinned
+TVM FFI C-string contract. Registered built-in error kinds are `RuntimeError`,
+`ValueError`, `TypeError`, `AttributeError`, `KeyError`, `IndexError`,
+`AssertionError` and `MemoryError`; unknown kinds use `RuntimeError`. Empty
+message-part containers and non-string fragments are rejected.
+
+The callable returned by `compile_kernel()` runs a separate native CPU checker
+before invoking the CUDA callable. The checker writes a failure index through a
+generic pointer into per-call `ctypes` storage; it requires no array-library
+dependency. The first failed condition raises its exception immediately, and
+later conditions are not evaluated. The NumPy reference checks the same
+conditions before executing blocks or writing outputs. Compiled-module
+properties remain readable. Native callable conversion and export require
+separate host-check integration and are rejected by this wrapper. Directly
+compiling the generated low-level `run` function bypasses the Python wrapper;
+use `compile_kernel()` to obtain the checked entry point.
+
+Runtime Python assertions and `T.Assert` inside a device kernel remain open;
+`T.device_assert` supplies the implemented device-side check. Compiler options
+that disable assertions and custom TVM FFI error registrations remain open.
 
 `T.likely(cond, span=None)` preserves the operand and its dtype. The wrapper's
 `dtype` keyword is evaluated and ignored. Index bounds, affine ownership and

@@ -9,6 +9,7 @@ from .scalar import (
     BIT_COUNT_OPS,
     BITWISE_OPS,
     CHOICE_OPS,
+    CLASSIFICATION_OPS,
     FAST_MATH_OPS,
     IEEE_MATH_OPS,
     INTEGER_DIVISION_OPS,
@@ -19,6 +20,15 @@ from .scalar import (
 )
 
 INT_MIN, INT_MAX = -(2**31), 2**31 - 1
+
+HOST_SCALAR_OPS = (
+    BINARY_NUMERIC_OPS
+    | BITWISE_OPS
+    | CHOICE_OPS
+    | ROUNDING_OPS
+    | CLASSIFICATION_OPS
+    | {"const", "var", "cast", "neg", "pos", "not", "and", "or", "likely", "abs", "pow_integer"}
+)
 
 
 def resolved_dtype(expr, bounds, definitions, buffers, *, ignore_predicates=False):
@@ -643,6 +653,33 @@ def validate(kernel: Kernel):
     parameter_definitions = {
         p.name: Expr("parameter", value=p.dtype) for p in kernel.parameters if isinstance(p, ScalarParameter)
     }
+
+    def host_expression(value):
+        if value.op not in HOST_SCALAR_OPS:
+            raise CompileError(f"Host assertion expression {value.op!r} requires further CPU lowering")
+        if value.op == "var" and value.value not in parameter_definitions:
+            raise CompileError(
+                "Host assertions can depend only on scalar parameters and construction-time values"
+            )
+        for child in value.args:
+            host_expression(child)
+
+    for check in kernel.host_checks:
+        try:
+            if check.op != "host_assert":
+                raise CompileError("Unknown host check statement")
+            condition, parts, error_kind = check.args
+            host_expression(condition)
+            expression(condition, {}, parameter_definitions)
+            if resolved_dtype(condition, {}, parameter_definitions, buffers) != "bool":
+                raise CompileError("Host assertion conditions require a Boolean scalar predicate")
+            if not parts or any(type(part) is not str for part in parts) or type(error_kind) is not str:
+                raise CompileError("Host assertions require string message parts and an error kind")
+        except CompileError as exc:
+            if exc.location is not None:
+                raise
+            raise CompileError(str(exc), check.location) from exc
+
     statements(kernel.body, initial_bounds, parameter_definitions)
     if reads & writes.keys():
         raise CompileError(

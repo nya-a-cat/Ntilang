@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: development resumed at the user's request on 2026-09-08.
+Status: development resumed at the user's request on 2026-09-12.
 Work continues from stage 1. The stages below describe remaining work and
 dependencies; they do not schedule recurring background jobs.
 
@@ -107,8 +107,12 @@ CUDA diagnostics now cover messages, scalar IR and global/shared/fragment
 buffers, including selected-thread printing and synchronized fragment snapshots.
 Device assertions retain optional source stacks. Construction-time Python
 assertions, default one-block launches, omitted block bindings and zero-argument
-kernels are supported. Runtime Python assertions, T.Assert frames, assumption
-checks, local/vector/pointer diagnostics and hardware execution remain open.
+kernels are supported. Pre-launch runtime Python assertions and T.Assert frames
+now use an independent native CPU checker with sequential failure handling and
+typed scalar inputs. The generated callable retains standard host exceptions
+and message fragments. Device-internal runtime Python assertions, general host
+execution, assumption checks, local/vector/pointer diagnostics and hardware
+execution remain open.
 Basic runtime scalar parameters now pass through mixed tensor/scalar signatures,
 typed CuTe arguments, host validation, and reference evaluation. Further argument
 work includes symbolic dimensions, defaults/keywords, vector types, and broader

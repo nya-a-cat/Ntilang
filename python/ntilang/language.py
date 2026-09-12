@@ -211,6 +211,7 @@ for _name in (
     "continue_loop",
     "print",
     "device_assert",
+    "Assert",
     "likely",
     "copy",
     "transpose",

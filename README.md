@@ -25,9 +25,10 @@ experiment with a compiler whose frontend, IR, and code generator are all Python
 - **Keep the generated source:** export a standalone CuTe Python module that
   compiles independently of Ntilang. Read the generated layouts, operations,
   and launch code directly.
-- **Check kernels as you build them:** static checks cover shapes, dtypes,
-  initialization, and supported write-ownership patterns. A serial NumPy evaluator
-  helps check the mathematics on CPU.
+- **Check kernels before execution:** static checks cover shapes, dtypes,
+  initialization, and supported write-ownership patterns. Scalar assertions check
+  preconditions before launch, including in exported modules. A serial NumPy
+  evaluator helps check the mathematics on CPU.
 - **Start with Python:** the core package has zero runtime dependencies and
   generates source on Windows and Linux. NVIDIA's compiler is an optional
   dependency for CUDA compilation and execution.

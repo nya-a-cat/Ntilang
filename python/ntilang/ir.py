@@ -149,6 +149,7 @@ class Kernel:
     threads: int
     body: tuple[Statement, ...]
     source: str
+    host_checks: tuple[Statement, ...] = ()
 
     @property
     def buffer_map(self) -> dict[str, Buffer]:

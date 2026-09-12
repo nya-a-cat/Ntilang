@@ -4,6 +4,27 @@ from numbers import Integral, Real
 
 from .ir import ScalarParameter, integer_limits
 
+# Built-in kinds registered by the pinned TVM FFI Python error dispatcher.
+HOST_ERROR_TYPES = {
+    cls.__name__: cls
+    for cls in (
+        RuntimeError,
+        ValueError,
+        TypeError,
+        AttributeError,
+        KeyError,
+        IndexError,
+        AssertionError,
+        MemoryError,
+    )
+}
+
+
+def host_assertion_error(error_kind, parts):
+    """Match TVM FFI's kind fallback and per-part C string termination."""
+    message = "".join(part.split("\0", 1)[0] for part in parts)
+    return HOST_ERROR_TYPES.get(error_kind.split("\0", 1)[0], RuntimeError)(message)
+
 
 def normalize_scalar(value, parameter: ScalarParameter):
     """Preserve logical values while checking the declared kernel input domain."""
