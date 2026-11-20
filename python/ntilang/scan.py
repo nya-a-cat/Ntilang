@@ -7,6 +7,8 @@ separate store. Shared staging makes overlapping regions and MMA fragments safe.
 
 from __future__ import annotations
 
+from math import prod
+
 from .ir import Partition, Region, Statement, integer_limits
 from .macros import ValueNode
 from .passes.smem_hazards import expr_smem_reads
@@ -112,6 +114,130 @@ def emit(emitter, src, dst, kind, dim, reverse):
             return result
         result = f"({left} + {right})" if kind == "sum" else e.float_minmax("max", dtype, left, right, False)
         return f"{typ}({result})"
+
+    can_warp_scan = (
+        dim == len(shape) - 1
+        and e.kernel.threads % 32 == 0
+        and dtype in ("float32", "int32", "uint32")
+        and (
+            e.buffers[src.buffer].space != "fragment"
+            or (
+                e.fragment_layouts[src.buffer] is None
+                and src.shape == shape
+                and src.is_full(e.buffers[src.buffer].type.shape)
+            )
+        )
+    )
+
+    if can_warp_scan:
+        src_reads = expr_smem_reads(src.origin, e.buffers)
+        if e.buffers[src.buffer].space == "shared":
+            src_reads.add(src.buffer)
+        e.sync_if_hazard(src_reads, {first})
+        slot, coords, depth = e.loop_tile(shape, constexpr=(e.buffers[src.buffer].space == "fragment"))
+        lane = e.unique("wscan_lane")
+        val = e.unique("wscan_val")
+        e.emit(f"{lane} = _nt_tid % 32")
+        if e.buffers[src.buffer].space == "fragment":
+            e.emit(f"{val} = {typ}({e.buf(src.buffer)}[{slot}])")
+        else:
+            indices = e.region_indices(src, coords)
+            src_pred = e.region_in_bounds_predicate(src, indices)
+            if src.shape == shape:
+                if src_pred is None:
+                    e.emit(f"{val} = {typ}({e.access(src.buffer, indices)})")
+                else:
+                    e.emit(f"{val} = {typ}(0)")
+                    e.emit(f"if {src_pred}:")
+                    e.depth += 1
+                    e.emit(f"{val} = {typ}({e.access(src.buffer, indices)})")
+                    e.depth -= 1
+            else:
+                e.emit(f"{val} = {initial}")
+                e.emit(f"if {coords[-1]} < {src.shape[-1]}:")
+                e.depth += 1
+                if src_pred is None:
+                    e.emit(f"{val} = {typ}({e.access(src.buffer, indices)})")
+                else:
+                    e.emit(f"{val} = {typ}(0)")
+                    e.emit(f"if {src_pred}:")
+                    e.depth += 1
+                    e.emit(f"{val} = {typ}({e.access(src.buffer, indices)})")
+                    e.depth -= 1
+                e.depth -= 1
+        shfl_fn = "cute.arch.shuffle_sync_down" if reverse else "cute.arch.shuffle_sync_up"
+        for offset in (1, 2, 4, 8, 16):
+            other = e.unique("wscan_other")
+            e.emit(f"{other} = {shfl_fn}({val}, {offset})")
+            pred = f"{lane} < {32 - offset}" if reverse else f"{lane} >= {offset}"
+            e.emit(f"if {pred}:")
+            e.depth += 1
+            e.emit(f"{val} = {combine(val, other)}")
+            e.depth -= 1
+        e.emit(f"{access(first, coords)} = {val}")
+        e.depth -= depth
+        e.hazards.record(src_reads, {first})
+        e.sync_threads()
+
+        segments = shape[dim] // 32
+        if segments > 1:
+            outer_shape = shape[:-1]
+            outer_count = prod(outer_shape)
+            row_slots = (outer_count + e.kernel.threads - 1) // e.kernel.threads
+            r_slot = e.unique("wscan_rslot")
+            r_flat = e.unique("wscan_row")
+            loop_hdr = (
+                f"cutlass.range_constexpr({row_slots})"
+                if row_slots <= 16
+                else f"cutlass.range({row_slots}, unroll=4)"
+            )
+            e.emit(f"for {r_slot} in {loop_hdr}:")
+            e.depth += 1
+            e.emit(f"{r_flat} = _nt_tid + {r_slot} * {e.kernel.threads}")
+            r_depth = 1
+            if outer_count % e.kernel.threads != 0:
+                e.emit(f"if {r_flat} < {outer_count}:")
+                e.depth += 1
+                r_depth += 1
+            row_coords = e.coordinates(r_flat, outer_shape)
+            carry = e.unique("wscan_carry")
+            seg = e.unique("wscan_seg")
+            e.emit(f"{carry} = {initial}")
+            e.emit(f"for {seg} in cutlass.range({segments}):")
+            e.depth += 1
+            seg_idx = f"({segments - 1} - {seg})" if reverse else seg
+            e.emit(f"{access(second, [*row_coords, seg_idx])} = {carry}")
+            end_col = f"({seg_idx} * 32)" if reverse else f"({seg_idx} * 32 + 31)"
+            e.emit(f"{carry} = {combine(access(first, [*row_coords, end_col]), carry)}")
+            e.depth -= r_depth + 1
+            e.hazards.record({first}, {second})
+            e.sync_threads()
+
+        dst_reads = ({first, second} if segments > 1 else {first}) | expr_smem_reads(dst.origin, e.buffers)
+        dst_writes = {dst.buffer} if e.buffers[dst.buffer].space == "shared" else set()
+        e.sync_if_hazard(dst_reads, dst_writes)
+        if e.buffers[dst.buffer].space == "fragment":
+            slot, physical, depth = e.loop_fragment(dst.buffer)
+            coords = e.region_coordinates(dst, physical)
+            if not dst.is_full(e.buffers[dst.buffer].type.shape):
+                e.emit(f"if {e.region_predicate(dst, physical)}:")
+                e.depth += 1
+                depth += 1
+            target = f"{e.buf(dst.buffer)}[{slot}]"
+        else:
+            _, coords, depth = e.loop_tile(dst.shape)
+            indices = e.region_indices(dst, coords)
+            dst_pred = e.region_in_bounds_predicate(dst, indices)
+            if dst_pred is not None:
+                e.emit(f"if {dst_pred}:")
+                e.depth += 1
+                depth += 1
+            target = e.access(dst.buffer, indices)
+        carry_val = initial if segments == 1 else access(second, [*coords[:-1], f"({coords[-1]} // 32)"])
+        e.emit(f"{target} = {e.dtype(dst.buffer)}({combine(access(first, coords), carry_val)})")
+        e.depth -= depth
+        e.hazards.record(dst_reads, dst_writes)
+        return
 
     # Padding has the reducer identity when the scan axis is not a multiple of 32.
     if src.shape != shape:

@@ -337,7 +337,7 @@ class Emitter:
     def loop_fragment(self, name):
         layout = self.fragment_layouts[name]
         if layout is None:
-            return self.loop_tile(self.buffers[name].type.shape)
+            return self.loop_tile(self.buffers[name].type.shape, constexpr=True)
         slot = self.unique("mma_slot")
         self.emit(f"for {slot} in cutlass.range_constexpr(cute.size({self.buf(name)})):")
         self.depth += 1
@@ -673,10 +673,13 @@ class Emitter:
     def coordinates(self, flat, shape):
         return [f"(({flat} // {prod(shape[i + 1 :])}) % {dim})" for i, dim in enumerate(shape)]
 
-    def loop_tile(self, shape):
+    def loop_tile(self, shape, *, constexpr: bool = False):
         plan = Partition(shape, self.kernel.threads)
         slot, flat = self.unique("slot"), self.unique("flat")
-        self.emit(f"for {slot} in cutlass.range_constexpr({plan.slots}):")
+        if constexpr or plan.slots <= 16:
+            self.emit(f"for {slot} in cutlass.range_constexpr({plan.slots}):")
+        else:
+            self.emit(f"for {slot} in cutlass.range({plan.slots}, unroll=4):")
         self.depth += 1
         self.emit(f"{flat} = _nt_tid + {slot} * {plan.threads}")
         total = prod(shape)
@@ -859,36 +862,134 @@ class Emitter:
         stage0_reads = {src} if self.buffers[src].space == "shared" else set()
         stage0_writes = {workspace}
         self.sync_if_hazard(stage0_reads, stage0_writes)
-        if self.buffers[src].space == "fragment":
-            slot, coords, depth = self.loop_fragment(src)
-            value = f"{self.buf(src)}[{slot}]"
-        else:
-            _, coords, depth = self.loop_tile(shape)
-            value = self.access(src, coords)
-        value_name = self.unique("reduce_value")
-        self.emit(f"{value_name} = {self.dtype(dst)}({value})")
-        if kind in ("abssum", "absmax") and not (dtype.startswith("uint") or dtype == "bool"):
-            value_name = self.float_minmax("max", dtype, value_name, f"-{value_name}", False)
-        self.emit(f"{access(coords)} = {self.dtype(dst)}({value_name})")
-        self.depth -= depth
-        self.hazards.record(stage0_reads, stage0_writes)
-        # Disjoint pairs in each tree level: right operands are never written
-        # at that level, and the block reconverges before the following level.
-        stride = 1
-        while stride < shape[dim]:
-            self.sync_threads()
-            _, coords, depth = self.loop_tile(shape)
-            self.emit(
-                f"if ({coords[dim]} % {2 * stride} == 0) and ({coords[dim]} + {stride} < {shape[dim]}):"
+
+        can_warp_shuffle = (
+            dim == len(shape) - 1
+            and self.kernel.threads % 32 == 0
+            and shape[dim] >= 32
+            and shape[dim] % 32 == 0
+            and dtype in ("float32", "int32", "uint32")
+            and (self.buffers[src].space == "shared" or self.fragment_layouts[src] is None)
+        )
+
+        if can_warp_shuffle:
+            groups = shape[dim] // 32
+            outer_shape = shape[:-1]
+            outer_count = prod(outer_shape)
+            slot, coords, depth = self.loop_tile(shape, constexpr=(self.buffers[src].space == "fragment"))
+            value = (
+                f"{self.buf(src)}[{slot}]"
+                if self.buffers[src].space == "fragment"
+                else self.access(src, coords)
             )
+            val = self.unique("wred_val")
+            self.emit(f"{val} = {self.dtype(dst)}({value})")
+            if kind in ("abssum", "absmax") and not (dtype.startswith("uint") or dtype == "bool"):
+                val = self.float_minmax("max", dtype, val, f"-{val}", False)
+                val_var = self.unique("wred_abs")
+                self.emit(f"{val_var} = {self.dtype(dst)}({val})")
+                val = val_var
+            for offset in (1, 2, 4, 8, 16):
+                other = self.unique("wred_other")
+                self.emit(f"{other} = cute.arch.shuffle_sync_down({val}, {offset})")
+                self.emit(f"{val} = {self.dtype(dst)}({combine(val, other)})")
+            self.emit("if (_nt_tid % 32) == 0:")
             self.depth += 1
-            partner = coords.copy()
-            partner[dim] = f"({coords[dim]} + {stride})"
-            result = combine(access(coords), access(partner))
-            self.emit(f"{access(coords)} = {self.dtype(dst)}({result})")
+            group_coords = [*coords[:-1], f"({coords[-1]} // 32)"]
+            self.emit(f"{access(group_coords)} = {val}")
             self.depth -= depth + 1
-            self.hazards.record({workspace}, {workspace})
-            stride *= 2
+            self.hazards.record(stage0_reads, stage0_writes)
+
+            if 2 <= groups <= 32:
+                self.sync_threads()
+                num_warps = self.kernel.threads // 32
+                row_slots = (outer_count + num_warps - 1) // num_warps
+                r_slot = self.unique("wred_row_slot")
+                r_flat = self.unique("wred_row")
+                lane = self.unique("wred_lane")
+                self.emit(f"{lane} = _nt_tid % 32")
+                loop_hdr = (
+                    f"cutlass.range_constexpr({row_slots})"
+                    if row_slots <= 16
+                    else f"cutlass.range({row_slots}, unroll=4)"
+                )
+                self.emit(f"for {r_slot} in {loop_hdr}:")
+                self.depth += 1
+                self.emit(f"{r_flat} = (_nt_tid // 32) + {r_slot} * {num_warps}")
+                r_depth = 1
+                if outer_count % num_warps != 0:
+                    self.emit(f"if {r_flat} < {outer_count}:")
+                    self.depth += 1
+                    r_depth += 1
+                row_coords = self.coordinates(r_flat, outer_shape)
+                val2 = self.unique("wred_gval")
+                self.emit(f"{val2} = {self.dtype(dst)}(0)")
+                self.emit(f"if {lane} < {groups}:")
+                self.depth += 1
+                self.emit(f"{val2} = {access([*row_coords, lane])}")
+                self.depth -= 1
+                stride = 1
+                while stride < groups:
+                    other2 = self.unique("wred_gother")
+                    self.emit(f"{other2} = cute.arch.shuffle_sync_down({val2}, {stride})")
+                    self.emit(f"if ({lane} % {2 * stride} == 0) and ({lane} + {stride} < {groups}):")
+                    self.depth += 1
+                    self.emit(f"{val2} = {self.dtype(dst)}({combine(val2, other2)})")
+                    self.depth -= 1
+                    stride *= 2
+                self.emit(f"if {lane} == 0:")
+                self.depth += 1
+                self.emit(f"{access([*row_coords, '0'])} = {val2}")
+                self.depth -= r_depth + 1
+                self.hazards.record({workspace}, {workspace})
+            elif groups > 32:
+                reduced_shape = (*outer_shape, groups)
+                stride = 1
+                while stride < groups:
+                    self.sync_threads()
+                    _, coords, depth = self.loop_tile(reduced_shape)
+                    self.emit(
+                        f"if ({coords[dim]} % {2 * stride} == 0) and ({coords[dim]} + {stride} < {groups}):"
+                    )
+                    self.depth += 1
+                    partner = coords.copy()
+                    partner[dim] = f"({coords[dim]} + {stride})"
+                    result = combine(access(coords), access(partner))
+                    self.emit(f"{access(coords)} = {self.dtype(dst)}({result})")
+                    self.depth -= depth + 1
+                    self.hazards.record({workspace}, {workspace})
+                    stride *= 2
+        else:
+            if self.buffers[src].space == "fragment":
+                slot, coords, depth = self.loop_fragment(src)
+                value = f"{self.buf(src)}[{slot}]"
+            else:
+                _, coords, depth = self.loop_tile(shape)
+                value = self.access(src, coords)
+            value_name = self.unique("reduce_value")
+            self.emit(f"{value_name} = {self.dtype(dst)}({value})")
+            if kind in ("abssum", "absmax") and not (dtype.startswith("uint") or dtype == "bool"):
+                value_name = self.float_minmax("max", dtype, value_name, f"-{value_name}", False)
+            self.emit(f"{access(coords)} = {self.dtype(dst)}({value_name})")
+            self.depth -= depth
+            self.hazards.record(stage0_reads, stage0_writes)
+            # Disjoint pairs in each tree level: right operands are never written
+            # at that level, and the block reconverges before the following level.
+            stride = 1
+            while stride < shape[dim]:
+                self.sync_threads()
+                _, coords, depth = self.loop_tile(shape)
+                self.emit(
+                    f"if ({coords[dim]} % {2 * stride} == 0) and ({coords[dim]} + {stride} < {shape[dim]}):"
+                )
+                self.depth += 1
+                partner = coords.copy()
+                partner[dim] = f"({coords[dim]} + {stride})"
+                result = combine(access(coords), access(partner))
+                self.emit(f"{access(coords)} = {self.dtype(dst)}({result})")
+                self.depth -= depth + 1
+                self.hazards.record({workspace}, {workspace})
+                stride *= 2
         final_reads = {workspace}
         final_writes: set[str] = set()
         if self.buffers[dst].space == "shared":

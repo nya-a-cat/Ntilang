@@ -9,6 +9,7 @@ import ntilang.language as T
 import pytest
 from ntilang.ptx_verifier import analyze_ptx, inspect_kernel_ptx
 
+from examples.cumsum import cumsum
 from examples.matmul import matmul
 from examples.softmax import softmax
 from examples.transpose import transpose
@@ -153,3 +154,11 @@ def test_core_kernels_ptx_contracts():
     soft_report = inspect_kernel_ptx(softmax(16, 128))
     assert soft_report.local_spill_ops == 0
     assert soft_report.consecutive_barriers == 0
+    assert soft_report.barriers <= 6
+    assert soft_report.contains(r"\bshfl\.sync\.down\.b32\b")
+
+    scan_report = inspect_kernel_ptx(cumsum(16, 256))
+    assert scan_report.local_spill_ops == 0
+    assert scan_report.consecutive_barriers == 0
+    assert scan_report.barriers <= 2
+    assert scan_report.contains(r"\bshfl\.sync\.up\.b32\b")
