@@ -115,14 +115,19 @@ def test_barrier_and_bounds_elision_in_generated_source():
     aligned_gemm = matmul(128, 128, 128)
     assert aligned_gemm.source.count("cute.arch.sync_threads()") == 2
     assert "if (0 <=" not in aligned_gemm.source
+    assert "cute.make_swizzle" in aligned_gemm.source
+    assert "LdMatrix8x8x16bOp" in aligned_gemm.source
+    assert "num_bits_per_copy=128" in aligned_gemm.source
 
     unaligned_gemm = matmul(65, 71, 37)
     assert unaligned_gemm.source.count("cute.arch.sync_threads()") == 2
     assert "0 <=" in unaligned_gemm.source
+    assert "LdMatrix8x8x16bOp" in unaligned_gemm.source
 
     aligned_transpose = transpose(128, 128)
     assert aligned_transpose.source.count("cute.arch.sync_threads()") == 1
     assert "if (0 <=" not in aligned_transpose.source
+    assert "cute.make_swizzle(5, 0, 5)" in aligned_transpose.source
 
 
 @pytest.mark.cuda
@@ -134,6 +139,8 @@ def test_core_kernels_ptx_contracts():
 
     gemm_report = inspect_kernel_ptx(matmul(128, 128, 128))
     assert gemm_report.mma_ops >= 1
+    assert gemm_report.ldmatrix_ops >= 2
+    assert gemm_report.contains(r"\bld\.global\.v4\b")
     assert gemm_report.local_spill_ops == 0
     assert gemm_report.barriers <= 2
     assert gemm_report.consecutive_barriers == 0

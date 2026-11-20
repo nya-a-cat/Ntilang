@@ -5,12 +5,13 @@ from __future__ import annotations
 import ast
 import re
 from hashlib import sha256
-from math import isfinite, isnan, prod
+from math import gcd, isfinite, isnan, prod
 
 from . import scan
 from .cuda_math import low_precision_asm, minmax_asm
 from .debug import print_format
 from .ir import (
+    DTYPES,
     CompileError,
     Expr,
     Kernel,
@@ -48,7 +49,7 @@ from .scalar import (
     expression_dtype,
     operand_dtype,
 )
-from .validation import interval, predicate_bounds
+from .validation import affine, interval, predicate_bounds
 
 CUTLASS_TYPES = {
     "float16": "Float16",
@@ -147,6 +148,162 @@ class Emitter:
             name: (0, extent - 1) for name, extent in zip(kernel.block_vars, kernel.grid)
         }
         self.definitions: dict[str, Expr] = {}
+        self.shared_swizzles: dict[str, tuple[int, int, int]] = self._plan_shared_swizzles()
+
+    def _plan_shared_swizzles(self) -> dict[str, tuple[int, int, int]]:
+        mma_operands: set[str] = set()
+        block_copy_shared: set[str] = set()
+        for stmt in walk(self.kernel.body):
+            if stmt.op == "gemm":
+                a, b, _, _, _ = stmt.args
+                mma_operands.update((a, b))
+            elif stmt.op == "copy":
+                src, dst = stmt.args
+                if len(src.shape) in (1, 2) and prod(src.shape) >= 2:
+                    for reg in (src, dst):
+                        if self.buffers[reg.buffer].space == "shared":
+                            block_copy_shared.add(reg.buffer)
+
+        swizzles: dict[str, tuple[int, int, int]] = {}
+        for buf in self.kernel.buffers:
+            if buf.space != "shared" or len(buf.type.shape) != 2:
+                continue
+            dtype = buf.type.dtype
+            if dtype not in ("float16", "bfloat16", "int16", "uint16", "float32", "int32", "uint32"):
+                continue
+            _, cols = buf.type.shape
+            elem_bytes = DTYPES[dtype]
+            needs_16b_contiguity = (
+                buf.name in mma_operands or buf.name in block_copy_shared or buf.name in self.swizzled_buffers
+            )
+            if needs_16b_contiguity:
+                m_bits = 3 if elem_bytes == 2 else 2
+                row_bytes = cols * elem_bytes
+                if row_bytes % 128 == 0:
+                    tz = (cols & -cols).bit_length() - 1
+                    swizzles[buf.name] = (3, m_bits, tz - m_bits)
+                elif row_bytes % 64 == 0:
+                    swizzles[buf.name] = (2, m_bits, 3)
+                elif row_bytes % 32 == 0:
+                    swizzles[buf.name] = (1, m_bits, 3)
+            elif elem_bytes == 4 and cols >= 32 and cols % 32 == 0:
+                tz = (cols & -cols).bit_length() - 1
+                swizzles[buf.name] = (min(5, tz), 0, tz)
+        return swizzles
+
+    def _affine_tile_coord(self, origin: Expr, tile_dim: int) -> str | None:
+        try:
+            const, coeffs = affine(origin, self.definitions, self.bounds, self.buffers)
+        except CompileError:
+            return None
+        if const % tile_dim != 0 or any(c % tile_dim != 0 for c in coeffs.values()):
+            return None
+        if any(name not in self.bounds for name in coeffs):
+            return None
+        terms: list[str] = []
+        if const != 0:
+            terms.append(str(const // tile_dim))
+        for name, coeff in coeffs.items():
+            q = coeff // tile_dim
+            var_name = self.var(name)
+            if q == 1:
+                terms.append(var_name)
+            elif q == -1:
+                terms.append(f"(-{var_name})")
+            else:
+                terms.append(f"({q} * {var_name})")
+        return " + ".join(terms) if terms else "0"
+
+    def _vectorized_copy_plan(self, src, dst):
+        if self.parallel is not None or src.buffer == dst.buffer:
+            return None
+        src_buf, dst_buf = self.buffers[src.buffer], self.buffers[dst.buffer]
+        if src_buf.type.dtype != dst_buf.type.dtype or src_buf.type.dtype == "bool":
+            return None
+        if {src_buf.space, dst_buf.space} not in ({"global", "shared"}, {"shared"}):
+            return None
+        rank = len(src.shape)
+        if rank not in (1, 2) or src.shape != dst.shape or prod(src.shape) < 2:
+            return None
+        if any(ax is None for ax in src.axes) or any(ax is None for ax in dst.axes):
+            return None
+        if len(src_buf.type.shape) != rank or len(dst_buf.type.shape) != rank:
+            return None
+
+        # Verify both regions are statically in bounds and tile-aligned.
+        for reg, buf in ((src, src_buf), (dst, dst_buf)):
+            for origin, axis, dim in zip(reg.origin, reg.axes, buf.type.shape):
+                iv = self.expr_interval(origin)
+                if iv is None or iv[0] < 0 or iv[1] + reg.shape[axis] - 1 >= dim:
+                    return None
+                if dim % reg.shape[axis] != 0:
+                    return None
+
+        src_coords = [self._affine_tile_coord(o, ext) for o, ext in zip(src.origin, src.shape)]
+        dst_coords = [self._affine_tile_coord(o, ext) for o, ext in zip(dst.origin, dst.shape)]
+        if any(c is None for c in src_coords) or any(c is None for c in dst_coords):
+            return None
+
+        elem_bytes = DTYPES[src_buf.type.dtype]
+        if elem_bytes not in (1, 2, 4, 8):
+            return None
+        max_vec = 16 // elem_bytes
+        for reg in (src, dst):
+            if reg.buffer in self.shared_swizzles:
+                _, m_bits, _ = self.shared_swizzles[reg.buffer]
+                max_vec = min(max_vec, 1 << m_bits)
+
+        threads = self.kernel.threads
+        tile_cols = src.shape[-1]
+        for vec in (16 // elem_bytes, 8 // elem_bytes, 4 // elem_bytes):
+            if vec < 2 or vec > max_vec or tile_cols % vec != 0:
+                continue
+            col_vecs = tile_cols // vec
+            if rank == 1:
+                if col_vecs % threads == 0:
+                    return (vec, elem_bytes, (threads,), (1,), (vec,), src_coords, dst_coords)
+            else:
+                tile_rows = src.shape[0]
+                thr_cols = gcd(threads, col_vecs)
+                thr_rows = threads // thr_cols
+                if col_vecs % thr_cols == 0 and tile_rows % thr_rows == 0:
+                    return (
+                        vec,
+                        elem_bytes,
+                        (thr_rows, thr_cols),
+                        (thr_cols, 1),
+                        (1, vec),
+                        src_coords,
+                        dst_coords,
+                    )
+        return None
+
+    def _emit_vectorized_copy(self, src, dst, plan):
+        vec, elem_bytes, thr_shape, thr_stride, val_shape, src_coords, dst_coords = plan
+        bits = vec * elem_bytes * 8
+        atom = self.unique("vec_atom")
+        tc = self.unique("vec_tc")
+        thr = self.unique("vec_thr")
+        self.emit(
+            f"{atom} = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), {self.dtype(src.buffer)}, num_bits_per_copy={bits})"
+        )
+        self.emit(
+            f"{tc} = cute.make_tiled_copy_tv({atom}, cute.make_layout({thr_shape}, stride={thr_stride}), cute.make_layout({val_shape}))"
+        )
+        self.emit(f"{thr} = {tc}.get_slice(_nt_tid)")
+
+        def tile_expr(reg, coords):
+            buf = self.buffers[reg.buffer]
+            if reg.is_full(buf.type.shape):
+                return self.buf(reg.buffer)
+            name = self.unique("vec_tile")
+            coord_tuple = self.tuple_text(coords)
+            self.emit(f"{name} = cute.local_tile({self.buf(reg.buffer)}, {reg.shape}, {coord_tuple})")
+            return name
+
+        src_tile = tile_expr(src, src_coords)
+        dst_tile = tile_expr(dst, dst_coords)
+        self.emit(f"cute.copy({tc}, {thr}.partition_S({src_tile}), {thr}.partition_D({dst_tile}))")
 
     def sync_threads(self):
         self.emit("cute.arch.sync_threads()")
@@ -572,6 +729,11 @@ class Emitter:
         if self.buffers[dst.buffer].space == "shared":
             writes.add(dst.buffer)
         self.sync_if_hazard(reads, writes)
+        vec_plan = None if snapshots else self._vectorized_copy_plan(src, dst)
+        if vec_plan is not None:
+            self._emit_vectorized_copy(src, dst, vec_plan)
+            self.hazards.record(reads, writes)
+            return
         if self.buffers[dst.buffer].space == "fragment":
             slot, buffer_coords, depth = self.loop_fragment(dst.buffer)
             coords = self.region_coordinates(dst, buffer_coords)
@@ -617,32 +779,59 @@ class Emitter:
         self.depth -= depth
         self.hazards.record(reads, writes)
 
+    def _shared_mma_view(self, name: str, shape: tuple[int, int], stride: tuple[int, int], native: bool):
+        if native:
+            return self.buf(name)
+        view = self.unique("mma_view")
+        swz = self.shared_swizzles.get(name)
+        base = f"cute.make_layout({shape}, stride={stride})"
+        if swz is not None:
+            layout_expr = f"cute.make_composed_layout(cute.make_swizzle{swz}, 0, {base})"
+        else:
+            layout_expr = base
+        self.emit(f"{view} = cute.make_tensor({self.buf(name)}.iterator, {layout_expr})")
+        return view
+
     def gemm(self, a, b, c, ta, tb):
-        am, bn, ak, _, _, _ = self.mmas[c]
-        a_stride = (1, self.buffers[a].type.shape[1]) if ta else (ak, 1)
-        # CuTe MMA B has (N, K) modes; source language B has (K, N).
-        b_stride = (ak, 1) if tb else (1, bn)
-        av, bv, ar, br = (self.unique(s) for s in ("a_part", "b_part", "a_reg", "b_reg"))
+        am, bn, ak, wm, wn, mma_dtype = self.mmas[c]
+        cutlass_ty = f"cutlass.{CUTLASS_TYPES[mma_dtype]}"
         reads = {a, b}
         self.sync_if_hazard(reads, set())
+
+        a_view = self._shared_mma_view(a, (am, ak), (1, self.buffers[a].type.shape[1]), native=not ta)
+        # CuTe MMA B has (N, K) modes; source language B has (K, N) unless transpose_B=True.
+        b_view = self._shared_mma_view(b, (bn, ak), (1, bn), native=tb)
+
+        b_num_mat = 4 if (bn // wn) % 16 == 0 else 2
+        atom_a, atom_b = self.unique("ldm_a"), self.unique("ldm_b")
+        tc_a, tc_b = self.unique("tc_s2r_a"), self.unique("tc_s2r_b")
+        thr_a, thr_b = self.unique("thr_s2r_a"), self.unique("thr_s2r_b")
+        ts_a, ts_b = self.unique("tCsA"), self.unique("tCsB")
+        ar, br = self.unique("a_reg"), self.unique("b_reg")
+        ar_view, br_view = self.unique("a_reg_v"), self.unique("b_reg_v")
+
         self.emit(
-            f"{av} = _nt_thr_{c}.partition_A(cute.make_tensor({self.buf(a)}.iterator, cute.make_layout(({am}, {ak}), stride={a_stride})))"
+            f"{atom_a} = cute.make_copy_atom(cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose={ta}, num_matrices=4), {cutlass_ty})"
         )
         self.emit(
-            f"{bv} = _nt_thr_{c}.partition_B(cute.make_tensor({self.buf(b)}.iterator, cute.make_layout(({bn}, {ak}), stride={b_stride})))"
+            f"{atom_b} = cute.make_copy_atom(cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose={not tb}, num_matrices={b_num_mat}), {cutlass_ty})"
         )
-        self.emit(f"{ar} = _nt_mma_{c}.make_fragment_A({av})")
-        self.emit(f"{br} = _nt_mma_{c}.make_fragment_B({bv})")
-        # Scalar register copies retain the MMA's physical register layout.
-        for reg, part in ((ar, av), (br, bv)):
-            idx = self.unique("mma_load")
-            self.emit(f"for {idx} in cutlass.range_constexpr(cute.size({reg})):")
-            self.depth += 1
-            self.emit(f"{reg}[{idx}] = {part}[{idx}]")
-            self.depth -= 1
+        self.emit(f"{tc_a} = cute.make_tiled_copy_A({atom_a}, _nt_mma_{c})")
+        self.emit(f"{tc_b} = cute.make_tiled_copy_B({atom_b}, _nt_mma_{c})")
+        self.emit(f"{thr_a} = {tc_a}.get_slice(_nt_tid)")
+        self.emit(f"{thr_b} = {tc_b}.get_slice(_nt_tid)")
+        self.emit(f"{ts_a} = {thr_a}.partition_S({a_view})")
+        self.emit(f"{ts_b} = {thr_b}.partition_S({b_view})")
+        self.emit(f"{ar} = _nt_mma_{c}.make_fragment_A(_nt_thr_{c}.partition_A({a_view}))")
+        self.emit(f"{br} = _nt_mma_{c}.make_fragment_B(_nt_thr_{c}.partition_B({b_view}))")
+        self.emit(f"{ar_view} = {thr_a}.retile({ar})")
+        self.emit(f"{br_view} = {thr_b}.retile({br})")
+
         k = self.unique("mma_k")
         self.emit(f"for {k} in cutlass.range_constexpr(cute.size({ar}, mode=[2])):")
         self.depth += 1
+        self.emit(f"cute.copy({tc_a}, {ts_a}[None, None, {k}], {ar_view}[None, None, {k}])")
+        self.emit(f"cute.copy({tc_b}, {ts_b}[None, None, {k}], {br_view}[None, None, {k}])")
         self.emit(
             f"cute.gemm(_nt_mma_{c}, {self.buf(c)}, {ar}[None, None, {k}], {br}[None, None, {k}], {self.buf(c)})"
         )
@@ -1424,8 +1613,15 @@ class Emitter:
                 )
             if b.space == "shared":
                 strides = tuple(prod(b.type.shape[i + 1 :]) for i in range(len(b.type.shape)))
+                base = f"cute.make_layout({b.type.shape}, stride={strides})"
+                swz = self.shared_swizzles.get(b.name)
+                layout_expr = (
+                    f"cute.make_composed_layout(cute.make_swizzle{swz}, 0, {base})"
+                    if swz is not None
+                    else base
+                )
                 self.emit(
-                    f"{self.buf(b.name)} = _nt_smem.allocate_tensor({self.dtype(b.name)}, cute.make_layout({b.type.shape}, stride={strides}), byte_alignment=16)"
+                    f"{self.buf(b.name)} = _nt_smem.allocate_tensor({self.dtype(b.name)}, {layout_expr}, byte_alignment=16)"
                 )
             elif b.name in self.mmas:
                 self.emit(f"{self.buf(b.name)} = _nt_mma_{b.name}.make_fragment_C(_nt_coords_{b.name}.shape)")
