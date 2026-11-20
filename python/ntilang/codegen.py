@@ -20,9 +20,12 @@ from .ir import (
     loop_controls,
 )
 from .passes import (
+    HazardTracker,
     analyze_mmas,
     collect_workspaces,
+    expr_smem_reads,
     infer_fragment_layouts,
+    smem_footprint,
     validate_shared_memory_budget,
     walk,
 )
@@ -45,6 +48,7 @@ from .scalar import (
     expression_dtype,
     operand_dtype,
 )
+from .validation import interval, predicate_bounds
 
 CUTLASS_TYPES = {
     "float16": "Float16",
@@ -138,6 +142,25 @@ class Emitter:
             self.reduction_workspaces,
             self.scan_workspaces,
         )
+        self.hazards = HazardTracker()
+        self.bounds: dict[str, tuple[int, int]] = {
+            name: (0, extent - 1) for name, extent in zip(kernel.block_vars, kernel.grid)
+        }
+        self.definitions: dict[str, Expr] = {}
+
+    def sync_threads(self):
+        self.emit("cute.arch.sync_threads()")
+        self.hazards.clear()
+
+    def sync_if_hazard(self, reads, writes):
+        if self.hazards.has_hazard(reads, writes):
+            self.sync_threads()
+
+    def expr_interval(self, expr: Expr):
+        try:
+            return interval(expr, self.bounds, self.definitions, self.buffers)
+        except CompileError:
+            return None
 
     def parallel_accesses(self, stmt):
         return _parallel_accesses(stmt, self.buffers)
@@ -157,8 +180,7 @@ class Emitter:
     def loop_fragment(self, name):
         layout = self.fragment_layouts[name]
         if layout is None:
-            slot, coords = self.loop_tile(self.buffers[name].type.shape)
-            return slot, coords, 2
+            return self.loop_tile(self.buffers[name].type.shape)
         slot = self.unique("mma_slot")
         self.emit(f"for {slot} in cutlass.range_constexpr(cute.size({self.buf(name)})):")
         self.depth += 1
@@ -167,17 +189,19 @@ class Emitter:
         return slot, coords, 1
 
     def materialize_fragment(self, name):
-        self.emit("cute.arch.sync_threads()")
+        snap = f"_nt_snapshot_{name}"
+        reads = {name} if self.buffers[name].space == "shared" else set()
+        writes = {snap}
+        self.sync_if_hazard(reads, writes)
         if self.buffers[name].space == "fragment":
             slot, coords, depth = self.loop_fragment(name)
             value = f"{self.buf(name)}[{slot}]"
         else:
-            _, coords = self.loop_tile(self.buffers[name].type.shape)
-            depth = 2
+            _, coords, depth = self.loop_tile(self.buffers[name].type.shape)
             value = self.access(name, coords)
-        self.emit(f"_nt_snapshot_{name}[{', '.join(coords)}] = {value}")
+        self.emit(f"{snap}[{', '.join(coords)}] = {value}")
         self.depth -= depth
-        self.emit("cute.arch.sync_threads()")
+        self.hazards.record(reads, writes)
 
     def emit(self, line=""):
         self.lines.append("    " * self.depth + line if line else "")
@@ -207,6 +231,27 @@ class Emitter:
     def predicate(self, name, indices):
         shape = self.buffers[name].type.shape
         return " and ".join(f"(0 <= ({idx}) and ({idx}) < {dim})" for idx, dim in zip(indices, shape))
+
+    def predicate_for_exprs(self, name, exprs, indices):
+        shape = self.buffers[name].type.shape
+        clauses = []
+        for expr, idx, dim in zip(exprs, indices, shape):
+            iv = self.expr_interval(expr)
+            if iv is not None and 0 <= iv[0] and iv[1] < dim:
+                continue
+            clauses.append(f"(0 <= ({idx}) and ({idx}) < {dim})")
+        return " and ".join(clauses) if clauses else None
+
+    def region_in_bounds_predicate(self, region, indices):
+        shape = self.buffers[region.buffer].type.shape
+        clauses = []
+        for origin, axis, idx, dim in zip(region.origin, region.axes, indices, shape):
+            iv = self.expr_interval(origin)
+            max_offset = 0 if axis is None else region.shape[axis] - 1
+            if iv is not None and 0 <= iv[0] and iv[1] + max_offset < dim:
+                continue
+            clauses.append(f"(0 <= ({idx}) and ({idx}) < {dim})")
+        return " and ".join(clauses) if clauses else None
 
     def index_expression(self, expr):
         value = self.expression(expr)
@@ -238,7 +283,6 @@ class Emitter:
             name = expr.value
             buf = self.buffers[name]
             indices = [self.index_expression(x) for x in expr.args]
-            temp = self.unique("load")
             if buf.space == "fragment":
                 expected = (
                     () if self.parallel is None else tuple(Expr("var", value=n) for n in self.parallel[1])
@@ -247,16 +291,26 @@ class Emitter:
                     return self.fragment_slot(name, expr.args)
                 if name not in self.active_snapshots:
                     raise CompileError("Fragment access requires a parallel coordinate mapping")
+                pred = self.predicate_for_exprs(name, expr.args, indices)
+                target = f"_nt_snapshot_{name}[{', '.join(indices)}]"
+                if pred is None:
+                    return target
+                temp = self.unique("load")
                 self.emit(f"{temp} = {self.dtype(name)}(0)")
-                self.emit(f"if {self.predicate(name, indices)}:")
+                self.emit(f"if {pred}:")
                 self.depth += 1
-                self.emit(f"{temp} = _nt_snapshot_{name}[{', '.join(indices)}]")
+                self.emit(f"{temp} = {target}")
                 self.depth -= 1
                 return temp
+            pred = self.predicate_for_exprs(name, expr.args, indices)
+            target = self.access(name, indices)
+            if pred is None:
+                return target
+            temp = self.unique("load")
             self.emit(f"{temp} = {self.dtype(name)}(0)")
-            self.emit(f"if {self.predicate(name, indices)}:")
+            self.emit(f"if {pred}:")
             self.depth += 1
-            self.emit(f"{temp} = {self.access(name, indices)}")
+            self.emit(f"{temp} = {target}")
             self.depth -= 1
             return temp
         values = [self.expression(x) for x in expr.args]
@@ -468,21 +522,32 @@ class Emitter:
         self.emit(f"for {slot} in cutlass.range_constexpr({plan.slots}):")
         self.depth += 1
         self.emit(f"{flat} = _nt_tid + {slot} * {plan.threads}")
-        self.emit(f"if {flat} < {prod(shape)}:")
+        total = prod(shape)
+        if total % plan.threads == 0:
+            return slot, self.coordinates(flat, shape), 1
+        self.emit(f"if {flat} < {total}:")
         self.depth += 1
-        return slot, self.coordinates(flat, shape)
+        return slot, self.coordinates(flat, shape), 2
 
     def region_indices(self, region, coords):
-        return [
-            f"({self.index_expression(origin)} + {coords[axis] if axis is not None else '0'})"
-            for origin, axis in zip(region.origin, region.axes)
-        ]
+        result = []
+        for origin, axis in zip(region.origin, region.axes):
+            if origin.op == "const" and origin.value == 0 and axis is not None:
+                result.append(coords[axis])
+            elif axis is None:
+                result.append(self.index_expression(origin))
+            else:
+                result.append(f"({self.index_expression(origin)} + {coords[axis]})")
+        return result
 
     def region_coordinates(self, region, buffer_coords):
         coords = ["0"] * len(region.shape)
         for index, origin, axis in zip(buffer_coords, region.origin, region.axes):
             if axis is not None:
-                coords[axis] = f"({index} - {self.index_expression(origin)})"
+                if origin.op == "const" and origin.value == 0:
+                    coords[axis] = index
+                else:
+                    coords[axis] = f"({index} - {self.index_expression(origin)})"
         return coords
 
     def region_predicate(self, region, buffer_coords):
@@ -498,10 +563,15 @@ class Emitter:
         snapshots = self.copy_snapshots(src, dst)
         for name in sorted(snapshots):
             self.materialize_fragment(name)
-        # A uniform barrier also protects shared tiles reused after readers finish.
-        shared = any(self.buffers[r.buffer].space == "shared" for r in (src, dst))
-        if shared:
-            self.emit("cute.arch.sync_threads()")
+        reads = expr_smem_reads(src.origin, self.buffers) | expr_smem_reads(dst.origin, self.buffers)
+        writes: set[str] = set()
+        if src.buffer in snapshots:
+            reads.add(f"_nt_snapshot_{src.buffer}")
+        elif self.buffers[src.buffer].space == "shared":
+            reads.add(src.buffer)
+        if self.buffers[dst.buffer].space == "shared":
+            writes.add(dst.buffer)
+        self.sync_if_hazard(reads, writes)
         if self.buffers[dst.buffer].space == "fragment":
             slot, buffer_coords, depth = self.loop_fragment(dst.buffer)
             coords = self.region_coordinates(dst, buffer_coords)
@@ -513,33 +583,39 @@ class Emitter:
             slot, buffer_coords, depth = self.loop_fragment(src.buffer)
             coords = self.region_coordinates(src, buffer_coords)
         else:
-            slot, coords = self.loop_tile(src.shape)
-            depth = 2
+            slot, coords, depth = self.loop_tile(src.shape)
         src_idx, dst_idx = self.region_indices(src, coords), self.region_indices(dst, coords)
         if self.buffers[src.buffer].space == "fragment" and src.buffer not in snapshots:
             value = f"{self.buf(src.buffer)}[{slot}]"
         else:
-            value = self.unique("copy_value")
-            self.emit(f"{value} = {self.dtype(src.buffer)}(0)")
-            self.emit(f"if {self.predicate(src.buffer, src_idx)}:")
-            self.depth += 1
             source = (
                 f"_nt_snapshot_{src.buffer}[{', '.join(src_idx)}]"
                 if src.buffer in snapshots
                 else self.access(src.buffer, src_idx)
             )
-            self.emit(f"{value} = {source}")
-            self.depth -= 1
+            src_pred = self.region_in_bounds_predicate(src, src_idx)
+            if src_pred is None:
+                value = source
+            else:
+                value = self.unique("copy_value")
+                self.emit(f"{value} = {self.dtype(src.buffer)}(0)")
+                self.emit(f"if {src_pred}:")
+                self.depth += 1
+                self.emit(f"{value} = {source}")
+                self.depth -= 1
         if self.buffers[dst.buffer].space == "fragment":
             self.emit(f"{self.buf(dst.buffer)}[{slot}] = {self.dtype(dst.buffer)}({value})")
         else:
-            self.emit(f"if {self.predicate(dst.buffer, dst_idx)}:")
-            self.depth += 1
-            self.emit(f"{self.access(dst.buffer, dst_idx)} = {self.dtype(dst.buffer)}({value})")
-            self.depth -= 1
+            dst_pred = self.region_in_bounds_predicate(dst, dst_idx)
+            if dst_pred is None:
+                self.emit(f"{self.access(dst.buffer, dst_idx)} = {self.dtype(dst.buffer)}({value})")
+            else:
+                self.emit(f"if {dst_pred}:")
+                self.depth += 1
+                self.emit(f"{self.access(dst.buffer, dst_idx)} = {self.dtype(dst.buffer)}({value})")
+                self.depth -= 1
         self.depth -= depth
-        if shared or snapshots:
-            self.emit("cute.arch.sync_threads()")
+        self.hazards.record(reads, writes)
 
     def gemm(self, a, b, c, ta, tb):
         am, bn, ak, _, _, _ = self.mmas[c]
@@ -547,7 +623,8 @@ class Emitter:
         # CuTe MMA B has (N, K) modes; source language B has (K, N).
         b_stride = (ak, 1) if tb else (1, bn)
         av, bv, ar, br = (self.unique(s) for s in ("a_part", "b_part", "a_reg", "b_reg"))
-        self.emit("cute.arch.sync_threads()")
+        reads = {a, b}
+        self.sync_if_hazard(reads, set())
         self.emit(
             f"{av} = _nt_thr_{c}.partition_A(cute.make_tensor({self.buf(a)}.iterator, cute.make_layout(({am}, {ak}), stride={a_stride})))"
         )
@@ -570,7 +647,7 @@ class Emitter:
             f"cute.gemm(_nt_mma_{c}, {self.buf(c)}, {ar}[None, None, {k}], {br}[None, None, {k}], {self.buf(c)})"
         )
         self.depth -= 1
-        self.emit("cute.arch.sync_threads()")
+        self.hazards.record(reads, set())
 
     def reduction(self, src, dst, kind, dim, clear, nan_propagate):
         shape = self.buffers[src].type.shape
@@ -590,13 +667,14 @@ class Emitter:
                 return self.float_minmax(operation, dtype, left, right, propagate)
             return f"({left} { {'bitand': '&', 'bitor': '|', 'bitxor': '^'}[kind] } {right})"
 
-        self.emit("cute.arch.sync_threads()")
+        stage0_reads = {src} if self.buffers[src].space == "shared" else set()
+        stage0_writes = {workspace}
+        self.sync_if_hazard(stage0_reads, stage0_writes)
         if self.buffers[src].space == "fragment":
             slot, coords, depth = self.loop_fragment(src)
             value = f"{self.buf(src)}[{slot}]"
         else:
-            _, coords = self.loop_tile(shape)
-            depth = 2
+            _, coords, depth = self.loop_tile(shape)
             value = self.access(src, coords)
         value_name = self.unique("reduce_value")
         self.emit(f"{value_name} = {self.dtype(dst)}({value})")
@@ -604,12 +682,13 @@ class Emitter:
             value_name = self.float_minmax("max", dtype, value_name, f"-{value_name}", False)
         self.emit(f"{access(coords)} = {self.dtype(dst)}({value_name})")
         self.depth -= depth
-        self.emit("cute.arch.sync_threads()")
+        self.hazards.record(stage0_reads, stage0_writes)
         # Disjoint pairs in each tree level: right operands are never written
         # at that level, and the block reconverges before the following level.
         stride = 1
         while stride < shape[dim]:
-            _, coords = self.loop_tile(shape)
+            self.sync_threads()
+            _, coords, depth = self.loop_tile(shape)
             self.emit(
                 f"if ({coords[dim]} % {2 * stride} == 0) and ({coords[dim]} + {stride} < {shape[dim]}):"
             )
@@ -618,15 +697,21 @@ class Emitter:
             partner[dim] = f"({coords[dim]} + {stride})"
             result = combine(access(coords), access(partner))
             self.emit(f"{access(coords)} = {self.dtype(dst)}({result})")
-            self.depth -= 3
-            self.emit("cute.arch.sync_threads()")
+            self.depth -= depth + 1
+            self.hazards.record({workspace}, {workspace})
             stride *= 2
+        final_reads = {workspace}
+        final_writes: set[str] = set()
+        if self.buffers[dst].space == "shared":
+            final_writes.add(dst)
+            if not clear:
+                final_reads.add(dst)
+        self.sync_if_hazard(final_reads, final_writes)
         if self.buffers[dst].space == "fragment":
             slot, coords, depth = self.loop_fragment(dst)
             destination = f"{self.buf(dst)}[{slot}]"
         else:
-            _, coords = self.loop_tile(out_shape)
-            depth = 2
+            _, coords, depth = self.loop_tile(out_shape)
             destination = self.access(dst, coords)
         source_coords = coords.copy()
         if len(out_shape) == len(shape):
@@ -647,7 +732,7 @@ class Emitter:
             initial = destination
         self.emit(f"{destination} = {self.dtype(dst)}({combine(initial, access(source_coords))})")
         self.depth -= depth
-        self.emit("cute.arch.sync_threads()")
+        self.hazards.record(final_reads, final_writes)
 
     def loop_control(self, body):
         if not loop_controls(body):
@@ -672,10 +757,14 @@ class Emitter:
         for stmt in body:
             depth = self.depth
             if self.control is not None:
+                before = self.hazards.clone()
                 alive, skip = self.control
                 self.emit(f"if {alive} & ~{skip}:")
                 self.depth += 1
-            self.statement(stmt)
+                self.statement(stmt)
+                self.hazards.merge_from(before)
+            else:
+                self.statement(stmt)
             self.depth = depth
 
     def statement(self, stmt):
@@ -723,11 +812,19 @@ class Emitter:
         if op == "pass":
             self.emit("pass")
         elif op == "evaluate":
+            reads = expr_smem_reads(args[0], self.buffers)
+            if self.parallel is None and reads:
+                self.sync_if_hazard(reads, set())
             value = self.expression(args[0])
             self.emit(f"{self.unique('evaluate')} = {value}")
+            if self.parallel is None and reads:
+                self.hazards.record(reads, set())
         elif op == "print":
             self.debug_print(*args)
         elif op == "device_assert":
+            reads = expr_smem_reads(args[0], self.buffers)
+            if self.parallel is None and reads:
+                self.sync_if_hazard(reads, set())
             self.device_asserts = True
             value = self.expression(args[0])
             condition = self.unique("assert_condition")
@@ -738,6 +835,8 @@ class Emitter:
                 self.emit(f"cute.printf('Device assert failed: %s\\n', {self.debug_string(args[1])}, end='')")
                 self.depth -= 1
             self.emit(f"_nt_device_assert({condition}, 'Device assertion failed')")
+            if self.parallel is None and reads:
+                self.hazards.record(reads, set())
         elif op in ("break", "continue"):
             alive, skip = self.control
             self.emit(f"{skip} = cutlass.Boolean(True)")
@@ -745,45 +844,83 @@ class Emitter:
                 self.emit(f"{alive} = cutlass.Boolean(False)")
         elif op == "if":
             condition, then_body, else_body = args
+            cond_reads = expr_smem_reads(condition, self.buffers)
+            if self.parallel is None and cond_reads:
+                self.sync_if_hazard(cond_reads, set())
             value = self.expression(condition)
+            if self.parallel is None and cond_reads:
+                self.hazards.record(cond_reads, set())
             merged_types = body_types((stmt,), self.scalar_types, self.buffers)
             for name in sorted(merged_types.keys() - self.scalar_types.keys()):
                 self.emit(f"{self.var(name)} = cutlass.{CUTLASS_TYPES[merged_types[name]]}(0)")
+            old_bounds = self.bounds.copy()
+            old_defs = self.definitions.copy()
+            pre_hazards = self.hazards.clone()
             self.scalar_types = merged_types.copy()
+            then_bounds = predicate_bounds(condition, True, old_bounds, old_defs, self.buffers)
+            self.bounds = old_bounds.copy() if then_bounds is None else then_bounds
+            self.definitions = old_defs.copy()
+            self.hazards = pre_hazards.clone()
             self.emit(f"if {value}:")
             self.depth += 1
             self.statements(then_body)
             self.depth -= 1
+            then_hazards = self.hazards
             self.scalar_types = merged_types.copy()
+            self.hazards = pre_hazards.clone()
             if else_body:
+                else_bounds = predicate_bounds(condition, False, old_bounds, old_defs, self.buffers)
+                self.bounds = old_bounds.copy() if else_bounds is None else else_bounds
+                self.definitions = old_defs.copy()
                 self.emit("else:")
                 self.depth += 1
                 self.statements(else_body)
                 self.depth -= 1
+            else_hazards = self.hazards
+            then_hazards.merge_from(else_hazards)
+            self.hazards = then_hazards
+            self.bounds = old_bounds
+            self.definitions = old_defs
             self.scalar_types = merged_types
         elif op == "fill":
             name, value = args
+            reads = expr_smem_reads(value, self.buffers)
+            writes = {name} if self.buffers[name].space == "shared" else set()
+            if self.parallel is None:
+                self.sync_if_hazard(reads, writes)
             text = self.expression(value)
             if self.buffers[name].space == "fragment":
                 self.emit(f"{self.buf(name)}.fill({self.dtype(name)}({text}))")
             else:
-                self.emit("cute.arch.sync_threads()")
-                _, coords = self.loop_tile(self.buffers[name].type.shape)
+                _, coords, depth = self.loop_tile(self.buffers[name].type.shape)
                 self.emit(f"{self.access(name, coords)} = {self.dtype(name)}({text})")
-                self.depth -= 2
-                self.emit("cute.arch.sync_threads()")
+                self.depth -= depth
+            if self.parallel is None:
+                self.hazards.record(reads, writes)
         elif op == "while":
             condition, inner = args
             if expression_dtype(condition, self.buffers, self.scalar_types) != "bool":
                 raise CompileError("While conditions require Boolean expressions", stmt.location)
+            cond_reads = expr_smem_reads(condition, self.buffers)
+            if self.parallel is None and cond_reads:
+                self.sync_if_hazard(cond_reads, set())
             predicate = self.unique("while_condition")
             control = self.loop_control(inner)
             self.emit(f"{predicate} = cutlass.Boolean({self.expression(condition)})")
+            if self.parallel is None and cond_reads:
+                self.hazards.record(cond_reads, set())
+            pre_loop_hazards = self.hazards.clone()
+            old_bounds = self.bounds.copy()
+            old_defs = self.definitions.copy()
             self.emit(f"while {predicate}:")
             self.depth += 1
             old_types = self.scalar_types.copy()
             self.loop_body(inner, control)
             self.scalar_types = old_types
+            self.bounds = old_bounds.copy()
+            self.definitions = old_defs.copy()
+            if self.parallel is None and cond_reads:
+                self.sync_if_hazard(cond_reads, set())
             if control is not None:
                 self.emit(f"if {control[0]}:")
                 self.depth += 1
@@ -794,7 +931,19 @@ class Emitter:
                 self.depth += 1
                 self.emit(f"{predicate} = cutlass.Boolean(False)")
                 self.depth -= 1
+            if self.parallel is None:
+                if cond_reads:
+                    self.hazards.record(cond_reads, set())
+                body_reads, body_writes = smem_footprint(
+                    inner, self.buffers, self.reduction_workspaces, self.scan_workspaces
+                )
+                body_reads |= cond_reads
+                self.sync_if_hazard(body_reads, body_writes)
             self.depth -= 1
+            if self.parallel is None:
+                self.hazards.merge_from(pre_loop_hazards)
+            self.bounds = old_bounds
+            self.definitions = old_defs
         elif op == "copy":
             self.copy(*args)
         elif op == "gemm":
@@ -804,35 +953,73 @@ class Emitter:
         elif op == "scan":
             scan.emit(self, *args)
         elif op == "let":
+            reads = expr_smem_reads(args[1], self.buffers)
+            if self.parallel is None and reads:
+                self.sync_if_hazard(reads, set())
             value = self.expression(args[1])
             dtype = self.scalar_types.get(args[0]) or expression_dtype(
                 args[1], self.buffers, self.scalar_types
             )
             self.scalar_types[args[0]] = dtype
+            self.definitions[args[0]] = args[1]
             self.emit(f"{self.var(args[0])} = cutlass.{CUTLASS_TYPES[dtype]}({value})")
+            if self.parallel is None and reads:
+                self.hazards.record(reads, set())
         elif op == "declare":
             name, dtype, initializer = args
+            reads = expr_smem_reads(initializer, self.buffers)
+            if self.parallel is None and reads:
+                self.sync_if_hazard(reads, set())
             value = self.expression(initializer)
             self.scalar_types[name] = dtype
+            self.definitions.pop(name, None)
+            self.bounds.pop(name, None)
             self.emit(f"{self.var(name)} = {value}")
+            if self.parallel is None and reads:
+                self.hazards.record(reads, set())
         elif op == "assign":
+            reads = expr_smem_reads(args[1], self.buffers)
+            if self.parallel is None and reads:
+                self.sync_if_hazard(reads, set())
+            self.definitions.pop(args[0], None)
+            self.bounds.pop(args[0], None)
             self.emit(f"{self.var(args[0])} = {self.expression(args[1])}")
+            if self.parallel is None and reads:
+                self.hazards.record(reads, set())
         elif op == "store":
             name, indices, value = args
+            reads = expr_smem_reads(indices, self.buffers) | expr_smem_reads(value, self.buffers)
+            writes = {name} if self.buffers[name].space == "shared" else set()
+            if self.parallel is None:
+                self.sync_if_hazard(reads, writes)
             coords = [self.index_expression(x) for x in indices]
-            value = self.expression(value)
+            value_text = self.expression(value)
             if self.buffers[name].space == "fragment":
                 slot = self.fragment_slot(name, indices)
-                self.emit(f"{slot} = {self.dtype(name)}({value})")
+                self.emit(f"{slot} = {self.dtype(name)}({value_text})")
+                if self.parallel is None and reads:
+                    self.hazards.record(reads, set())
                 return
-            self.emit(f"if {self.predicate(name, coords)}:")
-            self.depth += 1
-            self.emit(f"{self.access(name, coords)} = {self.dtype(name)}({value})")
-            self.depth -= 1
+            pred = self.predicate_for_exprs(name, indices, coords)
+            if pred is None:
+                self.emit(f"{self.access(name, coords)} = {self.dtype(name)}({value_text})")
+            else:
+                self.emit(f"if {pred}:")
+                self.depth += 1
+                self.emit(f"{self.access(name, coords)} = {self.dtype(name)}({value_text})")
+                self.depth -= 1
+            if self.parallel is None:
+                self.hazards.record(reads, writes)
         elif op in ("serial", "unroll"):
             names, extents, inner = args
-            if all(type(value) is int for value in extents):
-                trip_count = len(range(*extents))
+            extent_reads = expr_smem_reads(extents[:2], self.buffers)
+            if self.parallel is None and extent_reads:
+                self.sync_if_hazard(extent_reads, set())
+                self.hazards.record(extent_reads, set())
+            static_domain = all(type(value) is int for value in extents)
+            if static_domain:
+                static_range = range(*extents)
+                trip_count = len(static_range)
                 if not trip_count:
                     self.emit("pass  # empty static iteration domain")
                     return
@@ -860,6 +1047,9 @@ class Emitter:
                     loop = f"cutlass.range({trip_count}, unroll={max(1, factor)})"
                 else:
                     loop = f"cutlass.range({trip_count}, unroll_full=True)"
+            pre_loop_hazards = self.hazards.clone()
+            old_bounds = self.bounds.copy()
+            old_defs = self.definitions.copy()
             self.emit(f"for {ordinal} in {loop}:")
             self.depth += 1
             self.emit(
@@ -867,16 +1057,36 @@ class Emitter:
             )
             old_types = self.scalar_types.copy()
             self.scalar_types[names[0]] = "int32"
+            if static_domain:
+                self.bounds[names[0]] = (
+                    min(static_range[0], static_range[-1]),
+                    max(static_range[0], static_range[-1]),
+                )
+            else:
+                self.bounds.pop(names[0], None)
+            self.definitions.pop(names[0], None)
             self.loop_body(inner, control)
             self.scalar_types = old_types
+            self.bounds = old_bounds
+            self.definitions = old_defs
+            if self.parallel is None and (not static_domain or trip_count > 1):
+                body_reads, body_writes = smem_footprint(
+                    inner, self.buffers, self.reduction_workspaces, self.scan_workspaces
+                )
+                self.sync_if_hazard(body_reads, body_writes)
             self.depth -= 1
+            if self.parallel is None and not static_domain:
+                self.hazards.merge_from(pre_loop_hazards)
         elif op == "parallel":
             names, shape, inner = args
-            fragments, snapshots, shared = self.parallel_accesses(stmt)
-            if shared:
-                self.emit("cute.arch.sync_threads()")
+            fragments, snapshots, _ = self.parallel_accesses(stmt)
             for name in sorted(snapshots):
                 self.materialize_fragment(name)
+            p_reads, p_writes = smem_footprint(
+                inner, self.buffers, self.reduction_workspaces, self.scan_workspaces
+            )
+            p_reads.update(f"_nt_snapshot_{name}" for name in snapshots)
+            self.sync_if_hazard(p_reads, p_writes)
             self.active_snapshots = snapshots
             fragments = sorted(fragments)
             if fragments:
@@ -886,23 +1096,28 @@ class Emitter:
                     )
                 slot, coords, depth = self.loop_fragment(fragments[0])
             else:
-                slot, coords = self.loop_tile(shape)
-                depth = 2
+                slot, coords, depth = self.loop_tile(shape)
             for name, coord in zip(names, coords):
                 self.emit(f"{self.var(name)} = {coord}")
             old_types = self.scalar_types.copy()
+            old_bounds = self.bounds.copy()
+            old_defs = self.definitions.copy()
             self.scalar_types.update({name: "int32" for name in names})
+            for name, dim in zip(names, shape):
+                self.bounds[name] = (0, dim - 1)
+                self.definitions.pop(name, None)
             self.parallel = (shape, names, slot)
             previous_control = self.control
             self.control = None
             self.statements(inner)
             self.control = previous_control
             self.scalar_types = old_types
+            self.bounds = old_bounds
+            self.definitions = old_defs
             self.parallel = None
             self.active_snapshots = set()
             self.depth -= depth
-            if shared:
-                self.emit("cute.arch.sync_threads()")
+            self.hazards.record(p_reads, p_writes)
         else:
             raise CompileError(f"Unsupported IR operation {op}", stmt.location)
 
@@ -927,17 +1142,26 @@ class Emitter:
 
     def debug_print(self, obj, message, main_lane):
         if isinstance(obj, Expr):
+            reads = expr_smem_reads(obj, self.buffers)
+            if self.parallel is None and reads:
+                self.sync_if_hazard(reads, set())
             self.debug_call(
                 message, expression_dtype(obj, self.buffers, self.scalar_types), self.expression(obj)
             )
+            if self.parallel is None and reads:
+                self.hazards.record(reads, set())
             return
         if obj is None:
             self.debug_call(message)
             return
+        print_reads: set[str] = set()
         if obj.space == "fragment":
             self.materialize_fragment(obj.name)
-        elif obj.space == "shared" and self.parallel is None:
-            self.emit("cute.arch.sync_threads()")
+            print_reads.add(f"_nt_snapshot_{obj.name}")
+        elif obj.space == "shared":
+            print_reads.add(obj.name)
+        if self.parallel is None and print_reads:
+            self.sync_if_hazard(print_reads, set())
         if obj.space != "global":
             # No matching lane means no output, including out-of-range selectors.
             self.emit(f"if _nt_tid == {main_lane}:")
@@ -955,8 +1179,8 @@ class Emitter:
         self.depth -= 1
         if obj.space != "global":
             self.depth -= 1
-            if self.parallel is None:
-                self.emit("cute.arch.sync_threads()")
+        if self.parallel is None and print_reads:
+            self.hazards.record(print_reads, set())
 
     def emit_debug_helpers(self):
         if self.debug_prints or self.device_asserts:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from .ir import Partition, Region, Statement, integer_limits
 from .macros import ValueNode
+from .passes.smem_hazards import expr_smem_reads
 
 
 def workspace_shape(shape, dim):
@@ -112,13 +113,18 @@ def emit(emitter, src, dst, kind, dim, reverse):
         result = f"({left} + {right})" if kind == "sum" else e.float_minmax("max", dtype, left, right, False)
         return f"{typ}({result})"
 
-    # Padding has the reducer identity. The barriers also protect workspace
-    # reuse across multiple scans, branches, and loop iterations.
-    e.emit("cute.arch.sync_threads()")
-    _, coords = e.loop_tile(shape)
-    e.emit(f"{access(first, coords)} = {initial}")
-    e.depth -= 2
-    e.emit("cute.arch.sync_threads()")
+    # Padding has the reducer identity when the scan axis is not a multiple of 32.
+    if src.shape != shape:
+        e.sync_if_hazard(set(), {first})
+        _, coords, depth = e.loop_tile(shape)
+        e.emit(f"{access(first, coords)} = {initial}")
+        e.depth -= depth
+        e.hazards.record(set(), {first})
+
+    src_reads = expr_smem_reads(src.origin, e.buffers)
+    if e.buffers[src.buffer].space == "shared":
+        src_reads.add(src.buffer)
+    e.sync_if_hazard(src_reads, {first})
     if e.buffers[src.buffer].space == "fragment":
         slot, physical, depth = e.loop_fragment(src.buffer)
         coords = e.region_coordinates(src, physical)
@@ -128,23 +134,27 @@ def emit(emitter, src, dst, kind, dim, reverse):
             depth += 1
         value = f"{e.buf(src.buffer)}[{slot}]"
     else:
-        _, coords = e.loop_tile(src.shape)
-        depth = 2
+        _, coords, depth = e.loop_tile(src.shape)
         indices = e.region_indices(src, coords)
-        value = e.unique("scan_input")
-        e.emit(f"{value} = {typ}(0)")
-        e.emit(f"if {e.predicate(src.buffer, indices)}:")
-        e.depth += 1
-        e.emit(f"{value} = {e.access(src.buffer, indices)}")
-        e.depth -= 1
+        src_pred = e.region_in_bounds_predicate(src, indices)
+        if src_pred is None:
+            value = e.access(src.buffer, indices)
+        else:
+            value = e.unique("scan_input")
+            e.emit(f"{value} = {typ}(0)")
+            e.emit(f"if {src_pred}:")
+            e.depth += 1
+            e.emit(f"{value} = {e.access(src.buffer, indices)}")
+            e.depth -= 1
     e.emit(f"{access(first, coords)} = {value}")
     e.depth -= depth
-    e.emit("cute.arch.sync_threads()")
+    e.hazards.record(src_reads, {first})
+    e.sync_threads()
 
     # Each stage reads only the preceding bank, then reconverges before the
     # banks swap. This holds even when a thread owns several register slots.
     for offset in (1, 2, 4, 8, 16):
-        _, coords = e.loop_tile(shape)
+        _, coords, depth = e.loop_tile(shape)
         lane = f"({coords[dim]} % 32)"
         predicate = f"{lane} < {32 - offset}" if reverse else f"{lane} >= {offset}"
         neighbor = coords.copy()
@@ -156,8 +166,8 @@ def emit(emitter, src, dst, kind, dim, reverse):
         e.emit(f"{value} = {combine(value, access(first, neighbor))}")
         e.depth -= 1
         e.emit(f"{access(second, coords)} = {value}")
-        e.depth -= 2
-        e.emit("cute.arch.sync_threads()")
+        e.depth -= depth
+        e.sync_threads()
         first, second = second, first
 
     # Propagate segment carries in the same order as InclusiveScanLine. The
@@ -167,7 +177,7 @@ def emit(emitter, src, dst, kind, dim, reverse):
     e.emit(f"for {segment} in cutlass.range({segments}):")
     e.depth += 1
     chunk_shape = shape[:dim] + (32,) + shape[dim + 1 :]
-    _, coords = e.loop_tile(chunk_shape)
+    _, coords, depth = e.loop_tile(chunk_shape)
     segment_index = f"({segments - 1} - {segment})" if reverse else segment
     coords[dim] = f"({segment_index} * 32 + {coords[dim]})"
     carry = e.unique("scan_carry")
@@ -179,12 +189,15 @@ def emit(emitter, src, dst, kind, dim, reverse):
     e.emit(f"{carry} = {access(first, previous)}")
     e.depth -= 1
     e.emit(f"{access(first, coords)} = {combine(access(first, coords), carry)}")
-    e.depth -= 2
-    e.emit("cute.arch.sync_threads()")
+    e.depth -= depth
+    e.sync_threads()
     e.depth -= 1
 
     # All input has been captured before any destination write. A fragment
     # destination uses its own physical ownership, including MMA layouts.
+    dst_reads = {first} | expr_smem_reads(dst.origin, e.buffers)
+    dst_writes = {dst.buffer} if e.buffers[dst.buffer].space == "shared" else set()
+    e.sync_if_hazard(dst_reads, dst_writes)
     if e.buffers[dst.buffer].space == "fragment":
         slot, physical, depth = e.loop_fragment(dst.buffer)
         coords = e.region_coordinates(dst, physical)
@@ -194,15 +207,17 @@ def emit(emitter, src, dst, kind, dim, reverse):
             depth += 1
         target = f"{e.buf(dst.buffer)}[{slot}]"
     else:
-        _, coords = e.loop_tile(dst.shape)
+        _, coords, depth = e.loop_tile(dst.shape)
         indices = e.region_indices(dst, coords)
-        e.emit(f"if {e.predicate(dst.buffer, indices)}:")
-        e.depth += 1
-        depth = 3
+        dst_pred = e.region_in_bounds_predicate(dst, indices)
+        if dst_pred is not None:
+            e.emit(f"if {dst_pred}:")
+            e.depth += 1
+            depth += 1
         target = e.access(dst.buffer, indices)
     e.emit(f"{target} = {e.dtype(dst.buffer)}({access(first, coords)})")
     e.depth -= depth
-    e.emit("cute.arch.sync_threads()")
+    e.hazards.record(dst_reads, dst_writes)
 
 
 def evaluate(values, kind, dim, reverse):

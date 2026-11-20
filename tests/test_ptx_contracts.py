@@ -10,6 +10,8 @@ import pytest
 from ntilang.ptx_verifier import analyze_ptx, inspect_kernel_ptx
 
 from examples.matmul import matmul
+from examples.softmax import softmax
+from examples.transpose import transpose
 from examples.vector_add import vector_add
 
 
@@ -109,6 +111,20 @@ def test_minmax_ptx_survives_cute_compilation(kind, dtype, ptx_regex):
     assert report.local_spill_ops == 0
 
 
+def test_barrier_and_bounds_elision_in_generated_source():
+    aligned_gemm = matmul(128, 128, 128)
+    assert aligned_gemm.source.count("cute.arch.sync_threads()") == 2
+    assert "if (0 <=" not in aligned_gemm.source
+
+    unaligned_gemm = matmul(65, 71, 37)
+    assert unaligned_gemm.source.count("cute.arch.sync_threads()") == 2
+    assert "0 <=" in unaligned_gemm.source
+
+    aligned_transpose = transpose(128, 128)
+    assert aligned_transpose.source.count("cute.arch.sync_threads()") == 1
+    assert "if (0 <=" not in aligned_transpose.source
+
+
 @pytest.mark.cuda
 @pytest.mark.skipif(importlib.util.find_spec("cutlass") is None, reason="CuTe DSL compiler is not installed")
 def test_core_kernels_ptx_contracts():
@@ -116,6 +132,17 @@ def test_core_kernels_ptx_contracts():
     assert vec_report.local_spill_ops == 0
     assert vec_report.barriers == 0
 
-    gemm_report = inspect_kernel_ptx(matmul())
+    gemm_report = inspect_kernel_ptx(matmul(128, 128, 128))
     assert gemm_report.mma_ops >= 1
     assert gemm_report.local_spill_ops == 0
+    assert gemm_report.barriers <= 2
+    assert gemm_report.consecutive_barriers == 0
+
+    trans_report = inspect_kernel_ptx(transpose(128, 128))
+    assert trans_report.local_spill_ops == 0
+    assert trans_report.barriers == 1
+    assert trans_report.consecutive_barriers == 0
+
+    soft_report = inspect_kernel_ptx(softmax(16, 128))
+    assert soft_report.local_spill_ops == 0
+    assert soft_report.consecutive_barriers == 0

@@ -37,6 +37,24 @@ class HazardTracker:
         self.writes.update(other.writes)
 
 
+def expr_smem_reads(value, buffers: dict[str, Buffer]) -> set[str]:
+    """Return shared-memory buffers read anywhere inside a scalar expression tree."""
+    reads: set[str] = set()
+
+    def visit(node):
+        if isinstance(node, Expr):
+            if node.op == "load" and buffers[node.value].space == "shared":
+                reads.add(node.value)
+            for arg in node.args:
+                visit(arg)
+        elif isinstance(node, (tuple, list)):
+            for arg in node:
+                visit(arg)
+
+    visit(value)
+    return reads
+
+
 def smem_footprint(
     body,
     buffers: dict[str, Buffer],
@@ -48,14 +66,7 @@ def smem_footprint(
     writes: set[str] = set()
 
     def expr_reads(value):
-        if isinstance(value, Expr):
-            if value.op == "load" and buffers[value.value].space == "shared":
-                reads.add(value.value)
-            for arg in value.args:
-                expr_reads(arg)
-        elif isinstance(value, (tuple, list)):
-            for arg in value:
-                expr_reads(arg)
+        reads.update(expr_smem_reads(value, buffers))
 
     for stmt in walk(body):
         op, args = stmt.op, stmt.args
