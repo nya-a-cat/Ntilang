@@ -614,6 +614,8 @@ def validate(kernel: Kernel):
                             record_write(dst.buffer, indices, tile_bounds, definitions, in_serial, path)
                 elif op == "fill":
                     expression(args[1], bounds, definitions)
+                elif op in ("use_swizzle", "annotate_layout"):
+                    pass
                 elif op in ("parallel", "serial", "unroll"):
                     names, extent, inner = args
                     inner_bounds = bounds.copy()

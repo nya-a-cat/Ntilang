@@ -105,7 +105,13 @@ class Parser:
         self.filename = inspect.getsourcefile(self.function) or "<kernel>"
         self.node = next(n for n in ast.parse(self.source).body if isinstance(n, ast.FunctionDef))
         closure = inspect.getclosurevars(self.function)
-        self.constants = {**self.function.__globals__, **dict(program.annotation_locals), **closure.nonlocals}
+        self.specializations = dict(program.specializations)
+        self.constants = {
+            **self.function.__globals__,
+            **dict(program.annotation_locals),
+            **closure.nonlocals,
+            **self.specializations,
+        }
         self.buffers: dict[str, Buffer] = {}
         self.variables: set[str] = set()
         self.initialized: set[str] = set()
@@ -190,9 +196,11 @@ class Parser:
                 return self.python_value(macros.ValueNode(value[key], node))
             except (IndexError, KeyError, TypeError) as exc:
                 self.fail(node, f"Invalid construction-time index: {exc}")
-        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        elif isinstance(node, ast.Attribute) and isinstance(node.value, (ast.Name, ast.Attribute)):
             owner = self.python_value(node.value)
-            if owner is language:
+            import ntilang as _ntilang_pkg
+
+            if owner in (_ntilang_pkg, language, language.GemmWarpPolicy, language.layout):
                 value = inspect.getattr_static(owner, node.attr, None)
                 if value is None:
                     self.fail(node, "Unknown language attribute")
@@ -290,8 +298,10 @@ class Parser:
 
     def attribute_value(self, node):
         owner = self.macro_value(node.value)
+        import ntilang as _ntilang_pkg
+
         try:
-            if owner is language:
+            if owner in (_ntilang_pkg, language, language.GemmWarpPolicy, language.layout):
                 value = inspect.getattr_static(owner, node.attr, NO_CONSTRUCTION_CALL)
                 if value is NO_CONSTRUCTION_CALL:
                     self.fail(node, f"Unknown language attribute {node.attr!r}")
@@ -321,6 +331,12 @@ class Parser:
             name = "print" if target is language.print else "device_assert"
             self.pending.append(self.debug_statement(node, name, node, self.parse_context[0]))
             return None
+        if target is language.infinity:
+            args = self.bind_call(node, ["dtype"], {"dtype": "float32"})
+            dtype = str(language.DType(self.static(args["dtype"])))
+            if dtype not in ("float16", "bfloat16", "float32", "float64"):
+                self.fail(node, f"T.infinity requires a floating-point dtype, got {dtype!r}")
+            return Expr("cast", (Expr("const", value=float("inf")),), dtype)
         if type(target) is language.DType:
             if len(node.args) != 1 or node.keywords:
                 self.fail(node, "Scalar dtype conversion requires one positional argument")
@@ -1698,25 +1714,31 @@ class Parser:
                     if self.before_launch:
                         self.fail(node, "Allocations before T.Kernel require host execution lowering")
                     return self.scalar_allocation(node.value, target)
-                if name in ("alloc_shared", "alloc_fragment"):
+                if name in ("alloc_shared", "alloc_fragment", "alloc_local"):
                     if self.before_launch:
                         self.fail(node, "Allocations before T.Kernel require host execution lowering")
                     if nested:
                         self.fail(node, "Allocate buffers directly inside T.Kernel, before loops")
                     if target.id.startswith("_nt_"):
                         self.fail(node, f"Reserved name {target.id}")
-                    default_scope = "shared.dyn" if name == "alloc_shared" else "local.fragment"
+                    default_scope = (
+                        "shared.dyn"
+                        if name == "alloc_shared"
+                        else "local"
+                        if name == "alloc_local"
+                        else "local.fragment"
+                    )
                     args = self.bind_call(node.value, ["shape", "dtype", "scope"], {"scope": default_scope})
                     shape, dtype, scope = (self.static(args[key]) for key in ("shape", "dtype", "scope"))
                     typ = TensorType((shape,) if type(shape) is int else tuple(shape), dtype)
                     if name == "alloc_shared" and dtype == "bool":
                         scope = "shared"
-                    if scope not in ("shared", "shared.dyn", "local.fragment"):
+                    if scope not in ("shared", "shared.dyn", "local.fragment", "local"):
                         self.fail(node, f"Allocation scope {scope!r} requires further memory lowering")
                     buf = Buffer(
                         self.fresh(target.id),
                         typ,
-                        "fragment" if scope == "local.fragment" else "shared",
+                        "fragment" if scope in ("local.fragment", "local") else "shared",
                         source_scope=scope,
                         source_name=self.source_names.get(target.id, target.id),
                     )
@@ -1871,13 +1893,59 @@ class Parser:
                 value = Expr("const", value=0) if name == "clear" else self.expr(call.args[1])
                 self.initialized.add(buf)
                 return Statement("fill", (buf, value), loc)
+            if name == "use_swizzle":
+                if nested:
+                    self.fail(node, "T.use_swizzle must appear directly inside T.Kernel")
+                args = self.bind_call(
+                    call,
+                    ["panel_size", "order", "enable"],
+                    {"panel_size": 10, "order": "row", "enable": True},
+                )
+                panel_size = self.static(args["panel_size"])
+                order = self.static(args["order"])
+                enable = self.static(args["enable"])
+                if type(panel_size) is not int or panel_size <= 0:
+                    self.fail(node, "T.use_swizzle panel_size must be a positive integer")
+                if order not in ("row", "col"):
+                    self.fail(node, "T.use_swizzle order must be 'row' or 'col'")
+                if type(enable) is not bool:
+                    self.fail(node, "T.use_swizzle enable must be bool")
+                return Statement("use_swizzle", (panel_size, order, enable), loc)
+            if name == "annotate_layout":
+                if nested:
+                    self.fail(node, "T.annotate_layout must appear directly inside T.Kernel")
+                args = self.bind_call(call, ["layout_map"], {})
+                mapping_node = args["layout_map"]
+                if not isinstance(mapping_node, ast.Dict) or any(k is None for k in mapping_node.keys):
+                    self.fail(node, "T.annotate_layout requires a dictionary mapping buffers to layouts")
+                entries = []
+                for key_node, val_node in zip(mapping_node.keys, mapping_node.values):
+                    buf_name = self.buffer_name(key_node)
+                    if not isinstance(val_node, ast.Call):
+                        self.fail(val_node, "Unsupported layout annotation expression")
+                    func_val = self.python_value(val_node.func)
+                    if func_val is not language.layout.make_swizzled_layout:
+                        self.fail(
+                            val_node, "Only make_swizzled_layout is currently supported in annotate_layout"
+                        )
+                    entries.append((buf_name, "swizzled"))
+                return Statement("annotate_layout", (tuple(entries),), loc)
             if name == "gemm":
                 if len(call.args) != 3:
                     self.fail(node, "T.gemm expects A, B, accumulator")
-                kw = self.keywords(call, {"transpose_A", "transpose_B"})
-                if any(type(v) is not bool for v in kw.values()):
-                    self.fail(node, "Transpose flags must be bool")
+                kw = self.keywords(
+                    call, {"transpose_A", "transpose_B", "policy", "clear_accum", "k_pack", "wg_wait"}
+                )
+                for flag in ("transpose_A", "transpose_B", "clear_accum"):
+                    if flag in kw and type(kw[flag]) is not bool:
+                        self.fail(node, f"{flag} must be bool")
+                if kw.get("k_pack", 1) != 1:
+                    self.fail(node, "T.gemm k_pack > 1 requires further lowering")
                 names = tuple(self.buffer_name(x) for x in call.args)
+                clear_accum = kw.get("clear_accum", False)
+                if clear_accum:
+                    self.initialized.add(names[2])
+                    self.pending.append(Statement("fill", (names[2], Expr("const", value=0)), loc))
                 for buf in names:
                     if buf not in self.initialized:
                         self.fail(node, f"Buffer {buf} is read before initialization")
@@ -1894,7 +1962,18 @@ class Parser:
         parameters = []
         for param in fn.args.args:
             annotation = self.function.__annotations__.get(param.arg)
-            if isinstance(annotation, str) and annotation in language.DTYPE_NAMES:
+            if isinstance(annotation, language.SymbolicTensorSpec):
+                resolved_shape = []
+                for dim in annotation.shape:
+                    if isinstance(dim, language.SymbolicDim):
+                        concrete = self.specializations.get(dim.name, self.constants.get(dim.name))
+                        if type(concrete) is not int:
+                            self.fail(param, f"Symbolic dimension {dim.name!r} is not specialized")
+                        resolved_shape.append(concrete)
+                    else:
+                        resolved_shape.append(dim)
+                annotation = TensorType(tuple(resolved_shape), annotation.dtype)
+            elif isinstance(annotation, str) and annotation in language.DTYPE_NAMES:
                 annotation = language.DTYPE_NAMES[annotation]
             elif not isinstance(annotation, TensorType):
                 node = param.annotation

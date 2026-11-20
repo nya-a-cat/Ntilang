@@ -11,8 +11,6 @@ from . import scan
 from .cuda_math import low_precision_asm, minmax_asm
 from .debug import print_format
 from .ir import (
-    DTYPES,
-    Buffer,
     CompileError,
     Expr,
     Kernel,
@@ -21,6 +19,15 @@ from .ir import (
     integer_limits,
     loop_controls,
 )
+from .passes import (
+    analyze_mmas,
+    collect_workspaces,
+    infer_fragment_layouts,
+    validate_shared_memory_budget,
+    walk,
+)
+from .passes import copy_snapshots as _copy_snapshots
+from .passes import parallel_accesses as _parallel_accesses
 from .runtime import HOST_ERROR_TYPES
 from .scalar import (
     BINARY_MATH_OPS,
@@ -54,18 +61,6 @@ CUTLASS_TYPES = {
     "float64": "Float64",
     "bool": "Boolean",
 }
-
-
-def walk(body):
-    for stmt in body:
-        yield stmt
-        if stmt.op in ("serial", "parallel", "unroll"):
-            yield from walk(stmt.args[2])
-        elif stmt.op == "if":
-            yield from walk(stmt.args[1])
-            yield from walk(stmt.args[2])
-        elif stmt.op == "while":
-            yield from walk(stmt.args[1])
 
 
 def requests_math_header(value):
@@ -124,162 +119,31 @@ class Emitter:
             if isinstance(p, ScalarParameter) and p.name in host_inputs
         )
         self.active_snapshots = set()
-        for stmt in walk(kernel.body):
-            if stmt.op == "gemm":
-                a, b, c, ta, tb = stmt.args
-                ab, bb, cb = (self.buffers[n] for n in (a, b, c))
-                if ab.space != "shared" or bb.space != "shared" or cb.space != "fragment":
-                    raise CompileError("T.gemm requires shared A/B and a fragment accumulator", stmt.location)
-                if any(len(x.type.shape) != 2 for x in (ab, bb, cb)):
-                    raise CompileError("T.gemm requires rank-two tiles", stmt.location)
-                am, ak = ab.type.shape[::-1] if ta else ab.type.shape
-                bk, bn = bb.type.shape[::-1] if tb else bb.type.shape
-                if ak != bk or cb.type.shape != (am, bn):
-                    raise CompileError("T.gemm tile shapes do not match C += A @ B", stmt.location)
-                if (
-                    ab.type.dtype != bb.type.dtype
-                    or ab.type.dtype not in ("float16", "bfloat16")
-                    or cb.type.dtype != "float32"
-                ):
-                    raise CompileError(
-                        "T.gemm supports float16/bfloat16 operands with float32 accumulation", stmt.location
-                    )
-                if kernel.threads % 32 or kernel.threads not in (32, 64, 128, 256):
-                    raise CompileError("Tensor Core GEMM supports 32, 64, 128, or 256 threads", stmt.location)
-                warps = kernel.threads // 32
-                candidates = [
-                    wm
-                    for wm in (1, 2, 4, 8)
-                    if wm <= warps and am % (16 * wm) == 0 and bn % (8 * (warps // wm)) == 0
-                ]
-                if not candidates or ak % 16:
-                    raise CompileError(
-                        "GEMM M/N must cover the warp arrangement and K must be a multiple of 16",
-                        stmt.location,
-                    )
-                wm = max(candidates)
-                plan = (am, bn, ak, wm, warps // wm, ab.type.dtype)
-                if c in self.mmas and self.mmas[c] != plan:
-                    raise CompileError(
-                        "All GEMMs sharing an accumulator require the same MMA layout", stmt.location
-                    )
-                self.mmas[c] = plan
-        self.fragment_layouts = self.infer_fragment_layouts()
-        self.snapshots = set()
-        self.reduction_workspaces = {}
-        self.scan_workspaces = {}
-        for stmt in walk(kernel.body):
-            if stmt.op == "print" and isinstance(stmt.args[0], Buffer):
-                if stmt.args[0].space == "fragment":
-                    self.snapshots.add(stmt.args[0].name)
-            elif stmt.op == "parallel":
-                _, snapshots, _ = self.parallel_accesses(stmt)
-                self.snapshots.update(snapshots)
-            elif stmt.op == "copy":
-                self.snapshots.update(self.copy_snapshots(*stmt.args))
-            elif stmt.op == "reduce":
-                src, dst = stmt.args[:2]
-                key = (src, self.buffers[dst].type.dtype)
-                if key not in self.reduction_workspaces:
-                    self.reduction_workspaces[key] = f"_nt_reduce_workspace_{len(self.reduction_workspaces)}"
-            elif stmt.op == "scan":
-                key = scan.workspace_key(stmt.args, self.buffers)
-                if key not in self.scan_workspaces:
-                    label = f"_nt_scan_workspace_{len(self.scan_workspaces)}"
-                    self.scan_workspaces[key] = (label + "_a", label + "_b")
-        shared_bytes = 0
-        for buffer in kernel.buffers:
-            for needed in (buffer.name in self.snapshots, buffer.space == "shared"):
-                if not needed:
-                    continue
-                shared_bytes = (shared_bytes + 15) // 16 * 16
-                shared_bytes += prod(buffer.type.shape) * DTYPES[buffer.type.dtype]
-        for src, dtype in self.reduction_workspaces:
-            shared_bytes = (shared_bytes + 15) // 16 * 16
-            shared_bytes += prod(self.buffers[src].type.shape) * DTYPES[dtype]
-        for (shape, dtype), workspaces in self.scan_workspaces.items():
-            for _ in workspaces:
-                shared_bytes = (shared_bytes + 15) // 16 * 16
-                shared_bytes += prod(shape) * DTYPES[dtype]
-        if shared_bytes > 48 * 1024:
-            raise CompileError("Shared buffers and fragment communication exceed 48 KiB per block")
+        self.mmas = analyze_mmas(kernel, self.buffers)
+        self.fragment_layouts = infer_fragment_layouts(kernel, self.buffers, self.mmas)
+        self.snapshots, self.reduction_workspaces, self.scan_workspaces = collect_workspaces(
+            kernel, self.buffers
+        )
+        self.swizzled_buffers = {
+            buf_name
+            for stmt in walk(kernel.body)
+            if stmt.op == "annotate_layout"
+            for buf_name, kind in stmt.args[0]
+            if kind == "swizzled"
+        }
+        validate_shared_memory_budget(
+            kernel,
+            self.buffers,
+            self.snapshots,
+            self.reduction_workspaces,
+            self.scan_workspaces,
+        )
 
     def parallel_accesses(self, stmt):
-        names, shape, body = stmt.args
-        expected = tuple(Expr("var", value=n) for n in names)
-        pointwise, snapshots, written = set(), set(), set()
-        shared_used, shared_written, shared_cross_reads = set(), set(), set()
+        return _parallel_accesses(stmt, self.buffers)
 
-        def loads(value):
-            if isinstance(value, Expr):
-                if value.op == "load" and self.buffers[value.value].space == "fragment":
-                    if self.buffers[value.value].type.shape == shape and value.args == expected:
-                        pointwise.add(value.value)
-                    else:
-                        snapshots.add(value.value)
-                elif value.op == "load" and self.buffers[value.value].space == "shared":
-                    shared_used.add(value.value)
-                    if self.buffers[value.value].type.shape != shape or value.args != expected:
-                        shared_cross_reads.add(value.value)
-                for arg in value.args:
-                    loads(arg)
-            elif isinstance(value, (tuple, list)):
-                for arg in value:
-                    loads(arg)
-
-        for inner in walk(body):
-            loads(inner.args)
-            if inner.op == "print" and isinstance(inner.args[0], Buffer) and inner.args[0].space == "shared":
-                shared_used.add(inner.args[0].name)
-                shared_cross_reads.add(inner.args[0].name)
-            if inner.op == "store" and self.buffers[inner.args[0]].space == "fragment":
-                written.add(inner.args[0])
-            elif inner.op == "store" and self.buffers[inner.args[0]].space == "shared":
-                shared_used.add(inner.args[0])
-                shared_written.add(inner.args[0])
-        if snapshots & written:
-            raise CompileError(
-                "Cross-element fragment reads require a separate source fragment from parallel writes",
-                stmt.location,
-            )
-        if shared_cross_reads & shared_written:
-            raise CompileError(
-                "Cross-element shared reads require a separate source tile from parallel writes",
-                stmt.location,
-            )
-        return pointwise | written, snapshots, bool(shared_used)
-
-    def infer_fragment_layouts(self):
-        # Connected pointwise operations and whole-tile copies share ownership.
-        # Propagate before allocation so a fragment's earlier writes use the same
-        # mapping as its later MMA consumer.
-        parents = {b.name: b.name for b in self.kernel.buffers if b.space == "fragment"}
-
-        def root(name):
-            while parents[name] != name:
-                name = parents[name]
-            return name
-
-        for stmt in walk(self.kernel.body):
-            names = set()
-            if stmt.op == "parallel":
-                names, _, _ = self.parallel_accesses(stmt)
-            elif stmt.op == "copy":
-                if all(r.is_full(self.buffers[r.buffer].type.shape) for r in stmt.args):
-                    names = {r.buffer for r in stmt.args if self.buffers[r.buffer].space == "fragment"}
-            names = sorted(names)
-            for name in names[1:]:
-                parents[root(name)] = root(names[0])
-        seeds = {}
-        for name, plan in self.mmas.items():
-            group = root(name)
-            if group in seeds:
-                previous = self.mmas[seeds[group]]
-                if (plan[:2], plan[3:5]) != (previous[:2], previous[3:5]):
-                    raise CompileError("Connected MMA fragments require a register layout conversion")
-            else:
-                seeds[group] = name
-        return {name: seeds.get(root(name)) for name in parents}
+    def copy_snapshots(self, src, dst):
+        return _copy_snapshots(src, dst, self.buffers)
 
     def fragment_slot(self, name, indices):
         buf = self.buffers[name]
@@ -630,17 +494,6 @@ class Emitter:
             )
         return " and ".join(predicates)
 
-    def copy_snapshots(self, src, dst):
-        if src.buffer == dst.buffer and src != dst:
-            return {src.buffer}
-        if self.buffers[src.buffer].space == "fragment" and (
-            not src.is_full(self.buffers[src.buffer].type.shape)
-            or self.buffers[dst.buffer].space == "fragment"
-            and not dst.is_full(self.buffers[dst.buffer].type.shape)
-        ):
-            return {src.buffer}
-        return set()
-
     def copy(self, src, dst):
         snapshots = self.copy_snapshots(src, dst)
         for name in sorted(snapshots):
@@ -828,7 +681,44 @@ class Emitter:
     def statement(self, stmt):
         op, args = stmt.op, stmt.args
         self.emit(f"# {self.kernel.name}:{stmt.location.line} {op}")
-        if op == "alloc":
+        if op in ("alloc", "annotate_layout"):
+            return
+        if op == "use_swizzle":
+            panel_size, order, enable = args
+            if enable and panel_size > 1 and len(self.kernel.grid) >= 2:
+                gx, gy = self.kernel.grid[0], self.kernel.grid[1]
+                bx_v = self.var(self.kernel.block_vars[0])
+                by_v = self.var(self.kernel.block_vars[1])
+                pid = self.unique("swz_pid")
+                gid = self.unique("swz_gid")
+                first = self.unique("swz_first")
+                gsize = self.unique("swz_gsize")
+                rem = self.unique("swz_rem")
+                self.emit(f"{pid} = cutlass.Int32({bx_v}) + cutlass.Int32({by_v}) * cutlass.Int32({gx})")
+                if order == "row":
+                    panel_width = panel_size * gy
+                    self.emit(f"{gid} = {pid} // {panel_width}")
+                    self.emit(f"{first} = {gid} * {panel_size}")
+                    self.emit(f"{gsize} = cutlass.Int32({panel_size})")
+                    self.emit(f"if (cutlass.Int32({gx}) - {first}) < cutlass.Int32({panel_size}):")
+                    self.depth += 1
+                    self.emit(f"{gsize} = cutlass.Int32({gx}) - {first}")
+                    self.depth -= 1
+                    self.emit(f"{rem} = {pid} % {panel_width}")
+                    self.emit(f"{bx_v} = {first} + ({rem} % {gsize})")
+                    self.emit(f"{by_v} = {rem} // {gsize}")
+                else:
+                    panel_width = panel_size * gx
+                    self.emit(f"{gid} = {pid} // {panel_width}")
+                    self.emit(f"{first} = {gid} * {panel_size}")
+                    self.emit(f"{gsize} = cutlass.Int32({panel_size})")
+                    self.emit(f"if (cutlass.Int32({gy}) - {first}) < cutlass.Int32({panel_size}):")
+                    self.depth += 1
+                    self.emit(f"{gsize} = cutlass.Int32({gy}) - {first}")
+                    self.depth -= 1
+                    self.emit(f"{rem} = {pid} % {panel_width}")
+                    self.emit(f"{by_v} = {first} + ({rem} % {gsize})")
+                    self.emit(f"{bx_v} = {rem} // {gsize}")
             return
         if op == "pass":
             self.emit("pass")

@@ -348,6 +348,8 @@ def reference(kernel: CompiledKernel, *arrays):
                 av, bv = buffers[a], buffers[b]
                 av, bv = av.T if ta else av, bv.T if tb else bv
                 buffers[c] += av.astype(np.float32) @ bv.astype(np.float32)
+            elif op in ("use_swizzle", "annotate_layout"):
+                pass
             elif op == "reduce":
                 src, dst, kind, dim, clear, nan_propagate = args
                 output = buffers[dst]

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from functools import wraps
 from typing import Callable
 
+from . import layout as layout
 from .ir import DTYPE_ALIASES, DTYPES, TensorType
 
 
@@ -69,10 +70,59 @@ def get_tvm_dtype(value):
     return value if type(value) is DType else DType(value)
 
 
-def Tensor(shape, dtype="float32", data=None, scope=None) -> TensorType:
+@dataclass(frozen=True)
+class SymbolicDim:
+    """Symbolic dimension placeholder created by T.dynamic(name, dtype)."""
+
+    name: str
+    dtype: str = "int32"
+
+    def __post_init__(self):
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("T.dynamic requires a non-empty dimension name")
+        object.__setattr__(self, "dtype", str(DType(self.dtype)))
+
+
+@dataclass(frozen=True)
+class SymbolicTensorSpec:
+    """Tensor annotation containing one or more T.dynamic symbolic dimensions."""
+
+    shape: tuple[int | SymbolicDim, ...]
+    dtype: str
+
+
+class GemmWarpPolicy:
+    """TileLang-compatible GEMM warp partitioning policy constants."""
+
+    Square = 0
+    FullRow = 1
+    FullCol = 2
+
+
+def dynamic(name: str, dtype: str = "int32") -> SymbolicDim:
+    """Create a symbolic tensor dimension specialized automatically at @jit runtime."""
+    return SymbolicDim(name, dtype)
+
+
+def infinity(dtype: str = "float32") -> float:
+    """Return positive infinity for a floating-point dtype."""
+    canonical = str(DType(dtype))
+    if canonical not in ("float16", "bfloat16", "float32", "float64"):
+        raise ValueError(f"T.infinity requires a floating-point dtype, got {canonical!r}")
+    return float("inf")
+
+
+def Tensor(shape, dtype="float32", data=None, scope=None) -> TensorType | SymbolicTensorSpec:
     if data is not None or scope not in (None, "global"):
         raise ValueError("Tensor pointer bindings and non-global parameter scopes require further lowering")
-    return TensorType((shape,) if type(shape) is builtins.int else tuple(shape), DType(dtype))
+    dims = (shape,) if isinstance(shape, (builtins.int, SymbolicDim)) else tuple(shape)
+    resolved_dtype = DType(dtype)
+    if any(isinstance(d, SymbolicDim) for d in dims):
+        for dim in dims:
+            if not isinstance(dim, SymbolicDim) and (type(dim) is not builtins.int or dim <= 0):
+                raise ValueError("Static dimensions alongside T.dynamic must be positive integers")
+        return SymbolicTensorSpec(dims, str(resolved_dtype))
+    return TensorType(dims, resolved_dtype)
 
 
 def ceildiv(lhs: int, rhs: int, span=None) -> int:
@@ -111,6 +161,7 @@ def index_to_coordinates(index, shape):
 class PrimFunc:
     function: Callable
     annotation_locals: tuple = ()
+    specializations: tuple = ()
 
     @property
     def __name__(self):
@@ -205,7 +256,10 @@ for _name in (
     "Unroll",
     "alloc_shared",
     "alloc_fragment",
+    "alloc_local",
     "alloc_var",
+    "use_swizzle",
+    "annotate_layout",
     "loop_break",
     "break_loop",
     "continue_loop",
@@ -317,14 +371,103 @@ for _name in (
 del _name, _marker
 
 
-def jit(function=None, *, target="sm_80"):
-    """Compile a kernel factory when it is called with specialization constants."""
-    from .compiler import compile
+def _is_direct_kernel(function: Callable) -> bool:
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    except (OSError, TypeError, SyntaxError):
+        return False
+    if not tree.body or not isinstance(tree.body[0], ast.FunctionDef):
+        return False
+    body = tree.body[0].body
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if not body or not isinstance(body[-1], ast.With) or len(body[-1].items) != 1:
+        return False
+    ctx = body[-1].items[0].context_expr
+    if not isinstance(ctx, ast.Call):
+        return False
+    func = ctx.func
+    return (isinstance(func, ast.Attribute) and func.attr == "Kernel") or (
+        isinstance(func, ast.Name) and func.id == "Kernel"
+    )
+
+
+def _has_symbolic_annotations(program: PrimFunc) -> bool:
+    for ann in program.function.__annotations__.values():
+        if isinstance(ann, SymbolicTensorSpec):
+            return True
+    for _, val in program.annotation_locals:
+        if isinstance(val, (SymbolicDim, SymbolicTensorSpec)):
+            return True
+    if program.function.__closure__:
+        for cell in program.function.__closure__:
+            try:
+                val = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(val, (SymbolicDim, SymbolicTensorSpec)):
+                return True
+    return False
+
+
+def jit(
+    function=None,
+    *,
+    out_idx=None,
+    target="auto",
+    target_host=None,
+    execution_backend=None,
+    verbose=False,
+    pass_configs=None,
+    compile_flags=None,
+):
+    """Compile a TileLang-style kernel or kernel factory directly to standalone CuTe DSL."""
+    from .compat import resolve_target
+    from .compiler import DynamicJitKernel, compile
+
+    del target_host, execution_backend, verbose, compile_flags
+    frame = inspect.currentframe()
+    caller_locals = frame.f_back.f_locals.copy() if frame is not None and frame.f_back is not None else {}
+    del frame
 
     def decorate(factory):
+        if _is_direct_kernel(factory):
+            program = PrimFunc(factory, _annotation_bindings(factory, caller_locals))
+            if _has_symbolic_annotations(program):
+                return DynamicJitKernel(program, target=target, out_idx=out_idx, pass_configs=pass_configs)
+            return compile(program, target=resolve_target(target), out_idx=out_idx, pass_configs=pass_configs)
+
+        cache = {}
+
         @wraps(factory)
         def wrapped(*args, **kwargs):
-            return compile(factory(*args, **kwargs), target=target)
+            resolved = resolve_target(target)
+            key = (
+                args,
+                tuple(sorted(kwargs.items())),
+                resolved,
+                out_idx
+                if isinstance(out_idx, builtins.int)
+                else tuple(out_idx)
+                if out_idx is not None
+                else None,
+            )
+            if key in cache:
+                return cache[key]
+            program = factory(*args, **kwargs)
+            if isinstance(program, PrimFunc) and _has_symbolic_annotations(program):
+                kernel = DynamicJitKernel(
+                    program, target=resolved, out_idx=out_idx, pass_configs=pass_configs
+                )
+            else:
+                kernel = compile(program, target=resolved, out_idx=out_idx, pass_configs=pass_configs)
+            cache[key] = kernel
+            return kernel
 
         return wrapped
 
