@@ -1785,9 +1785,13 @@ class Parser:
             elif name in ("serial", "Serial", "unroll", "Unroll"):
                 extents, annotations = self.loop_signature(node.iter, name)
             else:
-                kw = self.keywords(node.iter, {"num_stages"} if name == "Pipelined" else set())
-                if kw.get("num_stages", 1) not in (0, 1):
-                    self.fail(node, "Asynchronous multi-stage pipelines are not implemented; use T.serial")
+                kw = self.keywords(
+                    node.iter,
+                    {"num_stages", "order", "stage", "sync", "group"} if name == "Pipelined" else set(),
+                )
+                num_stages = kw.get("num_stages", 1)
+                if type(num_stages) is not int or num_stages < 0:
+                    self.fail(node, "T.Pipelined num_stages must be a non-negative static integer")
                 extents = tuple(self.static(a) for a in node.iter.args)
             if not targets or any(not isinstance(t, ast.Name) for t in targets):
                 self.fail(node, "Loop targets must be names")
@@ -1847,8 +1851,20 @@ class Parser:
             if name != "Parallel" and (not static_domain or not range(*extents) or controls):
                 self.initialized = old_initialized
             kind = (
-                "parallel" if name == "Parallel" else "unroll" if name in ("unroll", "Unroll") else "serial"
+                "parallel"
+                if name == "Parallel"
+                else "unroll"
+                if name in ("unroll", "Unroll")
+                else "pipelined"
+                if name == "Pipelined" and kw.get("num_stages", 1) >= 2
+                else "serial"
             )
+            if kind == "pipelined":
+                if controls:
+                    self.fail(node, "T.Pipelined with num_stages >= 2 does not support break or continue")
+                return Statement(
+                    "pipelined", (names, extents, body, kw.get("num_stages", 1)), loc, annotations
+                )
             if kind == "unroll" and dict(annotations).get("pragma_unroll_explicit") and "break" in controls:
                 self.fail(node, "A loop with a targeted break cannot be explicitly expanded")
             return Statement(kind, (names, extents, body), loc, annotations)

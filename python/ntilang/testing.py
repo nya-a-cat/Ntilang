@@ -394,8 +394,8 @@ def reference(kernel: CompiledKernel, *arrays):
                     statements(inner)
                 variable_types = before_types
                 parallel_thread = before_thread
-            elif op in ("serial", "unroll"):
-                names, extent, inner = args
+            elif op in ("serial", "unroll", "pipelined"):
+                names, extent, inner = args[:3]
                 before_types = variable_types.copy()
                 domain = tuple(expr(value) if isinstance(value, Expr) else value for value in extent)
                 for value in range(*domain):

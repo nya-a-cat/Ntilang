@@ -162,3 +162,14 @@ def test_core_kernels_ptx_contracts():
     assert scan_report.consecutive_barriers == 0
     assert scan_report.barriers <= 2
     assert scan_report.contains(r"\bshfl\.sync\.up\.b32\b")
+
+    pipe_gemm = matmul(256, 256, 128, 128, 128, 32, num_stages=3, swizzle_panel=8)
+    assert "CopyG2SOp" in pipe_gemm.source
+    assert "cp_async_wait_group(1)" in pipe_gemm.source
+    pipe_report = inspect_kernel_ptx(pipe_gemm)
+    assert pipe_report.cp_async_ops >= 4
+    assert pipe_report.ldmatrix_ops >= 8
+    assert pipe_report.mma_ops >= 16
+    assert pipe_report.barriers <= 2
+    assert pipe_report.consecutive_barriers == 0
+    assert pipe_report.local_spill_ops == 0

@@ -56,7 +56,7 @@ def analyze_mmas(kernel: Kernel, buffers: dict[str, Buffer]) -> dict[str, tuple]
                 "GEMM M/N must cover the warp arrangement and K must be a multiple of 16",
                 stmt.location,
             )
-        wm = max(candidates)
+        wm = min(candidates, key=lambda w: (am // w + bn // (warps // w), -w))
         plan = (am, bn, ak, wm, warps // wm, ab.type.dtype)
         if c in mmas and mmas[c] != plan:
             raise CompileError("All GEMMs sharing an accumulator require the same MMA layout", stmt.location)
@@ -196,15 +196,20 @@ def validate_shared_memory_budget(
     reduction_workspaces: dict[tuple[str, str], str],
     scan_workspaces: dict[tuple[tuple[int, ...], str], tuple[str, str]],
     limit: int = 48 * 1024,
+    stage_multipliers: dict[str, int] | None = None,
 ) -> int:
     """Compute 16-byte aligned static shared-memory usage and enforce the block limit."""
+    multipliers = {} if stage_multipliers is None else stage_multipliers
     shared_bytes = 0
     for buffer in kernel.buffers:
-        for needed in (buffer.name in snapshots, buffer.space == "shared"):
-            if not needed:
-                continue
+        if buffer.name in snapshots:
             shared_bytes = (shared_bytes + 15) // 16 * 16
             shared_bytes += prod(buffer.type.shape) * DTYPES[buffer.type.dtype]
+        if buffer.space == "shared":
+            shared_bytes = (shared_bytes + 15) // 16 * 16
+            shared_bytes += (
+                prod(buffer.type.shape) * DTYPES[buffer.type.dtype] * multipliers.get(buffer.name, 1)
+            )
     for src, dtype in reduction_workspaces:
         shared_bytes = (shared_bytes + 15) // 16 * 16
         shared_bytes += prod(buffers[src].type.shape) * DTYPES[dtype]
@@ -213,5 +218,6 @@ def validate_shared_memory_budget(
             shared_bytes = (shared_bytes + 15) // 16 * 16
             shared_bytes += prod(shape) * DTYPES[dtype]
     if shared_bytes > limit:
-        raise CompileError("Shared buffers and fragment communication exceed 48 KiB per block")
+        kib = limit // 1024
+        raise CompileError(f"Shared buffers and fragment communication exceed {kib} KiB per block")
     return shared_bytes

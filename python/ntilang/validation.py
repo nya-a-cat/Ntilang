@@ -616,8 +616,8 @@ def validate(kernel: Kernel):
                     expression(args[1], bounds, definitions)
                 elif op in ("use_swizzle", "annotate_layout"):
                     pass
-                elif op in ("parallel", "serial", "unroll"):
-                    names, extent, inner = args
+                elif op in ("parallel", "serial", "unroll", "pipelined"):
+                    names, extent, inner = args[:3]
                     inner_bounds = bounds.copy()
                     if op == "parallel":
                         inner_bounds.update({n: (0, s - 1) for n, s in zip(names, extent)})

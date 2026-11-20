@@ -219,3 +219,27 @@ def test_dropin_tilelang_gemm_and_dynamic_on_gpu(torch_cuda):
         y2 = dyn_softmax(x2)
         torch.testing.assert_close(y1, torch.softmax(x1, dim=-1), rtol=2e-5, atol=2e-6)
         torch.testing.assert_close(y2, torch.softmax(x2, dim=-1), rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.gpu
+def test_pipelined_multistage_gemm_on_gpu():
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device is not available")
+
+    from examples.matmul import matmul
+
+    for m, n, k, bm, bn, bk, stages in (
+        (256, 256, 128, 128, 128, 32, 3),
+        (256, 256, 128, 128, 128, 32, 4),
+        (128, 128, 32, 64, 64, 32, 3),  # trip_count=1 < num_stages
+        (65, 71, 37, 32, 32, 32, 3),  # non-divisible fallback
+    ):
+        a = torch.randn(m, k, device="cuda", dtype=torch.float16)
+        b = torch.randn(k, n, device="cuda", dtype=torch.float16)
+        c = torch.empty(m, n, device="cuda", dtype=torch.float32)
+        kernel = matmul(m, n, k, bm, bn, bk, num_stages=stages, swizzle_panel=4)
+        kernel(a, b, c)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(c, a.float() @ b.float(), rtol=2e-3, atol=2e-3)

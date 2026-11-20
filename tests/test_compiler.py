@@ -113,16 +113,28 @@ def test_collective_in_parallel_is_rejected():
         ntilang.compile(bad)
 
 
-def test_unsupported_pipeline_is_rejected():
+def test_invalid_pipeline_is_rejected():
     @T.prim_func
-    def bad(A: T.Tensor((32,), "float32")):
+    def bad_stages(A: T.Tensor((32,), "float32")):
         with T.Kernel(1, threads=32) as _bx:
-            for k in T.Pipelined(2, num_stages=3):
+            for k in T.Pipelined(2, num_stages=-1):
                 for i in T.Parallel(32):
                     A[i] = 0.0
 
-    with pytest.raises(ntilang.CompileError, match="multi-stage"):
-        ntilang.compile(bad)
+    with pytest.raises(ntilang.CompileError, match="non-negative"):
+        ntilang.compile(bad_stages)
+
+    @T.prim_func
+    def bad_break(A: T.Tensor((32,), "float32")):
+        with T.Kernel(1, threads=32) as _bx:
+            for k in T.Pipelined(2, num_stages=3):
+                if k == 1:
+                    break
+                for i in T.Parallel(32):
+                    A[i] = 0.0
+
+    with pytest.raises(ntilang.CompileError, match="break or continue"):
+        ntilang.compile(bad_break)
 
 
 def test_gemm_shape_error():

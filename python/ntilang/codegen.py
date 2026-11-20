@@ -17,6 +17,7 @@ from .ir import (
     Kernel,
     Partition,
     ScalarParameter,
+    Statement,
     integer_limits,
     loop_controls,
 )
@@ -136,19 +137,107 @@ class Emitter:
             for buf_name, kind in stmt.args[0]
             if kind == "swizzled"
         }
+        self.hazards = HazardTracker()
+        self.bounds: dict[str, tuple[int, int]] = {
+            name: (0, extent - 1) for name, extent in zip(kernel.block_vars, kernel.grid)
+        }
+        self.definitions: dict[str, Expr] = {}
+        self.active_stage: dict[str, str] = {}
+        self.shared_swizzles: dict[str, tuple[int, int, int]] = self._plan_shared_swizzles()
+        self.pipelined_plans, self.staged_buffers = self._plan_pipelined_loops()
         validate_shared_memory_budget(
             kernel,
             self.buffers,
             self.snapshots,
             self.reduction_workspaces,
             self.scan_workspaces,
+            limit=self._shared_memory_limit(),
+            stage_multipliers=self.staged_buffers,
         )
-        self.hazards = HazardTracker()
-        self.bounds: dict[str, tuple[int, int]] = {
-            name: (0, extent - 1) for name, extent in zip(kernel.block_vars, kernel.grid)
-        }
-        self.definitions: dict[str, Expr] = {}
-        self.shared_swizzles: dict[str, tuple[int, int, int]] = self._plan_shared_swizzles()
+
+    def _shared_memory_limit(self) -> int:
+        if not self.staged_buffers:
+            return 48 * 1024
+        if self.target == "sm_80":
+            return 163 * 1024
+        if self.target in ("sm_86", "sm_87", "sm_89"):
+            return 99 * 1024
+        return 227 * 1024
+
+    def _plan_pipelined_loops(self):
+        plans: dict[int, tuple[int, list, list]] = {}
+        staged: dict[str, int] = {}
+
+        def _buf_refs(stmts):
+            reads, writes = smem_footprint(
+                stmts, self.buffers, self.reduction_workspaces, self.scan_workspaces
+            )
+            return reads | writes
+
+        all_stmts = list(walk(self.kernel.body))
+        for stmt in all_stmts:
+            if stmt.op != "pipelined":
+                continue
+            names, extents, inner, num_stages = stmt.args
+            if num_stages < 2 or not all(type(v) is int for v in extents):
+                continue
+            static_range = range(*extents)
+            if not static_range:
+                continue
+            loop_var = names[0]
+            old_bounds = self.bounds.copy()
+            self.bounds[loop_var] = (
+                min(static_range[0], static_range[-1]),
+                max(static_range[0], static_range[-1]),
+            )
+            try:
+                inner_ids = {id(s) for s in walk(inner)}
+                outside_stmts = [s for s in all_stmts if id(s) != id(stmt) and id(s) not in inner_ids]
+                outside_refs = _buf_refs(outside_stmts)
+                producers = []
+                producer_bufs: set[str] = set()
+                idx = 0
+                while idx < len(inner):
+                    child = inner[idx]
+                    if child.op != "copy":
+                        break
+                    src, dst = child.args
+                    src_buf, dst_buf = self.buffers[src.buffer], self.buffers[dst.buffer]
+                    if (
+                        src_buf.space != "global"
+                        or dst_buf.space != "shared"
+                        or not dst.is_full(dst_buf.type.shape)
+                        or len(dst_buf.type.shape) != 2
+                        or dst.buffer in producer_bufs
+                        or dst.buffer in staged
+                        or dst.buffer in self.snapshots
+                        or dst.buffer in outside_refs
+                    ):
+                        break
+                    vec_plan = self._vectorized_copy_plan(src, dst)
+                    if vec_plan is None or vec_plan[0] * vec_plan[1] * 8 not in (32, 64, 128):
+                        break
+                    producers.append((src, dst))
+                    producer_bufs.add(dst.buffer)
+                    idx += 1
+                consumers = list(inner[idx:])
+                if not producers or not consumers:
+                    continue
+                _, consumer_writes = smem_footprint(
+                    consumers, self.buffers, self.reduction_workspaces, self.scan_workspaces
+                )
+                if consumer_writes & producer_bufs:
+                    continue
+                for buf_name in producer_bufs:
+                    if buf_name in self.shared_swizzles:
+                        b_bits, m_bits, s_bits = self.shared_swizzles[buf_name]
+                        if prod(self.buffers[buf_name].type.shape) % (1 << (b_bits + m_bits + s_bits)) != 0:
+                            del self.shared_swizzles[buf_name]
+                    staged[buf_name] = num_stages
+                plans[id(stmt)] = (num_stages, producers, consumers)
+            finally:
+                self.bounds = old_bounds
+        return plans, staged
 
     def _plan_shared_swizzles(self) -> dict[str, tuple[int, int, int]]:
         mma_operands: set[str] = set()
@@ -305,6 +394,35 @@ class Emitter:
         dst_tile = tile_expr(dst, dst_coords)
         self.emit(f"cute.copy({tc}, {thr}.partition_S({src_tile}), {thr}.partition_D({dst_tile}))")
 
+    def _emit_async_copy(self, src, dst, plan, stage_expr: str):
+        vec, elem_bytes, thr_shape, thr_stride, val_shape, src_coords, _ = plan
+        bits = vec * elem_bytes * 8
+        cache_mode = (
+            "cute.nvgpu.cpasync.LoadCacheMode.GLOBAL"
+            if bits == 128
+            else "cute.nvgpu.cpasync.LoadCacheMode.ALWAYS"
+        )
+        atom = self.unique("async_atom")
+        tc = self.unique("async_tc")
+        thr = self.unique("async_thr")
+        self.emit(
+            f"{atom} = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(cache_mode={cache_mode}), {self.dtype(src.buffer)}, num_bits_per_copy={bits})"
+        )
+        self.emit(
+            f"{tc} = cute.make_tiled_copy_tv({atom}, cute.make_layout({thr_shape}, stride={thr_stride}), cute.make_layout({val_shape}))"
+        )
+        self.emit(f"{thr} = {tc}.get_slice(_nt_tid)")
+        src_buf = self.buffers[src.buffer]
+        if src.is_full(src_buf.type.shape):
+            src_tile = self.buf(src.buffer)
+        else:
+            src_tile = self.unique("async_src")
+            self.emit(
+                f"{src_tile} = cute.local_tile({self.buf(src.buffer)}, {src.shape}, {self.tuple_text(src_coords)})"
+            )
+        dst_tile = f"{self.buf(dst.buffer)}[None, None, {stage_expr}]"
+        self.emit(f"cute.copy({tc}, {thr}.partition_S({src_tile}), {thr}.partition_D({dst_tile}))")
+
     def sync_threads(self):
         self.emit("cute.arch.sync_threads()")
         self.hazards.clear()
@@ -383,6 +501,8 @@ class Emitter:
         return "(" + ", ".join(map(str, items)) + ("," if len(items) == 1 else "") + ")"
 
     def access(self, name, indices):
+        if name in self.active_stage:
+            return f"{self.buf(name)}[{', '.join(indices)}, {self.active_stage[name]}]"
         return f"{self.buf(name)}[{', '.join(indices)}]"
 
     def predicate(self, name, indices):
@@ -783,15 +903,26 @@ class Emitter:
         self.hazards.record(reads, writes)
 
     def _shared_mma_view(self, name: str, shape: tuple[int, int], stride: tuple[int, int], native: bool):
+        stage = self.active_stage.get(name)
         if native:
-            return self.buf(name)
+            return f"{self.buf(name)}[None, None, {stage}]" if stage is not None else self.buf(name)
         view = self.unique("mma_view")
         swz = self.shared_swizzles.get(name)
+        if stage is not None:
+            stages = self.staged_buffers[name]
+            rows, cols = self.buffers[name].type.shape
+            base = f"cute.make_layout(({shape[0]}, {shape[1]}, {stages}), stride=({stride[0]}, {stride[1]}, {rows * cols}))"
+            layout_expr = (
+                f"cute.make_composed_layout(cute.make_swizzle{swz}, 0, {base})" if swz is not None else base
+            )
+            self.emit(
+                f"{view} = cute.make_tensor({self.buf(name)}.iterator, {layout_expr})[None, None, {stage}]"
+            )
+            return view
         base = f"cute.make_layout({shape}, stride={stride})"
-        if swz is not None:
-            layout_expr = f"cute.make_composed_layout(cute.make_swizzle{swz}, 0, {base})"
-        else:
-            layout_expr = base
+        layout_expr = (
+            f"cute.make_composed_layout(cute.make_swizzle{swz}, 0, {base})" if swz is not None else base
+        )
         self.emit(f"{view} = cute.make_tensor({self.buf(name)}.iterator, {layout_expr})")
         return view
 
@@ -1367,6 +1498,89 @@ class Emitter:
             self.depth -= 1
             if self.parallel is None and not static_domain:
                 self.hazards.merge_from(pre_loop_hazards)
+        elif op == "pipelined":
+            names, extents, inner, _ = args
+            if id(stmt) not in self.pipelined_plans or self.parallel is not None:
+                fallback = Statement("serial", (names, extents, inner), stmt.location, stmt.annotations)
+                self.statement(fallback)
+                return
+            num_stages, producers, consumers = self.pipelined_plans[id(stmt)]
+            static_range = range(*extents)
+            trip_count = len(static_range)
+            start, step = extents[0], extents[2]
+            loop_var = names[0]
+            staged_names = {dst.buffer for _, dst in producers}
+
+            old_types = self.scalar_types.copy()
+            old_bounds = self.bounds.copy()
+            old_defs = self.definitions.copy()
+            self.scalar_types[loop_var] = "int32"
+            self.bounds[loop_var] = (
+                min(static_range[0], static_range[-1]),
+                max(static_range[0], static_range[-1]),
+            )
+            self.definitions.pop(loop_var, None)
+
+            # Prologue: asynchronously prefetch the first (num_stages - 1) tiles.
+            p_var = self.unique("pipe_pre")
+            self.emit(f"for {p_var} in cutlass.range_constexpr({num_stages - 1}):")
+            self.depth += 1
+            guarded_pro = trip_count < num_stages - 1
+            if guarded_pro:
+                self.emit(f"if {p_var} < {trip_count}:")
+                self.depth += 1
+            self.emit(
+                f"{self.var(loop_var)} = cutlass.Int32(cutlass.Int64({start}) + cutlass.Int64({p_var}) * {step})"
+            )
+            for src, dst in producers:
+                plan = self._vectorized_copy_plan(src, dst)
+                self._emit_async_copy(src, dst, plan, p_var)
+            if guarded_pro:
+                self.depth -= 1
+            self.emit("cute.arch.cp_async_commit_group()")
+            self.depth -= 1
+
+            # Mainloop: wait oldest stage, overlap next prefetch with consumer compute.
+            it = self.unique("pipe_it")
+            r_stage = self.unique("rstage")
+            w_stage = self.unique("wstage")
+            pref_it = self.unique("pref_it")
+            self.emit(f"for {it} in range({trip_count}):")
+            self.depth += 1
+            self.emit(f"{r_stage} = {it} % {num_stages}")
+            self.emit(f"{w_stage} = ({it} + {num_stages - 1}) % {num_stages}")
+            self.emit(f"cute.arch.cp_async_wait_group({num_stages - 2})")
+            self.sync_threads()
+            self.emit(f"{pref_it} = {it} + {num_stages - 1}")
+            self.emit(f"if {pref_it} < {trip_count}:")
+            self.depth += 1
+            self.emit(
+                f"{self.var(loop_var)} = cutlass.Int32(cutlass.Int64({start}) + cutlass.Int64({pref_it}) * {step})"
+            )
+            for src, dst in producers:
+                plan = self._vectorized_copy_plan(src, dst)
+                self._emit_async_copy(src, dst, plan, w_stage)
+            self.depth -= 1
+            self.emit("cute.arch.cp_async_commit_group()")
+            self.emit(
+                f"{self.var(loop_var)} = cutlass.Int32(cutlass.Int64({start}) + cutlass.Int64({it}) * {step})"
+            )
+
+            old_stage = self.active_stage.copy()
+            for name in staged_names:
+                self.active_stage[name] = r_stage
+            self.statements(consumers)
+            self.active_stage = old_stage
+            self.hazards.reads -= staged_names
+            self.hazards.writes -= staged_names
+            self.depth -= 1
+
+            # Epilogue: drain any empty commit groups and leave shared state clean.
+            self.emit("cute.arch.cp_async_wait_group(0)")
+            self.sync_threads()
+            self.scalar_types = old_types
+            self.bounds = old_bounds
+            self.definitions = old_defs
         elif op == "parallel":
             names, shape, inner = args
             fragments, snapshots, _ = self.parallel_accesses(stmt)
@@ -1713,8 +1927,13 @@ class Emitter:
                     f"_nt_snapshot_{b.name} = _nt_smem.allocate_tensor({self.dtype(b.name)}, cute.make_layout({b.type.shape}, stride={strides}), byte_alignment=16)"
                 )
             if b.space == "shared":
-                strides = tuple(prod(b.type.shape[i + 1 :]) for i in range(len(b.type.shape)))
-                base = f"cute.make_layout({b.type.shape}, stride={strides})"
+                if b.name in self.staged_buffers:
+                    stages = self.staged_buffers[b.name]
+                    rows, cols = b.type.shape
+                    base = f"cute.make_layout(({rows}, {cols}, {stages}), stride=({cols}, 1, {rows * cols}))"
+                else:
+                    strides = tuple(prod(b.type.shape[i + 1 :]) for i in range(len(b.type.shape)))
+                    base = f"cute.make_layout({b.type.shape}, stride={strides})"
                 swz = self.shared_swizzles.get(b.name)
                 layout_expr = (
                     f"cute.make_composed_layout(cute.make_swizzle{swz}, 0, {base})"
