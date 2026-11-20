@@ -272,6 +272,8 @@ for _name in (
     "clamp",
     "clear",
     "fill",
+    "atomic_add",
+    "atomic_max",
     "gemm",
     "reduce",
     "reduce_sum",

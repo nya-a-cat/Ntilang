@@ -58,17 +58,31 @@ class CompileError(ValueError):
 
 
 @dataclass(frozen=True)
+class SymDim:
+    """Symbolic dynamic tensor dimension lowered to CuTe SymInt (cute.sym_int32)."""
+
+    name: str
+    divisibility: int = 1
+
+
+@dataclass(frozen=True)
 class TensorType:
-    shape: tuple[int, ...]
+    shape: tuple[int | SymDim, ...]
     dtype: str
+
+    @property
+    def is_symbolic(self) -> bool:
+        return any(isinstance(n, SymDim) for n in self.shape)
 
     def __post_init__(self):
         object.__setattr__(self, "dtype", str(DTYPE_ALIASES.get(self.dtype, self.dtype)))
-        if not self.shape or any(type(n) is not int or n <= 0 for n in self.shape):
+        if not self.shape or any(
+            not isinstance(n, SymDim) and (type(n) is not int or n <= 0) for n in self.shape
+        ):
             raise CompileError("Tensor dimensions must be positive static integers")
         if self.dtype not in DTYPES:
             raise CompileError(f"Unsupported dtype {self.dtype!r}; supported: {', '.join(DTYPES)}")
-        if prod(self.shape) > 2**31 - 1:
+        if not self.is_symbolic and prod(self.shape) > 2**31 - 1:
             raise CompileError("Tensor sizes exceeding signed 32-bit indexing are not supported")
 
 
@@ -150,6 +164,8 @@ class Kernel:
     body: tuple[Statement, ...]
     source: str
     host_checks: tuple[Statement, ...] = ()
+    grid_exprs: tuple[int | Expr, ...] = ()
+    sym_dims: tuple[SymDim, ...] = ()
 
     @property
     def buffer_map(self) -> dict[str, Buffer]:

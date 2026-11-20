@@ -15,7 +15,7 @@ from pathlib import Path
 from .codegen import generate
 from .compat import normalize_out_idx, resolve_target, torch_dtype_for
 from .frontend import parse
-from .ir import DTYPES, Kernel, ScalarParameter
+from .ir import DTYPES, CompileError, Kernel, ScalarParameter, SymDim
 from .language import PrimFunc, SymbolicDim, SymbolicTensorSpec
 from .runtime import scalar_ffi_argument
 from .validation import validate
@@ -70,7 +70,43 @@ class CompiledKernel:
             sys.modules.pop(module_name, None)
         return self._executable
 
-    def _allocate_outputs(self, inputs: tuple) -> list:
+    @property
+    def user_parameters(self):
+        if not self.ir.sym_dims:
+            return self.ir.parameters
+        sym_param_names = {f"_nt_sym_{sym.name}" for sym in self.ir.sym_dims}
+        return tuple(p for p in self.ir.parameters if p.name not in sym_param_names)
+
+    def _extract_sym_bindings(self, user_params, arguments, out_set) -> dict[str, int]:
+        bindings: dict[str, int] = {}
+        in_params = [p for i, p in enumerate(user_params) if i not in out_set]
+        pairs = (
+            zip(user_params, arguments) if len(arguments) == len(user_params) else zip(in_params, arguments)
+        )
+        for param, arg in pairs:
+            if isinstance(param, ScalarParameter):
+                continue
+            if not hasattr(arg, "shape"):
+                continue
+            if len(arg.shape) != len(param.type.shape):
+                raise ValueError(f"{param.name}: expected rank {len(param.type.shape)}, got {len(arg.shape)}")
+            for spec_dim, actual in zip(param.type.shape, arg.shape):
+                if isinstance(spec_dim, SymDim):
+                    actual_int = int(actual)
+                    if actual_int <= 0:
+                        raise ValueError(f"Symbolic dimension {spec_dim.name!r} must be positive")
+                    prev = bindings.get(spec_dim.name)
+                    if prev is not None and prev != actual_int:
+                        raise ValueError(
+                            f"Symbolic dimension {spec_dim.name!r} mismatch: {prev} vs {actual_int}"
+                        )
+                    bindings[spec_dim.name] = actual_int
+        return bindings
+
+    def _resolve_shape(self, shape, sym_bindings: dict[str, int]) -> tuple[int, ...]:
+        return tuple(sym_bindings[d.name] if isinstance(d, SymDim) else d for d in shape)
+
+    def _allocate_outputs(self, inputs: tuple, sym_bindings: dict[str, int]) -> list:
         torch = sys.modules.get("torch")
         if torch is None:
             torch = importlib.import_module("torch")
@@ -86,28 +122,41 @@ class CompiledKernel:
         if device is None:
             device = torch.device("cuda")
         outputs = []
+        user_params = self.user_parameters
         for idx in self.out_idx:
-            param = self.ir.parameters[idx]
+            param = user_params[idx]
+            concrete_shape = self._resolve_shape(param.type.shape, sym_bindings)
             outputs.append(
-                torch.empty(param.type.shape, dtype=torch_dtype_for(param.type.dtype, torch), device=device)
+                torch.empty(concrete_shape, dtype=torch_dtype_for(param.type.dtype, torch), device=device)
             )
         return outputs
 
     def __call__(self, *arguments):
+        user_params = self.user_parameters
+        out_set = set(self.out_idx)
+        sym_bindings = self._extract_sym_bindings(user_params, arguments, out_set) if self.ir.sym_dims else {}
         allocated_outputs = None
-        if self.out_idx and len(arguments) == len(self.ir.parameters) - len(self.out_idx):
-            allocated_outputs = self._allocate_outputs(arguments)
+        if self.out_idx and len(arguments) == len(user_params) - len(self.out_idx):
+            allocated_outputs = self._allocate_outputs(arguments, sym_bindings)
             out_map = dict(zip(self.out_idx, allocated_outputs))
             input_iter = iter(arguments)
             arguments = tuple(
-                out_map[i] if i in out_map else next(input_iter) for i in range(len(self.ir.parameters))
+                out_map[i] if i in out_map else next(input_iter) for i in range(len(user_params))
             )
-        if len(arguments) != len(self.ir.parameters):
-            raise TypeError(f"Expected {len(self.ir.parameters)} arguments, received {len(arguments)}")
+        if len(arguments) != len(user_params):
+            raise TypeError(f"Expected {len(user_params)} arguments, received {len(arguments)}")
+        if self.ir.sym_dims:
+            sym_bindings = self._extract_sym_bindings(user_params, arguments, set())
+            missing = [s.name for s in self.ir.sym_dims if s.name not in sym_bindings]
+            if missing:
+                raise ValueError(f"Unbound symbolic dimensions: {', '.join(missing)}")
+            full_arguments = (*arguments, *(sym_bindings[s.name] for s in self.ir.sym_dims))
+        else:
+            full_arguments = arguments
         devices = set()
         ranges = []
         ffi_arguments = []
-        for tensor, param in zip(arguments, self.ir.parameters):
+        for tensor, param in zip(full_arguments, self.ir.parameters):
             if isinstance(param, ScalarParameter):
                 ffi_arguments.append(scalar_ffi_argument(tensor, param))
                 continue
@@ -115,10 +164,9 @@ class CompiledKernel:
             if not hasattr(tensor, "__dlpack_device__") or tensor.__dlpack_device__()[0] != 2:
                 raise TypeError(f"{param.name} must be a CUDA tensor supporting DLPack")
             devices.add(tensor.__dlpack_device__()[1])
-            if tuple(tensor.shape) != param.type.shape:
-                raise ValueError(
-                    f"{param.name}: expected shape {param.type.shape}, got {tuple(tensor.shape)}"
-                )
+            expected_shape = self._resolve_shape(param.type.shape, sym_bindings)
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(f"{param.name}: expected shape {expected_shape}, got {tuple(tensor.shape)}")
             if str(tensor.dtype).split(".")[-1] != param.type.dtype:
                 raise ValueError(f"{param.name}: expected dtype {param.type.dtype}, got {tensor.dtype}")
             contiguous = (
@@ -138,7 +186,7 @@ class CompiledKernel:
                     f"{param.name} requires a tensor with an inspectable, 16-byte-aligned data pointer"
                 )
             size = DTYPES[param.type.dtype]
-            for dimension in param.type.shape:
+            for dimension in expected_shape:
                 size *= dimension
             for start, end, name in ranges:
                 if pointer < end and start < pointer + size:
@@ -153,7 +201,8 @@ class CompiledKernel:
 
 
 class DynamicJitKernel:
-    """Phase-A runtime shape specializer and cache for kernels using T.dynamic(...) dimensions."""
+    """Dynamic-shape JIT dispatcher: prefers single-compile CuTe SymInt (Phase B),
+    falling back seamlessly to per-shape specialization caching (Phase A)."""
 
     def __init__(
         self,
@@ -162,14 +211,37 @@ class DynamicJitKernel:
         target: str | None = "auto",
         out_idx: int | Sequence[int] | None = None,
         pass_configs: dict | None = None,
+        symbolic: bool = True,
     ):
         self.program = program
         self.target = target
         self.out_idx = out_idx
         self.pass_configs = pass_configs
+        self.symbolic = symbolic
         self._cache: dict[tuple, CompiledKernel] = {}
+        self._symbolic_cache: dict[str, CompiledKernel | None] = {}
         self._param_names = tuple(inspect.signature(program.function).parameters.keys())
         self._annotations = self._resolve_symbolic_annotations()
+
+    @property
+    def compile_count(self) -> int:
+        sym_count = sum(1 for k in self._symbolic_cache.values() if k is not None)
+        return sym_count + len(self._cache)
+
+    def _try_symbolic_kernel(self, resolved_target: str) -> CompiledKernel | None:
+        if not self.symbolic:
+            return None
+        if resolved_target not in self._symbolic_cache:
+            try:
+                self._symbolic_cache[resolved_target] = compile(
+                    self.program,
+                    target=resolved_target,
+                    out_idx=self.out_idx,
+                    pass_configs=self.pass_configs,
+                )
+            except CompileError:
+                self._symbolic_cache[resolved_target] = None
+        return self._symbolic_cache[resolved_target]
 
     def _resolve_symbolic_annotations(self) -> dict[str, object]:
         closure = inspect.getclosurevars(self.program.function)
@@ -258,6 +330,10 @@ class DynamicJitKernel:
         return self._cache[key]
 
     def __call__(self, *arguments):
+        resolved_target = resolve_target(self.target)
+        sym_kernel = self._try_symbolic_kernel(resolved_target)
+        if sym_kernel is not None:
+            return sym_kernel(*arguments)
         return self.specialize(*arguments)(*arguments)
 
 
@@ -273,5 +349,7 @@ def compile(
     resolved_target = resolve_target(target)
     ir = parse(program)
     validate(ir)
-    normalized_out = normalize_out_idx(out_idx, ir.parameters)
+    sym_param_names = {f"_nt_sym_{sym.name}" for sym in ir.sym_dims}
+    user_params = tuple(p for p in ir.parameters if p.name not in sym_param_names)
+    normalized_out = normalize_out_idx(out_idx, user_params)
     return CompiledKernel(ir, resolved_target, generate(ir, resolved_target), out_idx=normalized_out)

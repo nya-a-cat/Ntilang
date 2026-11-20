@@ -18,6 +18,7 @@ from .ir import (
     Partition,
     ScalarParameter,
     Statement,
+    SymDim,
     integer_limits,
     loop_controls,
 )
@@ -100,6 +101,7 @@ class Emitter:
         self.math_externs = {}
         self.math_ptx = {}
         self.minmax_ptx = {}
+        self.atomics = {}
         self.bitcasts = {}
         self.debug_prints = {}
         self.device_asserts = False
@@ -138,8 +140,11 @@ class Emitter:
             if kind == "swizzled"
         }
         self.hazards = HazardTracker()
+        grid_exprs = kernel.grid_exprs or kernel.grid
         self.bounds: dict[str, tuple[int, int]] = {
-            name: (0, extent - 1) for name, extent in zip(kernel.block_vars, kernel.grid)
+            name: (0, extent - 1)
+            for name, extent, g_expr in zip(kernel.block_vars, kernel.grid, grid_exprs)
+            if not isinstance(g_expr, Expr)
         }
         self.definitions: dict[str, Expr] = {}
         self.active_stage: dict[str, str] = {}
@@ -329,6 +334,8 @@ class Emitter:
                 return None
             tile_coords = []
             for origin, axis, dim in zip(reg.origin, reg.axes, buf.type.shape):
+                if isinstance(dim, SymDim):
+                    return None
                 iv = self.expr_interval(origin)
                 if axis is None:
                     if iv is None or iv[0] < 0 or iv[1] >= dim:
@@ -520,29 +527,38 @@ class Emitter:
             return f"{self.buf(name)}[{', '.join(indices)}, {self.active_stage[name]}]"
         return f"{self.buf(name)}[{', '.join(indices)}]"
 
+    def dim_expr(self, dim) -> str:
+        if isinstance(dim, SymDim):
+            return self.var(f"_nt_sym_{dim.name}")
+        return str(dim)
+
     def predicate(self, name, indices):
         shape = self.buffers[name].type.shape
-        return " and ".join(f"(0 <= ({idx}) and ({idx}) < {dim})" for idx, dim in zip(indices, shape))
+        return " and ".join(
+            f"(0 <= ({idx}) and ({idx}) < {self.dim_expr(dim)})" for idx, dim in zip(indices, shape)
+        )
 
     def predicate_for_exprs(self, name, exprs, indices):
         shape = self.buffers[name].type.shape
         clauses = []
         for expr, idx, dim in zip(exprs, indices, shape):
-            iv = self.expr_interval(expr)
-            if iv is not None and 0 <= iv[0] and iv[1] < dim:
-                continue
-            clauses.append(f"(0 <= ({idx}) and ({idx}) < {dim})")
+            if not isinstance(dim, SymDim):
+                iv = self.expr_interval(expr)
+                if iv is not None and 0 <= iv[0] and iv[1] < dim:
+                    continue
+            clauses.append(f"(0 <= ({idx}) and ({idx}) < {self.dim_expr(dim)})")
         return " and ".join(clauses) if clauses else None
 
     def region_in_bounds_predicate(self, region, indices):
         shape = self.buffers[region.buffer].type.shape
         clauses = []
         for origin, axis, idx, dim in zip(region.origin, region.axes, indices, shape):
-            iv = self.expr_interval(origin)
-            max_offset = 0 if axis is None else region.shape[axis] - 1
-            if iv is not None and 0 <= iv[0] and iv[1] + max_offset < dim:
-                continue
-            clauses.append(f"(0 <= ({idx}) and ({idx}) < {dim})")
+            if not isinstance(dim, SymDim):
+                iv = self.expr_interval(origin)
+                max_offset = 0 if axis is None else region.shape[axis] - 1
+                if iv is not None and 0 <= iv[0] and iv[1] + max_offset < dim:
+                    continue
+            clauses.append(f"(0 <= ({idx}) and ({idx}) < {self.dim_expr(dim)})")
         return " and ".join(clauses) if clauses else None
 
     def index_expression(self, expr):
@@ -1499,6 +1515,32 @@ class Emitter:
                 self.depth -= 1
             if self.parallel is None:
                 self.hazards.record(reads, writes)
+        elif op == "atomic":
+            atom_op, name, indices, value = args
+            reads = expr_smem_reads(indices, self.buffers) | expr_smem_reads(value, self.buffers)
+            if self.parallel is None and reads:
+                self.sync_if_hazard(reads, set())
+            coords = [self.index_expression(x) for x in indices]
+            value_text = self.expression(value)
+            dtype = self.buffers[name].type.dtype
+            helper = f"_nt_{atom_op}_{dtype}"
+            self.atomics[helper] = (atom_op, dtype)
+            shape = self.buffers[name].type.shape
+            flat = f"cutlass.Int64({coords[0]})"
+            for dim, coord in zip(shape[1:], coords[1:]):
+                flat = f"(({flat}) * cutlass.Int64({self.dim_expr(dim)}) + cutlass.Int64({coord}))"
+            pred = self.predicate_for_exprs(name, indices, coords)
+            ptr_expr = f"{self.buf(name)}.iterator + {flat}"
+            call_line = f"{helper}({ptr_expr}, {self.dtype(name)}({value_text}))"
+            if pred is None:
+                self.emit(call_line)
+            else:
+                self.emit(f"if {pred}:")
+                self.depth += 1
+                self.emit(call_line)
+                self.depth -= 1
+            if self.parallel is None and reads:
+                self.hazards.record(reads, set())
         elif op in ("serial", "unroll"):
             names, extents, inner = args
             extent_reads = expr_smem_reads(extents[:2], self.buffers)
@@ -2047,7 +2089,14 @@ class Emitter:
         self.statements(self.kernel.body)
         self.depth = 0
         self.emit()
-        if self.math_ptx or self.minmax_ptx or self.bitcasts or self.debug_prints or self.device_asserts:
+        if (
+            self.math_ptx
+            or self.minmax_ptx
+            or self.atomics
+            or self.bitcasts
+            or self.debug_prints
+            or self.device_asserts
+        ):
             self.emit("from cutlass.cutlass_dsl import dsl_user_op")
             self.emit("from cutlass._mlir.dialects import llvm")
             self.emit()
@@ -2116,6 +2165,36 @@ class Emitter:
                 self.emit(f"return {typ}(result)")
             self.depth = 0
             self.emit()
+        for helper, (atom_op, dtype) in sorted(self.atomics.items()):
+            typ = f"cutlass.{CUTLASS_TYPES[dtype]}"
+            asm_map = {
+                ("atomic_add", "float32"): ("atom.global.add.f32 $0, [$1], $2;", "=f,l,f"),
+                ("atomic_add", "float64"): ("atom.global.add.f64 $0, [$1], $2;", "=d,l,d"),
+                ("atomic_add", "int32"): ("atom.global.add.s32 $0, [$1], $2;", "=r,l,r"),
+                ("atomic_add", "uint32"): ("atom.global.add.u32 $0, [$1], $2;", "=r,l,r"),
+                ("atomic_add", "float16"): ("atom.global.add.noftz.f16 $0, [$1], $2;", "=h,l,h"),
+                ("atomic_max", "int32"): ("atom.global.max.s32 $0, [$1], $2;", "=r,l,r"),
+                ("atomic_max", "uint32"): ("atom.global.max.u32 $0, [$1], $2;", "=r,l,r"),
+            }
+            assembly, constraint = asm_map[atom_op, dtype]
+            self.emit("@dsl_user_op")
+            self.emit(f"def {helper}(ptr: cute.Pointer, val: {typ}, *, loc=None, ip=None):")
+            self.depth = 1
+            if dtype == "float16":
+                self.emit(
+                    "val_bits = llvm.bitcast(cutlass.Uint16.mlir_type, val.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)"
+                )
+                self.emit(
+                    f"res = llvm.inline_asm(cutlass.Uint16.mlir_type, [ptr.llvm_ptr, val_bits], {assembly!r}, {constraint!r}, has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)"
+                )
+                self.emit(f"return {typ}(llvm.bitcast({typ}.mlir_type, res, loc=loc, ip=ip))")
+            else:
+                self.emit(
+                    f"res = llvm.inline_asm({typ}.mlir_type, [ptr.llvm_ptr, val.ir_value(loc=loc, ip=ip)], {assembly!r}, {constraint!r}, has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)"
+                )
+                self.emit(f"return {typ}(res)")
+            self.depth = 0
+            self.emit()
         for symbol, (dtype, dtypes) in sorted(self.math_externs.items()):
             self.emit(f'@cute.extern(name="{symbol}", overloaded=False)')
             arguments = ", ".join(f"arg{i}: cutlass.{CUTLASS_TYPES[typ]}" for i, typ in enumerate(dtypes))
@@ -2128,9 +2207,16 @@ class Emitter:
         self.emit(f"def run({params}):")
         self.depth = 1
         actual = ", ".join(parameter_name(p) for p in self.kernel.parameters)
-        self.emit(
-            f"_nt_kernel({actual}).launch(grid={self.kernel.grid + (1,) * (3 - len(self.kernel.grid))}, block=({self.kernel.threads}, 1, 1))"
-        )
+        grid_exprs = self.kernel.grid_exprs or self.kernel.grid
+        if any(isinstance(g, Expr) for g in grid_exprs):
+            self.emitting_host_checks = True
+            grid_items = [self.expression(g) if isinstance(g, Expr) else str(g) for g in grid_exprs]
+            self.emitting_host_checks = False
+            grid_items += ["1"] * (3 - len(grid_items))
+            grid_text = f"({', '.join(grid_items)})"
+        else:
+            grid_text = repr(self.kernel.grid + (1,) * (3 - len(self.kernel.grid)))
+        self.emit(f"_nt_kernel({actual}).launch(grid={grid_text}, block=({self.kernel.threads}, 1, 1))")
         self.depth = 0
         self.emit()
         parameter_names = [parameter_name(p) for p in self.kernel.parameters]
@@ -2139,6 +2225,8 @@ class Emitter:
         self.emit("def compile_kernel():")
         self.depth = 1
         self.emit("from cutlass.cute.runtime import make_fake_compact_tensor")
+        for sym in self.kernel.sym_dims:
+            self.emit(f"_nt_sym_{sym.name} = cute.sym_int32(symbol={sym.name!r})")
         names = []
         for p in self.kernel.parameters:
             name = parameter_name(p)
@@ -2147,8 +2235,10 @@ class Emitter:
                 self.emit(f"{name} = cutlass.{CUTLASS_TYPES[p.dtype]}(0)")
                 continue
             order = tuple(reversed(range(len(p.type.shape))))
+            shape_items = [f"_nt_sym_{d.name}" if isinstance(d, SymDim) else str(d) for d in p.type.shape]
+            shape_text = self.tuple_text(shape_items)
             self.emit(
-                f"{name} = make_fake_compact_tensor({self.dtype(p.name)}, {p.type.shape}, stride_order={order}, assumed_align=16)"
+                f"{name} = make_fake_compact_tensor({self.dtype(p.name)}, {shape_text}, stride_order={order}, assumed_align=16)"
             )
         arguments = ", ".join(["run", *names, f'options="--enable-tvm-ffi --gpu-arch={self.target}"'])
         if self.kernel.host_checks:

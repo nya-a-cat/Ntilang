@@ -22,6 +22,7 @@ from .ir import (
     ScalarParameter,
     SourceLocation,
     Statement,
+    SymDim,
     TensorType,
     loop_controls,
 )
@@ -783,6 +784,8 @@ class Parser:
             value = self.constants[node.id]
             if isinstance(value, language.DType):
                 return str(value)
+            if isinstance(value, language.SymbolicDim):
+                return value
             if value is None or type(value) in (int, float, str, bool, tuple, dict):
                 return value
         if isinstance(node, ast.Dict) and all(key is not None for key in node.keys):
@@ -1903,6 +1906,28 @@ class Parser:
                 return self.statement(control, parallel=parallel, nested=nested)
             if name == "copy":
                 return self.copy_statement(call, node, parallel, nested)
+            if name in ("atomic_add", "atomic_max"):
+                if len(call.args) != 2 or call.keywords:
+                    self.fail(node, f"T.{name}(dst[indices], value) expects two positional arguments")
+                dst_node, val_node = call.args
+                if not isinstance(dst_node, ast.Subscript):
+                    self.fail(dst_node, f"T.{name} target must be an indexed global tensor element")
+                buf_name = self.buffer_name(dst_node.value)
+                buf = self.buffers[buf_name]
+                if buf.space != "global":
+                    self.fail(dst_node, f"T.{name} requires a global tensor destination")
+                idx = self.indices(dst_node.slice)
+                if len(idx) != len(buf.type.shape):
+                    self.fail(dst_node, f"T.{name} index rank mismatch")
+                allowed_dtypes = (
+                    ("float32", "int32", "uint32", "float64", "float16")
+                    if name == "atomic_add"
+                    else ("int32", "uint32")
+                )
+                if buf.type.dtype not in allowed_dtypes:
+                    self.fail(node, f"T.{name} does not support dtype {buf.type.dtype!r}")
+                val = self.expr(val_node)
+                return Statement("atomic", (name, buf_name, idx, val), loc)
             if parallel:
                 self.fail(node, "Collective tile operations cannot appear inside T.Parallel")
             if name == "transpose":
@@ -1987,19 +2012,26 @@ class Parser:
         if fn.args.posonlyargs or fn.args.kwonlyargs or fn.args.vararg or fn.args.kwarg or fn.args.defaults:
             self.fail(fn, "Kernel parameters must be positional tensors or scalars without defaults")
         parameters = []
+        sym_dim_map: dict[str, SymDim] = {}
+
+        def resolve_symbolic_spec(spec: language.SymbolicTensorSpec) -> TensorType:
+            resolved_shape = []
+            for dim in spec.shape:
+                if isinstance(dim, language.SymbolicDim):
+                    concrete = self.specializations.get(dim.name, self.constants.get(dim.name))
+                    if type(concrete) is int:
+                        resolved_shape.append(concrete)
+                    else:
+                        sym = sym_dim_map.setdefault(dim.name, SymDim(dim.name))
+                        resolved_shape.append(sym)
+                else:
+                    resolved_shape.append(dim)
+            return TensorType(tuple(resolved_shape), spec.dtype)
+
         for param in fn.args.args:
             annotation = self.function.__annotations__.get(param.arg)
             if isinstance(annotation, language.SymbolicTensorSpec):
-                resolved_shape = []
-                for dim in annotation.shape:
-                    if isinstance(dim, language.SymbolicDim):
-                        concrete = self.specializations.get(dim.name, self.constants.get(dim.name))
-                        if type(concrete) is not int:
-                            self.fail(param, f"Symbolic dimension {dim.name!r} is not specialized")
-                        resolved_shape.append(concrete)
-                    else:
-                        resolved_shape.append(dim)
-                annotation = TensorType(tuple(resolved_shape), annotation.dtype)
+                annotation = resolve_symbolic_spec(annotation)
             elif isinstance(annotation, str) and annotation in language.DTYPE_NAMES:
                 annotation = language.DTYPE_NAMES[annotation]
             elif not isinstance(annotation, TensorType):
@@ -2016,6 +2048,8 @@ class Parser:
                         )
                     except (TypeError, ValueError) as exc:
                         self.fail(param, str(exc))
+                    if isinstance(annotation, language.SymbolicTensorSpec):
+                        annotation = resolve_symbolic_spec(annotation)
                 else:
                     if node is None:
                         self.fail(param, "Every parameter needs T.Tensor(shape, dtype) or a scalar dtype")
@@ -2025,12 +2059,15 @@ class Parser:
             if param.arg.startswith("_nt_"):
                 self.fail(param, "Names starting with _nt_ are reserved")
             if isinstance(annotation, TensorType):
+                strides = (
+                    ()
+                    if annotation.is_symbolic
+                    else tuple(prod(annotation.shape[index + 1 :]) for index in range(len(annotation.shape)))
+                )
                 parameter = Buffer(
                     param.arg,
                     annotation,
-                    strides=tuple(
-                        prod(annotation.shape[index + 1 :]) for index in range(len(annotation.shape))
-                    ),
+                    strides=strides,
                     source_scope="global",
                 )
                 self.buffers[param.arg] = parameter
@@ -2040,6 +2077,19 @@ class Parser:
                 self.parameter_types[param.arg] = Expr("parameter", value=parameter.dtype)
             self.value_frames[param.arg] = self.frames[-1]
             parameters.append(parameter)
+        sym_dims = tuple(sym_dim_map.values())
+        for sym in sym_dims:
+            sym_param_name = f"_nt_sym_{sym.name}"
+            parameters.append(ScalarParameter(sym_param_name, "int32"))
+            self.variables.add(sym_param_name)
+            self.parameter_types[sym_param_name] = Expr("parameter", value="int32")
+            sym_expr = Expr("var", value=sym_param_name)
+            self.values[sym.name] = sym_expr
+            self.value_frames[sym.name] = self.frames[-1]
+            for const_name, const_val in self.constants.items():
+                if isinstance(const_val, language.SymbolicDim) and const_val.name == sym.name:
+                    self.values[const_name] = sym_expr
+                    self.value_frames[const_name] = self.frames[-1]
         parameters = tuple(parameters)
         body = fn.body
         if (
@@ -2067,11 +2117,28 @@ class Parser:
         call = item.context_expr
         if self.call_name(call) != "Kernel":
             self.fail(call, "Expected T.Kernel")
-        grid = tuple(self.static(a) for a in call.args) or (1,)
-        if not 1 <= len(grid) <= 3 or any(type(x) is not int or x <= 0 for x in grid):
-            self.fail(call, "Kernel grid needs one to three positive static dimensions")
-        if grid[0] > 2**31 - 1 or any(x > 65535 for x in grid[1:]):
-            self.fail(call, "Kernel grid exceeds CUDA grid dimension limits")
+        raw_grid = []
+        for a in call.args:
+            try:
+                raw_grid.append(self.static(a))
+            except CompileError:
+                if not sym_dims:
+                    raise
+                raw_grid.append(self.expr(a))
+        grid_exprs = tuple(raw_grid) or (1,)
+        if not 1 <= len(grid_exprs) <= 3:
+            self.fail(call, "Kernel grid needs one to three positive dimensions")
+        grid_list = []
+        for axis, x in enumerate(grid_exprs):
+            if isinstance(x, Expr):
+                grid_list.append(1)
+            elif type(x) is not int or x <= 0:
+                self.fail(call, "Kernel grid needs one to three positive static dimensions")
+            else:
+                if (axis == 0 and x > 2**31 - 1) or (axis > 0 and x > 65535):
+                    self.fail(call, "Kernel grid exceeds CUDA grid dimension limits")
+                grid_list.append(x)
+        grid = tuple(grid_list)
         self.threads = self.keywords(call, {"threads"}).get("threads", 128)
         Partition((1,), self.threads)
         targets = (
@@ -2114,6 +2181,8 @@ class Parser:
             statements,
             self.source,
             tuple(host_checks),
+            grid_exprs,
+            sym_dims,
         )
 
 

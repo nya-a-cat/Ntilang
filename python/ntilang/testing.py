@@ -325,6 +325,16 @@ def reference(kernel: CompiledKernel, *arrays):
                         variable_types = before_types.copy()
             elif op == "store":
                 write(args[0], tuple(expr(x) for x in args[1]), expr(args[2]))
+            elif op == "atomic":
+                atom_op, name, idx_exprs, val_expr = args
+                coords = tuple(expr(x) for x in idx_exprs)
+                arr = buffers[name]
+                if all(0 <= c < dim for c, dim in zip(coords, arr.shape)):
+                    v = cast(expr(val_expr), arr.dtype)
+                    if atom_op == "atomic_add":
+                        arr[coords] = cast(arr[coords] + v, arr.dtype)
+                    else:
+                        arr[coords] = max(arr[coords], v)
             elif op in ("copy", "scan"):
                 src, dst = args[:2]
                 src_origin, dst_origin = (tuple(expr(x) for x in r.origin) for r in (src, dst))

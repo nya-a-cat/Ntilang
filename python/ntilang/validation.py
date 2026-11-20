@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .ir import DTYPES, CompileError, Expr, Kernel, ScalarParameter, integer_limits
+from .ir import DTYPES, CompileError, Expr, Kernel, ScalarParameter, SymDim, integer_limits
 from .scalar import (
     BINARY_MATH_OPS,
     BINARY_NUMERIC_OPS,
@@ -395,7 +395,7 @@ def check_ownership(indices, bounds, definitions, buffers=None):
     recoverable from at least one output coordinate. This sufficient condition
     deliberately rejects affine maps outside the supported proof rule.
     """
-    active = {name for name, (low, high) in bounds.items() if high > low}
+    active = {name for name, (low, high) in bounds.items() if high > low and not name.startswith("_nt_sym_")}
     recovered = set()
     for index in indices:
         interval(index, bounds, definitions, buffers)
@@ -420,7 +420,14 @@ def check_ownership(indices, bounds, definitions, buffers=None):
 def validate(kernel: Kernel):
     buffers = kernel.buffer_map
     reads, writes = set(), {}
-    initial_bounds = {name: (0, size - 1) for name, size in zip(kernel.block_vars, kernel.grid)}
+    grid_exprs = kernel.grid_exprs or kernel.grid
+    initial_bounds = {
+        name: (0, 65535) if isinstance(g_expr, Expr) else (0, size - 1)
+        for name, size, g_expr in zip(kernel.block_vars, kernel.grid, grid_exprs)
+    }
+    sym_names = {f"_nt_sym_{sym.name}" for sym in kernel.sym_dims}
+    for sym_name in sym_names:
+        initial_bounds[sym_name] = (1, 1 << 20)
 
     def runtime_value(expr, definitions):
         if expr.op in ("load", "mutable", "parameter"):
@@ -506,7 +513,7 @@ def validate(kernel: Kernel):
         check_ownership(indices, bounds, definitions, buffers)
         mapping = (tuple(affine(x, definitions, bounds, buffers) for x in indices), bounds)
         footprint = tuple(
-            (max(0, low), min(size - 1, high))
+            (max(0, low), high if isinstance(size, SymDim) else min(size - 1, high))
             for (low, high), size in zip(
                 (interval(x, bounds, definitions, buffers) for x in indices), buffers[name].type.shape
             )
@@ -585,6 +592,12 @@ def validate(kernel: Kernel):
                         interval(index, bounds, definitions, buffers)
                     if buffers[name].space == "global":
                         record_write(name, indices, bounds, definitions, in_serial, path)
+                elif op == "atomic":
+                    _, name, indices, value = args
+                    expression(value, bounds, definitions)
+                    for index in indices:
+                        expression(index, bounds, definitions)
+                        interval(index, bounds, definitions, buffers)
                 elif op in ("copy", "scan"):
                     src, dst = args[:2]
                     if buffers[src.buffer].space == "global":
@@ -653,7 +666,9 @@ def validate(kernel: Kernel):
                 raise CompileError(str(exc), stmt.location) from exc
 
     parameter_definitions = {
-        p.name: Expr("parameter", value=p.dtype) for p in kernel.parameters if isinstance(p, ScalarParameter)
+        p.name: Expr("parameter", value=p.dtype)
+        for p in kernel.parameters
+        if isinstance(p, ScalarParameter) and p.name not in sym_names
     }
 
     def host_expression(value):
