@@ -188,3 +188,29 @@ def _half_trigonometric_asm(operation):
         lines += _half_corrections("input_magnitude", ((0x2B7C, 0x1000),))
     lines += ["mov.b16 $0, rounded;", "}"]
     return "\n".join(lines)
+
+
+def minmax_asm(operation, dtype, propagate_nan):
+    """Return PTX assembly for floating min/max ordering +0.0 > -0.0 and honoring propagate_nan."""
+    assert operation in ("max", "min")
+    suffix = {"float16": "f16", "bfloat16": "bf16", "float32": "f32", "float64": "f64"}[dtype]
+    if suffix in ("f16", "bf16", "f32"):
+        nan_mod = ".NaN" if propagate_nan else ""
+        return f"{{ {operation}{nan_mod}.{suffix} $0, $1, $2; }}"
+    if not propagate_nan:
+        return f"{{ {operation}.f64 $0, $1, $2; }}"
+    # PTX has no .NaN modifier on f64: combine max.f64/min.f64 (which orders +0.0 > -0.0)
+    # with explicit NaN propagation.
+    return "\n".join(
+        [
+            "{",
+            ".reg .f64 tmp;",
+            ".reg .pred nan1, nan2;",
+            f"{operation}.f64 tmp, $1, $2;",
+            "testp.notanumber.f64 nan2, $2;",
+            "selp.f64 tmp, $2, tmp, nan2;",
+            "testp.notanumber.f64 nan1, $1;",
+            "selp.f64 $0, $1, tmp, nan1;",
+            "}",
+        ]
+    )

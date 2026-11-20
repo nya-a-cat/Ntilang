@@ -8,7 +8,7 @@ from hashlib import sha256
 from math import isfinite, isnan, prod
 
 from . import scan
-from .cuda_math import low_precision_asm
+from .cuda_math import low_precision_asm, minmax_asm
 from .debug import print_format
 from .ir import (
     DTYPES,
@@ -98,6 +98,7 @@ class Emitter:
         self.mmas = {}
         self.math_externs = {}
         self.math_ptx = {}
+        self.minmax_ptx = {}
         self.bitcasts = {}
         self.debug_prints = {}
         self.device_asserts = False
@@ -542,7 +543,7 @@ class Emitter:
             return f"cutlass.{CUTLASS_TYPES[expr.value]}({values[0]})"
         if op in ("maximum", "minimum", "max", "min"):
             function = "max" if op in ("maximum", "max") else "min"
-            return f"cute.math.{function}({', '.join(values)}, propagate_nan={op in ('maximum', 'minimum')})"
+            return self.float_minmax(function, dtype, values[0], values[1], op in ("maximum", "minimum"))
         return "(" + f" {op} ".join(values) + ")"
 
     def conditional_expression(self, expr):
@@ -733,7 +734,7 @@ class Emitter:
                 return f"({left} + {right})"
             if kind in ("max", "absmax", "min"):
                 operation = "min" if kind == "min" else "max"
-                return f"cute.math.{operation}({left}, {right}, propagate_nan={propagate})"
+                return self.float_minmax(operation, dtype, left, right, propagate)
             return f"({left} { {'bitand': '&', 'bitor': '|', 'bitxor': '^'}[kind] } {right})"
 
         self.emit("cute.arch.sync_threads()")
@@ -747,7 +748,7 @@ class Emitter:
         value_name = self.unique("reduce_value")
         self.emit(f"{value_name} = {self.dtype(dst)}({value})")
         if kind in ("abssum", "absmax") and not (dtype.startswith("uint") or dtype == "bool"):
-            value_name = f"cute.math.max({value_name}, -{value_name}, propagate_nan=False)"
+            value_name = self.float_minmax("max", dtype, value_name, f"-{value_name}", False)
         self.emit(f"{access(coords)} = {self.dtype(dst)}({value_name})")
         self.depth -= depth
         self.emit("cute.arch.sync_threads()")
@@ -1225,6 +1226,16 @@ class Emitter:
         self.depth = 0
         self.emit()
 
+    def float_minmax(self, operation, dtype, left, right, propagate_nan):
+        """Emit PTX min/max on device to preserve +0.0 > -0.0 and NaN propagation contracts."""
+        assert operation in ("max", "min")
+        if self.emitting_host_checks or dtype not in ("float16", "bfloat16", "float32", "float64"):
+            return f"cute.math.{operation}({left}, {right}, propagate_nan={propagate_nan})"
+        helper = f"_nt_minmax_{operation}_{'nan' if propagate_nan else 'num'}_{dtype}"
+        self.minmax_ptx[helper] = (operation, dtype, propagate_nan)
+        typ = f"cutlass.{CUTLASS_TYPES[dtype]}"
+        return f"{helper}({typ}({left}), {typ}({right}))"
+
     def math_low_precision(self, operation, dtype, values):
         helper = f"_nt_{operation}_{dtype}"
         self.math_ptx[helper] = (operation, dtype, len(values))
@@ -1330,7 +1341,7 @@ class Emitter:
         self.statements(self.kernel.body)
         self.depth = 0
         self.emit()
-        if self.math_ptx or self.bitcasts or self.debug_prints or self.device_asserts:
+        if self.math_ptx or self.minmax_ptx or self.bitcasts or self.debug_prints or self.device_asserts:
             self.emit("from cutlass.cutlass_dsl import dsl_user_op")
             self.emit("from cutlass._mlir.dialects import llvm")
             self.emit()
@@ -1369,6 +1380,34 @@ class Emitter:
                 f"result = llvm.inline_asm(cutlass.Uint16.mlir_type, operands, {assembly!r}, {constraints!r}, has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)"
             )
             self.emit(f"return {typ}(llvm.bitcast({typ}.mlir_type, result, loc=loc, ip=ip))")
+            self.depth = 0
+            self.emit()
+        for helper, (operation, dtype, propagate_nan) in sorted(self.minmax_ptx.items()):
+            typ = f"cutlass.{CUTLASS_TYPES[dtype]}"
+            assembly = minmax_asm(operation, dtype, propagate_nan)
+            self.emit("@dsl_user_op")
+            self.emit(f"def {helper}(arg0: {typ}, arg1: {typ}, *, loc=None, ip=None):")
+            self.depth = 1
+            if dtype in ("float16", "bfloat16"):
+                self.emit("operands = [")
+                self.depth += 1
+                for i in range(2):
+                    self.emit(
+                        f"llvm.bitcast(cutlass.Uint16.mlir_type, arg{i}.ir_value(loc=loc, ip=ip), loc=loc, ip=ip),"
+                    )
+                self.depth -= 1
+                self.emit("]")
+                self.emit(
+                    f"result = llvm.inline_asm(cutlass.Uint16.mlir_type, operands, {assembly!r}, '=h,h,h', has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)"
+                )
+                self.emit(f"return {typ}(llvm.bitcast({typ}.mlir_type, result, loc=loc, ip=ip))")
+            else:
+                constraint = "=f,f,f" if dtype == "float32" else "=d,d,d"
+                self.emit("operands = [arg0.ir_value(loc=loc, ip=ip), arg1.ir_value(loc=loc, ip=ip)]")
+                self.emit(
+                    f"result = llvm.inline_asm({typ}.mlir_type, operands, {assembly!r}, {constraint!r}, has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)"
+                )
+                self.emit(f"return {typ}(result)")
             self.depth = 0
             self.emit()
         for symbol, (dtype, dtypes) in sorted(self.math_externs.items()):

@@ -109,9 +109,7 @@ def emit(emitter, src, dst, kind, dim, reverse):
             e.emit(f"{result} = {right}")
             e.depth -= 1
             return result
-        result = (
-            f"({left} + {right})" if kind == "sum" else f"cute.math.max({left}, {right}, propagate_nan=False)"
-        )
+        result = f"({left} + {right})" if kind == "sum" else e.float_minmax("max", dtype, left, right, False)
         return f"{typ}({result})"
 
     # Padding has the reducer identity. The barriers also protect workspace

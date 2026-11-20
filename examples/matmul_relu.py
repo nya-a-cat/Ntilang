@@ -15,12 +15,12 @@ def matmul_relu(m=65, n=71, k=37, *, target="sm_80"):
             sb = T.alloc_shared((32, 32), "float16")
             acc = T.alloc_fragment((32, 32), "float32")
             bias = T.alloc_fragment((32, 32), "float32")
-            T.copy(Bias[bx * 32, by * 32], bias)
             T.clear(acc)
             for ko in T.serial(T.ceildiv(k, 32)):
                 T.copy(A[bx * 32, ko * 32], sa)
                 T.copy(B[ko * 32, by * 32], sb)
                 T.gemm(sa, sb, acc)
+            T.copy(Bias[bx * 32, by * 32], bias)
             for i, j in T.Parallel(32, 32):
                 acc[i, j] = T.maximum(acc[i, j] * 0.5 + bias[i, j], 0.0)
             T.copy(acc, C[bx * 32, by * 32])
