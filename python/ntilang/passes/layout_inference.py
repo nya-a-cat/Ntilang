@@ -29,8 +29,10 @@ def analyze_mmas(kernel: Kernel, buffers: dict[str, Buffer]) -> dict[str, tuple]
             continue
         a, b, c, ta, tb = stmt.args
         ab, bb, cb = (buffers[n] for n in (a, b, c))
-        if ab.space != "shared" or bb.space != "shared" or cb.space != "fragment":
-            raise CompileError("T.gemm requires shared A/B and a fragment accumulator", stmt.location)
+        if ab.space not in ("shared", "fragment") or bb.space != "shared" or cb.space != "fragment":
+            raise CompileError(
+                "T.gemm requires shared/fragment A, shared B, and a fragment accumulator", stmt.location
+            )
         if any(len(x.type.shape) != 2 for x in (ab, bb, cb)):
             raise CompileError("T.gemm requires rank-two tiles", stmt.location)
         am, ak = ab.type.shape[::-1] if ta else ab.type.shape
@@ -176,6 +178,10 @@ def collect_workspaces(
             snapshots.update(stmt_snapshots)
         elif stmt.op == "copy":
             snapshots.update(copy_snapshots(*stmt.args, buffers))
+        elif stmt.op == "gemm":
+            a = stmt.args[0]
+            if buffers[a].space == "fragment":
+                snapshots.add(a)
         elif stmt.op == "reduce":
             src, dst = stmt.args[:2]
             key = (src, buffers[dst].type.dtype)

@@ -156,7 +156,7 @@ class Emitter:
         )
 
     def _shared_memory_limit(self) -> int:
-        if not self.staged_buffers:
+        if not self.staged_buffers and len(self.mmas) < 2:
             return 48 * 1024
         if self.target == "sm_80":
             return 163 * 1024
@@ -255,7 +255,12 @@ class Emitter:
 
         swizzles: dict[str, tuple[int, int, int]] = {}
         for buf in self.kernel.buffers:
-            if buf.space != "shared" or len(buf.type.shape) != 2:
+            if len(buf.type.shape) != 2:
+                continue
+            is_rs_gemm_snap = (
+                buf.space == "fragment" and buf.name in mma_operands and buf.name in self.snapshots
+            )
+            if buf.space != "shared" and not is_rs_gemm_snap:
                 continue
             dtype = buf.type.dtype
             if dtype not in ("float16", "bfloat16", "int16", "uint16", "float32", "int32", "uint32"):
@@ -265,19 +270,20 @@ class Emitter:
             needs_16b_contiguity = (
                 buf.name in mma_operands or buf.name in block_copy_shared or buf.name in self.swizzled_buffers
             )
+            key = f"_nt_snapshot_{buf.name}" if is_rs_gemm_snap else buf.name
             if needs_16b_contiguity:
                 m_bits = 3 if elem_bytes == 2 else 2
                 row_bytes = cols * elem_bytes
                 if row_bytes % 128 == 0:
                     tz = (cols & -cols).bit_length() - 1
-                    swizzles[buf.name] = (3, m_bits, tz - m_bits)
+                    swizzles[key] = (3, m_bits, tz - m_bits)
                 elif row_bytes % 64 == 0:
-                    swizzles[buf.name] = (2, m_bits, 3)
+                    swizzles[key] = (2, m_bits, 3)
                 elif row_bytes % 32 == 0:
-                    swizzles[buf.name] = (1, m_bits, 3)
+                    swizzles[key] = (1, m_bits, 3)
             elif elem_bytes == 4 and cols >= 32 and cols % 32 == 0:
                 tz = (cols & -cols).bit_length() - 1
-                swizzles[buf.name] = (min(5, tz), 0, tz)
+                swizzles[key] = (min(5, tz), 0, tz)
         return swizzles
 
     def _affine_tile_coord(self, origin: Expr, tile_dim: int) -> str | None:
@@ -314,23 +320,33 @@ class Emitter:
         rank = len(src.shape)
         if rank not in (1, 2) or src.shape != dst.shape or prod(src.shape) < 2:
             return None
-        if any(ax is None for ax in src.axes) or any(ax is None for ax in dst.axes):
-            return None
-        if len(src_buf.type.shape) != rank or len(dst_buf.type.shape) != rank:
-            return None
 
-        # Verify both regions are statically in bounds and tile-aligned.
-        for reg, buf in ((src, src_buf), (dst, dst_buf)):
+        def _check_region(reg, buf):
+            non_none = [ax for ax in reg.axes if ax is not None]
+            if tuple(non_none) != tuple(range(rank)) or reg.axes[-1] != rank - 1:
+                return None
+            if len(buf.type.shape) < rank:
+                return None
+            tile_coords = []
             for origin, axis, dim in zip(reg.origin, reg.axes, buf.type.shape):
                 iv = self.expr_interval(origin)
-                if iv is None or iv[0] < 0 or iv[1] + reg.shape[axis] - 1 >= dim:
-                    return None
-                if dim % reg.shape[axis] != 0:
-                    return None
+                if axis is None:
+                    if iv is None or iv[0] < 0 or iv[1] >= dim:
+                        return None
+                else:
+                    if iv is None or iv[0] < 0 or iv[1] + reg.shape[axis] - 1 >= dim:
+                        return None
+                    if dim % reg.shape[axis] != 0:
+                        return None
+                    tc = self._affine_tile_coord(origin, reg.shape[axis])
+                    if tc is None:
+                        return None
+                    tile_coords.append(tc)
+            return tile_coords
 
-        src_coords = [self._affine_tile_coord(o, ext) for o, ext in zip(src.origin, src.shape)]
-        dst_coords = [self._affine_tile_coord(o, ext) for o, ext in zip(dst.origin, dst.shape)]
-        if any(c is None for c in src_coords) or any(c is None for c in dst_coords):
+        src_coords = _check_region(src, src_buf)
+        dst_coords = _check_region(dst, dst_buf)
+        if src_coords is None or dst_coords is None:
             return None
 
         elem_bytes = DTYPES[src_buf.type.dtype]
@@ -367,6 +383,22 @@ class Emitter:
                     )
         return None
 
+    def _region_tile_tensor(self, reg, tile_coords):
+        buf = self.buffers[reg.buffer]
+        if reg.is_full(buf.type.shape):
+            return self.buf(reg.buffer)
+        base = self.buf(reg.buffer)
+        if any(ax is None for ax in reg.axes):
+            slice_items = [
+                self.index_expression(o) if ax is None else "None" for o, ax in zip(reg.origin, reg.axes)
+            ]
+            sliced = self.unique("vec_slice")
+            self.emit(f"{sliced} = {base}[{', '.join(slice_items)}]")
+            base = sliced
+        name = self.unique("vec_tile")
+        self.emit(f"{name} = cute.local_tile({base}, {reg.shape}, {self.tuple_text(tile_coords)})")
+        return name
+
     def _emit_vectorized_copy(self, src, dst, plan):
         vec, elem_bytes, thr_shape, thr_stride, val_shape, src_coords, dst_coords = plan
         bits = vec * elem_bytes * 8
@@ -380,18 +412,8 @@ class Emitter:
             f"{tc} = cute.make_tiled_copy_tv({atom}, cute.make_layout({thr_shape}, stride={thr_stride}), cute.make_layout({val_shape}))"
         )
         self.emit(f"{thr} = {tc}.get_slice(_nt_tid)")
-
-        def tile_expr(reg, coords):
-            buf = self.buffers[reg.buffer]
-            if reg.is_full(buf.type.shape):
-                return self.buf(reg.buffer)
-            name = self.unique("vec_tile")
-            coord_tuple = self.tuple_text(coords)
-            self.emit(f"{name} = cute.local_tile({self.buf(reg.buffer)}, {reg.shape}, {coord_tuple})")
-            return name
-
-        src_tile = tile_expr(src, src_coords)
-        dst_tile = tile_expr(dst, dst_coords)
+        src_tile = self._region_tile_tensor(src, src_coords)
+        dst_tile = self._region_tile_tensor(dst, dst_coords)
         self.emit(f"cute.copy({tc}, {thr}.partition_S({src_tile}), {thr}.partition_D({dst_tile}))")
 
     def _emit_async_copy(self, src, dst, plan, stage_expr: str):
@@ -412,14 +434,7 @@ class Emitter:
             f"{tc} = cute.make_tiled_copy_tv({atom}, cute.make_layout({thr_shape}, stride={thr_stride}), cute.make_layout({val_shape}))"
         )
         self.emit(f"{thr} = {tc}.get_slice(_nt_tid)")
-        src_buf = self.buffers[src.buffer]
-        if src.is_full(src_buf.type.shape):
-            src_tile = self.buf(src.buffer)
-        else:
-            src_tile = self.unique("async_src")
-            self.emit(
-                f"{src_tile} = cute.local_tile({self.buf(src.buffer)}, {src.shape}, {self.tuple_text(src_coords)})"
-            )
+        src_tile = self._region_tile_tensor(src, src_coords)
         dst_tile = f"{self.buf(dst.buffer)}[None, None, {stage_expr}]"
         self.emit(f"cute.copy({tc}, {thr}.partition_S({src_tile}), {thr}.partition_D({dst_tile}))")
 
@@ -902,12 +917,23 @@ class Emitter:
         self.depth -= depth
         self.hazards.record(reads, writes)
 
-    def _shared_mma_view(self, name: str, shape: tuple[int, int], stride: tuple[int, int], native: bool):
-        stage = self.active_stage.get(name)
+    def _shared_mma_view(
+        self,
+        name: str,
+        shape: tuple[int, int],
+        stride: tuple[int, int],
+        native: bool,
+        *,
+        tensor_expr: str | None = None,
+        swizzle_key: str | None = None,
+    ):
+        expr = self.buf(name) if tensor_expr is None else tensor_expr
+        swz_key = name if swizzle_key is None else swizzle_key
+        stage = self.active_stage.get(name) if tensor_expr is None else None
         if native:
-            return f"{self.buf(name)}[None, None, {stage}]" if stage is not None else self.buf(name)
+            return f"{expr}[None, None, {stage}]" if stage is not None else expr
         view = self.unique("mma_view")
-        swz = self.shared_swizzles.get(name)
+        swz = self.shared_swizzles.get(swz_key)
         if stage is not None:
             stages = self.staged_buffers[name]
             rows, cols = self.buffers[name].type.shape
@@ -915,24 +941,35 @@ class Emitter:
             layout_expr = (
                 f"cute.make_composed_layout(cute.make_swizzle{swz}, 0, {base})" if swz is not None else base
             )
-            self.emit(
-                f"{view} = cute.make_tensor({self.buf(name)}.iterator, {layout_expr})[None, None, {stage}]"
-            )
+            self.emit(f"{view} = cute.make_tensor({expr}.iterator, {layout_expr})[None, None, {stage}]")
             return view
         base = f"cute.make_layout({shape}, stride={stride})"
         layout_expr = (
             f"cute.make_composed_layout(cute.make_swizzle{swz}, 0, {base})" if swz is not None else base
         )
-        self.emit(f"{view} = cute.make_tensor({self.buf(name)}.iterator, {layout_expr})")
+        self.emit(f"{view} = cute.make_tensor({expr}.iterator, {layout_expr})")
         return view
 
     def gemm(self, a, b, c, ta, tb):
         am, bn, ak, wm, wn, mma_dtype = self.mmas[c]
         cutlass_ty = f"cutlass.{CUTLASS_TYPES[mma_dtype]}"
-        reads = {a, b}
-        self.sync_if_hazard(reads, set())
-
-        a_view = self._shared_mma_view(a, (am, ak), (1, self.buffers[a].type.shape[1]), native=not ta)
+        if self.buffers[a].space == "fragment":
+            self.materialize_fragment(a)
+            snap_a = f"_nt_snapshot_{a}"
+            reads = {snap_a, b}
+            self.sync_if_hazard(reads, set())
+            a_view = self._shared_mma_view(
+                a,
+                (am, ak),
+                (1, self.buffers[a].type.shape[1]),
+                native=not ta,
+                tensor_expr=snap_a,
+                swizzle_key=snap_a,
+            )
+        else:
+            reads = {a, b}
+            self.sync_if_hazard(reads, set())
+            a_view = self._shared_mma_view(a, (am, ak), (1, self.buffers[a].type.shape[1]), native=not ta)
         # CuTe MMA B has (N, K) modes; source language B has (K, N) unless transpose_B=True.
         b_view = self._shared_mma_view(b, (bn, ak), (1, bn), native=tb)
 
@@ -1000,22 +1037,40 @@ class Emitter:
             and shape[dim] >= 32
             and shape[dim] % 32 == 0
             and dtype in ("float32", "int32", "uint32")
-            and (self.buffers[src].space == "shared" or self.fragment_layouts[src] is None)
         )
 
         if can_warp_shuffle:
             groups = shape[dim] // 32
             outer_shape = shape[:-1]
             outer_count = prod(outer_shape)
-            slot, coords, depth = self.loop_tile(shape, constexpr=(self.buffers[src].space == "fragment"))
-            value = (
-                f"{self.buf(src)}[{slot}]"
-                if self.buffers[src].space == "fragment"
-                else self.access(src, coords)
+            is_mma_src = self.buffers[src].space == "fragment" and self.fragment_layouts[src] is not None
+            if is_mma_src:
+                slot, coords, depth = self.loop_fragment(src)
+                value_name = self.unique("reduce_value")
+                self.emit(f"{value_name} = {self.dtype(dst)}({self.buf(src)}[{slot}])")
+                if kind in ("abssum", "absmax") and not (dtype.startswith("uint") or dtype == "bool"):
+                    value_name = self.float_minmax("max", dtype, value_name, f"-{value_name}", False)
+                self.emit(f"{access(coords)} = {self.dtype(dst)}({value_name})")
+                self.depth -= depth
+                self.hazards.record(stage0_reads, stage0_writes)
+                self.sync_threads()
+
+            slot, coords, depth = self.loop_tile(
+                shape, constexpr=(self.buffers[src].space == "fragment" and not is_mma_src)
             )
+            if is_mma_src:
+                value = access(coords)
+            elif self.buffers[src].space == "fragment":
+                value = f"{self.buf(src)}[{slot}]"
+            else:
+                value = self.access(src, coords)
             val = self.unique("wred_val")
             self.emit(f"{val} = {self.dtype(dst)}({value})")
-            if kind in ("abssum", "absmax") and not (dtype.startswith("uint") or dtype == "bool"):
+            if (
+                not is_mma_src
+                and kind in ("abssum", "absmax")
+                and not (dtype.startswith("uint") or dtype == "bool")
+            ):
                 val = self.float_minmax("max", dtype, val, f"-{val}", False)
                 val_var = self.unique("wred_abs")
                 self.emit(f"{val_var} = {self.dtype(dst)}({val})")
@@ -1026,11 +1081,16 @@ class Emitter:
                 self.emit(f"{val} = {self.dtype(dst)}({combine(val, other)})")
             self.emit("if (_nt_tid % 32) == 0:")
             self.depth += 1
-            group_coords = [*coords[:-1], f"({coords[-1]} // 32)"]
-            self.emit(f"{access(group_coords)} = {val}")
+            if is_mma_src:
+                # Write in-place at group leader (32 * g) to avoid WAR with other warps.
+                self.emit(f"{access(coords)} = {val}")
+            else:
+                group_coords = [*coords[:-1], f"({coords[-1]} // 32)"]
+                self.emit(f"{access(group_coords)} = {val}")
             self.depth -= depth + 1
-            self.hazards.record(stage0_reads, stage0_writes)
+            self.hazards.record({workspace} if is_mma_src else stage0_reads, stage0_writes)
 
+            group_stride = 32 if is_mma_src else 1
             if 2 <= groups <= 32:
                 self.sync_threads()
                 num_warps = self.kernel.threads // 32
@@ -1057,7 +1117,8 @@ class Emitter:
                 self.emit(f"{val2} = {self.dtype(dst)}(0)")
                 self.emit(f"if {lane} < {groups}:")
                 self.depth += 1
-                self.emit(f"{val2} = {access([*row_coords, lane])}")
+                g_idx = f"({lane} * {group_stride})" if group_stride > 1 else lane
+                self.emit(f"{val2} = {access([*row_coords, g_idx])}")
                 self.depth -= 1
                 stride = 1
                 while stride < groups:
@@ -1083,10 +1144,17 @@ class Emitter:
                         f"if ({coords[dim]} % {2 * stride} == 0) and ({coords[dim]} + {stride} < {groups}):"
                     )
                     self.depth += 1
+                    cur_coords = (
+                        [*coords[:-1], f"({coords[-1]} * {group_stride})"] if group_stride > 1 else coords
+                    )
                     partner = coords.copy()
-                    partner[dim] = f"({coords[dim]} + {stride})"
-                    result = combine(access(coords), access(partner))
-                    self.emit(f"{access(coords)} = {self.dtype(dst)}({result})")
+                    partner[dim] = (
+                        f"(({coords[dim]} + {stride}) * {group_stride})"
+                        if group_stride > 1
+                        else f"({coords[dim]} + {stride})"
+                    )
+                    result = combine(access(cur_coords), access(partner))
+                    self.emit(f"{access(cur_coords)} = {self.dtype(dst)}({result})")
                     self.depth -= depth + 1
                     self.hazards.record({workspace}, {workspace})
                     stride *= 2
@@ -1923,8 +1991,16 @@ class Emitter:
         for b in self.kernel.buffers:
             if b.name in self.snapshots:
                 strides = tuple(prod(b.type.shape[i + 1 :]) for i in range(len(b.type.shape)))
+                base = f"cute.make_layout({b.type.shape}, stride={strides})"
+                snap_key = f"_nt_snapshot_{b.name}"
+                snap_swz = self.shared_swizzles.get(snap_key)
+                snap_layout = (
+                    f"cute.make_composed_layout(cute.make_swizzle{snap_swz}, 0, {base})"
+                    if snap_swz is not None
+                    else base
+                )
                 self.emit(
-                    f"_nt_snapshot_{b.name} = _nt_smem.allocate_tensor({self.dtype(b.name)}, cute.make_layout({b.type.shape}, stride={strides}), byte_alignment=16)"
+                    f"{snap_key} = _nt_smem.allocate_tensor({self.dtype(b.name)}, {snap_layout}, byte_alignment=16)"
                 )
             if b.space == "shared":
                 if b.name in self.staged_buffers:

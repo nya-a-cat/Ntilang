@@ -98,7 +98,12 @@ def smem_footprint(
                 writes.add(dst.buffer)
         elif op == "gemm":
             a, b, _, _, _ = args
-            reads.add(a)
+            if buffers[a].space == "fragment":
+                snap = f"_nt_snapshot_{a}"
+                reads.add(snap)
+                writes.add(snap)
+            else:
+                reads.add(a)
             reads.add(b)
         elif op == "reduce":
             src, dst = args[:2]

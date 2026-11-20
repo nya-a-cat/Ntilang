@@ -210,6 +210,8 @@ def constant_integer(expr, bindings):
     def resolve(value):
         if value.op == "likely":
             return resolve(value.args[0])
+        if value.op == "if_then_else" and value.args[0].op == "const" and type(value.args[0].value) is bool:
+            return resolve(value.args[1] if value.args[0].value else value.args[2])
         if value.op == "var":
             return resolve(bindings[value.value]) if value.value in bindings else None
         if value.op == "const" and type(value.value) in (int, bool):
@@ -234,7 +236,7 @@ def constant_integer(expr, bindings):
             if item is None:
                 return None
             result, dtype = item[0], value.value
-        elif value.op in ("+", "-", "*"):
+        elif value.op in ("+", "-", "*", "//", "ceildiv"):
             parts = [resolve(arg) for arg in value.args]
             if any(part is None for part in parts):
                 return None
@@ -242,7 +244,19 @@ def constant_integer(expr, bindings):
             dtype = promote(lt, rt)
             if dtype == "bool":
                 return None
-            result = left + right if value.op == "+" else left - right if value.op == "-" else left * right
+            if value.op in ("//", "ceildiv") and right == 0:
+                return None
+            result = (
+                left + right
+                if value.op == "+"
+                else left - right
+                if value.op == "-"
+                else left * right
+                if value.op == "*"
+                else left // right
+                if value.op == "//"
+                else (left + right - 1) // right
+            )
         else:
             return None
         low, high = integer_limits(dtype)

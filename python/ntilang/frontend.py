@@ -801,6 +801,8 @@ class Parser:
                 return STATIC_OPS[type(node.op)](self.static(node.left), self.static(node.right))
             except (TypeError, ValueError, ZeroDivisionError) as exc:
                 self.fail(node, f"Invalid static expression: {exc}")
+        if isinstance(node, ast.IfExp):
+            return self.static(node.body if self.static(node.test) else node.orelse)
         if isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]) in COMPARISONS:
             operations = {
                 ast.Lt: operator.lt,
@@ -1792,7 +1794,16 @@ class Parser:
                 num_stages = kw.get("num_stages", 1)
                 if type(num_stages) is not int or num_stages < 0:
                     self.fail(node, "T.Pipelined num_stages must be a non-negative static integer")
-                extents = tuple(self.static(a) for a in node.iter.args)
+                parsed_extents = []
+                for idx_arg, a in enumerate(node.iter.args):
+                    if idx_arg < 2:
+                        try:
+                            parsed_extents.append(self.static(a))
+                        except CompileError:
+                            parsed_extents.append(self.expr(a))
+                    else:
+                        parsed_extents.append(self.static(a))
+                extents = tuple(parsed_extents)
             if not targets or any(not isinstance(t, ast.Name) for t in targets):
                 self.fail(node, "Loop targets must be names")
             source_names = tuple(t.id for t in targets)
