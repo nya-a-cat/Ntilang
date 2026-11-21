@@ -5,7 +5,8 @@ build-backend = "hatchling.build"
 [project]
 name = "ntilang"
 version = "0.1.0"
-description = "A TileLang-style language that compiles directly to pure CuTe DSL."
+description = "A drop-in TileLang compiler powered by NVIDIA CuTe DSL."
+keywords = ["tilelang", "cute-dsl", "cutlass", "gpu-compiler", "cuda", "triton", "flash-attention", "tensor-cores"]
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
